@@ -1,0 +1,9 @@
+name = "teledrive-worker"
+main = "src/index.ts"
+compatibility_date = "2026-08-05"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "teledrive"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "../../migrations"

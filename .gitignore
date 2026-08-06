@@ -1,0 +1,23 @@
+node_modules
+.next
+
+# Ignore files
+.DS_Store
+
+# Ignore directories
+__tests__
+__mocks__
+
+# Ignore generated files
+*.d.ts
+*.tsbuildinfo
+apps/web/out/
+apps/worker/.wrangler/
+apps/worker/package-lock.json
+
+.env
+.env.local
+apps/web/.env.local
+apps/worker/.dev.vars
+apps/web/.env.local.tmp
+apps/worker/.dev.vars.tmp

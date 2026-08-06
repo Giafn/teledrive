@@ -1,0 +1,10 @@
+{
+  "name": "Ruang — Drive pribadi",
+  "short_name": "Ruang",
+  "description": "Drive pribadi berbasis Telegram",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f1ea",
+  "theme_color": "#f4f1ea",
+  "icons": []
+}

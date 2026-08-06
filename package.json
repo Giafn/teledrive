@@ -1,0 +1,17 @@
+{
+  "name": "teledrive",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "env:sync": "node scripts/sync-local-env.mjs",
+    "format": "prettier --write --ignore-unknown \"apps/**/*\" \"packages/**/*\" \"migrations/**/*\" \"*.{md,json,jsonc,ts,tsx}\"",
+    "format:check": "prettier --check --ignore-unknown \"apps/**/*\" \"packages/**/*\" \"migrations/**/*\" \"*.{md,json,jsonc,ts,tsx}\"",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.6",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}

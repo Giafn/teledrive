@@ -1,0 +1,11 @@
+{
+  "name": "@teledrive/upload-engine",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@teledrive/contracts": "workspace:*"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
