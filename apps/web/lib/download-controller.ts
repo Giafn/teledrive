@@ -1,11 +1,11 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { api, type ApiClient, type ManifestResponse } from './api';
-import { telegramGateway, type TelegramDownloadResult, type TelegramGateway } from './telegram-gateway';
+import { ApiError, api, type ApiClient, type BotManifestResponse, type StoragePoolResponse } from './api';
 
 export const MAX_PREVIEW_BYTES = 200 * 1024 * 1024;
 // ponytail: Blob fallback capped at 200 MiB; FSA and StreamSaver paths stream above ceiling.
 export const MAX_BLOB_FALLBACK_BYTES = MAX_PREVIEW_BYTES;
+export const MAX_PART_BYTES = 19 * 1024 * 1024;
 const MAX_PART_ATTEMPTS = 3;
 const PART_RETRY_BASE_DELAY_MS = 100;
 
@@ -18,7 +18,12 @@ export type DownloadProgress = {
 };
 
 export type PreviewResult = { url: string; mime: string; size: number; revoke: () => void };
-export type SaveResult = { method: 'file-system-access' | 'streamsaver' | 'blob'; name: string; size: number };
+export type SaveResult = {
+  method: 'file-system-access' | 'streamsaver' | 'blob' | 'cancelled';
+  name: string;
+  size: number;
+};
+export type KnownDownloadFile = { size: number } & ({ name: string } | { filename: string });
 
 export class DownloadError extends Error {
   constructor(
@@ -31,12 +36,10 @@ export class DownloadError extends Error {
   }
 }
 
-type DownloadApi = Pick<ApiClient, 'getManifest'>;
-type DownloadGateway = Pick<TelegramGateway, 'checkSession' | 'downloadPart'>;
+type DownloadApi = Pick<ApiClient, 'getBotManifest' | 'getBotPartContent'> &
+  Partial<Pick<ApiClient, 'getStoragePool'>>;
 export type DownloadControllerOptions = {
-  channel?: string;
   api?: DownloadApi;
-  gateway?: DownloadGateway;
   signal?: AbortSignal;
   onProgress?: (progress: DownloadProgress) => void;
 };
@@ -54,7 +57,16 @@ type StreamSaver = {
   mitm: string;
   createWriteStream: (filename: string, options?: { size?: number }) => { getWriter: () => FileWritable };
 };
-type PreparedDownload = { channel: string; manifest: ManifestResponse };
+type PreparedDownload = { manifest: BotManifestResponse };
+type SaveFilePickerInput = KnownDownloadFile | AbortSignal;
+
+class FileSystemUnavailableError extends Error {
+  constructor(readonly cause: unknown) {
+    super('File System Access writable is unavailable.');
+    this.name = 'FileSystemUnavailableError';
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
 
 const STREAMSAVER_MITM_PATH = '/streamsaver/mitm.html';
 
@@ -103,38 +115,46 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DownloadError('DOWNLOAD_ABORTED', 'Download aborted.');
 }
 
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    'aborted' in value &&
+    'addEventListener' in value &&
+    typeof (value as { addEventListener?: unknown }).addEventListener === 'function',
+  );
+}
+
+function knownName(file: KnownDownloadFile): string {
+  return 'name' in file ? file.name : file.filename;
+}
+
+function isPickerAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'name' in error && error.name === 'AbortError');
+}
+
 function errorText(error: unknown): string {
-  if (error instanceof Error) {
-    const value = error as Error & { text?: unknown; code?: unknown };
-    return [value.message, value.text, value.code].filter((part): part is string => typeof part === 'string').join(' ');
-  }
+  if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
   if (error && typeof error === 'object') {
-    const value = error as { message?: unknown; text?: unknown; code?: unknown };
-    return [value.message, value.text, value.code].filter((part): part is string => typeof part === 'string').join(' ');
+    const value = error as { message?: unknown; code?: unknown };
+    return [value.message, value.code].filter((part): part is string => typeof part === 'string').join(' ');
   }
   return '';
 }
 
-function floodWaitSeconds(error: unknown): number | undefined {
-  const match = /\bFLOOD_WAIT_(\d+)\b/iu.exec(errorText(error));
-  if (!match) return undefined;
-  const seconds = Number(match[1]);
-  return Number.isSafeInteger(seconds) ? seconds : undefined;
+function retryAfter(error: unknown): number | undefined {
+  if (!(error instanceof ApiError)) return undefined;
+  return error.retryAfter !== undefined && Number.isSafeInteger(error.retryAfter) && error.retryAfter >= 0
+    ? error.retryAfter
+    : undefined;
 }
 
 function isRetryablePartError(error: unknown): boolean {
   if (error instanceof DownloadError) return false;
-  const text = errorText(error);
-  if (
-    !text ||
-    /configuration|manifest|(?:part|file|object)?\s*size|hash|integrity|(?:document|file|message)[\s_]+(?:is[\s_]+)?(?:missing|not[\s_]+found)/iu.test(
-      text,
-    )
-  ) {
-    return false;
-  }
-  return floodWaitSeconds(error) !== undefined || /network|transport|connection|timeout|worker/iu.test(text);
+  if (error instanceof ApiError)
+    return error.status === 0 || error.status === 408 || error.status === 429 || error.status >= 500;
+  return error instanceof TypeError || /network|transport|connection|timeout/iu.test(errorText(error));
 }
 
 function waitForRetry(milliseconds: number, signal?: AbortSignal): Promise<void> {
@@ -154,24 +174,7 @@ function waitForRetry(milliseconds: number, signal?: AbortSignal): Promise<void>
   });
 }
 
-function configuredChannel(channel?: string): string {
-  const value = channel ?? process.env.NEXT_PUBLIC_TELEGRAM_CHANNEL;
-  if (!value?.trim()) throw new DownloadError('CHANNEL_MISSING', 'Telegram channel is not configured.');
-  return value;
-}
-
-function messageId(value: unknown): number {
-  if (typeof value !== 'string' || !/^[1-9]\d*$/u.test(value)) {
-    throw new DownloadError('INVALID_MESSAGE_ID', 'Download manifest contains an invalid Telegram message ID.');
-  }
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw new DownloadError('INVALID_MESSAGE_ID', 'Download manifest contains an invalid Telegram message ID.');
-  }
-  return parsed;
-}
-
-function validateManifest(manifest: ManifestResponse): ManifestResponse['parts'] {
+function validateManifest(manifest: BotManifestResponse): BotManifestResponse['parts'] {
   if (
     !Number.isSafeInteger(manifest.object.size) ||
     manifest.object.size < 0 ||
@@ -188,13 +191,13 @@ function validateManifest(manifest: ManifestResponse): ManifestResponse['parts']
     if (
       part.partNo !== index ||
       !Number.isSafeInteger(part.size) ||
-      part.size < 0 ||
+      part.size < 1 ||
+      part.size > MAX_PART_BYTES ||
       typeof part.sha256 !== 'string' ||
       !/^[a-f\d]{64}$/iu.test(part.sha256)
     ) {
       throw new DownloadError('INVALID_MANIFEST', 'Download manifest is invalid.');
     }
-    messageId(part.messageId);
   }
   if (parts.reduce((total, part) => total + part.size, 0) !== manifest.object.size) {
     throw new DownloadError('INVALID_MANIFEST', 'Download manifest is invalid.');
@@ -203,16 +206,12 @@ function validateManifest(manifest: ManifestResponse): ManifestResponse['parts']
 }
 
 export class DownloadController {
-  private readonly channel?: string;
   private readonly api: DownloadApi;
-  private readonly gateway: DownloadGateway;
   private readonly signal?: AbortSignal;
   private readonly onProgress?: (progress: DownloadProgress) => void;
 
   constructor(options: DownloadControllerOptions = {}) {
-    this.channel = options.channel;
     this.api = options.api ?? api;
-    this.gateway = options.gateway ?? telegramGateway;
     this.signal = options.signal;
     this.onProgress = options.onProgress;
   }
@@ -221,12 +220,10 @@ export class DownloadController {
     requireBrowser();
     const prepared = await this.prepare(objectId, signal);
     const { object } = prepared.manifest;
-    if (!previewMimeSupported(object.mime)) {
+    if (!previewMimeSupported(object.mime))
       throw new DownloadError('PREVIEW_UNSUPPORTED_MIME', 'This file type is download-only.');
-    }
-    if (object.size > MAX_PREVIEW_BYTES) {
+    if (object.size > MAX_PREVIEW_BYTES)
       throw new DownloadError('PREVIEW_TOO_LARGE', 'Preview exceeds the safe 200 MiB limit.');
-    }
     const chunks = await this.downloadParts(prepared, signal, MAX_PREVIEW_BYTES, true);
     const blob = new Blob(chunks as BlobPart[], { type: object.mime });
     if (typeof URL.createObjectURL !== 'function')
@@ -235,21 +232,50 @@ export class DownloadController {
     return { url, mime: object.mime, size: object.size, revoke: () => URL.revokeObjectURL(url) };
   }
 
-  async save(objectId: string, signal = this.signal): Promise<SaveResult> {
+  save(objectId: string, signal?: AbortSignal): Promise<SaveResult>;
+  save(objectId: string, knownFile: KnownDownloadFile, signal?: AbortSignal): Promise<SaveResult>;
+  async save(
+    objectId: string,
+    knownOrSignal?: SaveFilePickerInput,
+    requestedSignal = this.signal,
+  ): Promise<SaveResult> {
     requireBrowser();
+    const knownFile = knownOrSignal && !isAbortSignal(knownOrSignal) ? knownOrSignal : undefined;
+    const signal = isAbortSignal(knownOrSignal) ? knownOrSignal : requestedSignal;
+    const picker = (window as SavePickerWindow).showSaveFilePicker;
+    let selectedHandle: SaveFileHandle | undefined;
+    let pickerAttempted = false;
+    if (knownFile && picker) {
+      pickerAttempted = true;
+      try {
+        // Start picker before prepare() reaches its first network await.
+        selectedHandle = await picker({ suggestedName: knownName(knownFile) });
+      } catch (error) {
+        if (isPickerAbortError(error)) return { method: 'cancelled', name: knownName(knownFile), size: knownFile.size };
+      }
+    }
     const prepared = await this.prepare(objectId, signal);
     const { object } = prepared.manifest;
-    const picker = (window as SavePickerWindow).showSaveFilePicker;
-    if (picker) {
-      const handle = await picker({ suggestedName: object.name });
-      const writable = await handle.createWritable();
+    if (selectedHandle) {
       try {
-        await this.downloadParts(prepared, signal, undefined, false, (bytes) => writable.write(bytes));
-        await writable.close();
-        return { method: 'file-system-access', name: object.name, size: object.size };
+        return await this.saveToFileSystem(selectedHandle, prepared, signal);
       } catch (error) {
-        await writable.abort?.();
-        throw error;
+        if (!(error instanceof FileSystemUnavailableError)) throw error;
+      }
+    } else if (picker && !pickerAttempted) {
+      let handle: SaveFileHandle | undefined;
+      try {
+        handle = await picker({ suggestedName: object.name });
+      } catch (error) {
+        if (isPickerAbortError(error)) return { method: 'cancelled', name: object.name, size: object.size };
+        // Non-cancel picker failures fall through to StreamSaver/Blob.
+      }
+      if (handle) {
+        try {
+          return await this.saveToFileSystem(handle, prepared, signal);
+        } catch (error) {
+          if (!(error instanceof FileSystemUnavailableError)) throw error;
+        }
       }
     }
 
@@ -269,12 +295,11 @@ export class DownloadController {
       }
     }
 
-    if (object.size > MAX_BLOB_FALLBACK_BYTES) {
+    if (object.size > MAX_BLOB_FALLBACK_BYTES)
       throw new DownloadError(
         'STREAMSAVER_UNAVAILABLE',
         'StreamSaver is unavailable; large downloads require a supported browser download stream.',
       );
-    }
     const chunks = await this.downloadParts(prepared, signal, MAX_BLOB_FALLBACK_BYTES, true);
     const blob = new Blob(chunks as BlobPart[], { type: object.mime });
     const url = URL.createObjectURL(blob);
@@ -286,13 +311,35 @@ export class DownloadController {
     return { method: 'blob', name: object.name, size: object.size };
   }
 
+  saveWithKnownFile(objectId: string, knownFile: KnownDownloadFile, signal = this.signal): Promise<SaveResult> {
+    return this.save(objectId, knownFile, signal);
+  }
+
+  private async saveToFileSystem(
+    handle: SaveFileHandle,
+    prepared: PreparedDownload,
+    signal: AbortSignal | undefined,
+  ): Promise<SaveResult> {
+    const { object } = prepared.manifest;
+    let writable: FileWritable;
+    try {
+      writable = await handle.createWritable();
+    } catch (error) {
+      throw new FileSystemUnavailableError(error);
+    }
+    try {
+      await this.downloadParts(prepared, signal, undefined, false, (bytes) => writable.write(bytes));
+      await writable.close();
+      return { method: 'file-system-access', name: object.name, size: object.size };
+    } catch (error) {
+      await writable.abort?.();
+      throw error;
+    }
+  }
+
   private async prepare(objectId: string, signal?: AbortSignal): Promise<PreparedDownload> {
     throwIfAborted(signal);
-    const session = await this.gateway.checkSession();
-    if (!session.authorized) throw new DownloadError('TG_AUTH_REQUIRED', 'Connect Telegram before downloading.');
-    throwIfAborted(signal);
-    const channel = configuredChannel(this.channel);
-    const manifest = await this.api.getManifest(objectId);
+    const manifest = await this.api.getBotManifest(objectId);
     validateManifest(manifest);
     this.onProgress?.({
       phase: 'metadata',
@@ -301,32 +348,30 @@ export class DownloadController {
       completedParts: 0,
       totalParts: manifest.object.partCount,
     });
-    return { channel, manifest };
+    return { manifest };
   }
 
   private async downloadPartWithRetry(
-    channel: string,
-    telegramMessageId: number,
+    objectId: string,
+    partNo: number,
     signal: AbortSignal | undefined,
-    onProgress: (bytes: number, total: number) => void,
-  ): Promise<TelegramDownloadResult> {
+  ): Promise<Uint8Array> {
     for (let attempt = 1; attempt <= MAX_PART_ATTEMPTS; attempt += 1) {
       throwIfAborted(signal);
       try {
-        return await this.gateway.downloadPart(channel, telegramMessageId, onProgress);
+        const response = await this.api.getBotPartContent(objectId, partNo);
+        return new Uint8Array(await response.arrayBuffer());
       } catch (error) {
         throwIfAborted(signal);
         if (!isRetryablePartError(error)) throw error;
-        if (attempt === MAX_PART_ATTEMPTS) {
-          throw new DownloadError('TG_PART_DOWNLOAD_FAILED', 'Telegram file part failed after retries.');
-        }
-        const floodWait = floodWaitSeconds(error);
-        const delay = floodWait === undefined ? PART_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) : floodWait * 1000;
+        if (attempt === MAX_PART_ATTEMPTS)
+          throw new DownloadError('PART_DOWNLOAD_FAILED', 'File part failed after retries.');
+        const delay =
+          retryAfter(error) === undefined ? PART_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) : retryAfter(error)! * 1000;
         await waitForRetry(delay, signal);
-        throwIfAborted(signal);
       }
     }
-    throw new DownloadError('TG_PART_DOWNLOAD_FAILED', 'Telegram file part failed after retries.');
+    throw new DownloadError('PART_DOWNLOAD_FAILED', 'File part failed after retries.');
   }
 
   private async downloadParts(
@@ -336,54 +381,63 @@ export class DownloadController {
     collect: boolean,
     sink?: (bytes: Uint8Array) => Promise<void>,
   ): Promise<Uint8Array[]> {
-    const { channel, manifest } = prepared;
+    const { manifest } = prepared;
     const parts = validateManifest(manifest);
     const objectHash = manifest.object.sha256;
     if (typeof objectHash !== 'string') throw new DownloadError('INVALID_MANIFEST', 'Download manifest is invalid.');
-    if (maxBytes !== undefined && manifest.object.size > maxBytes) {
+    if (maxBytes !== undefined && manifest.object.size > maxBytes)
       throw new DownloadError('DOWNLOAD_TOO_LARGE', 'Download exceeds the configured safe memory limit.');
-    }
     const fullHash = sha256.create();
     const chunks: Uint8Array[] = [];
     let downloaded = 0;
-    for (const [index, part] of parts.entries()) {
-      throwIfAborted(signal);
-      const result = await this.downloadPartWithRetry(channel, messageId(part.messageId), signal, (bytes) => {
-        const current = Math.min(part.size, Math.max(0, bytes));
+    let completedCount = 0;
+    // Resolve concurrency from pool
+    let concurrency = 1;
+    if (this.api.getStoragePool) {
+      try {
+        const pool = await this.api.getStoragePool();
+        concurrency = Math.max(1, Math.min(8, pool.botCount || 1));
+      } catch {
+        // ponytail: pool offline, fallback serial
+      }
+    }
+    // Bounded parallel download
+    const results = new Array<Uint8Array>(parts.length);
+    let nextIdx = 0;
+    const runWorker = async () => {
+      while (nextIdx < parts.length) {
+        const idx = nextIdx++;
+        const part = parts[idx];
+        throwIfAborted(signal);
+        const data = await this.downloadPartWithRetry(manifest.object.id, part.partNo, signal);
+        throwIfAborted(signal);
+        if (data.byteLength !== part.size || data.byteLength > MAX_PART_BYTES)
+          throw new DownloadError('PART_SIZE_MISMATCH', 'Downloaded part size does not match manifest.');
+        if (bytesToHex(sha256(data)).toLowerCase() !== part.sha256.toLowerCase())
+          throw new DownloadError('PART_HASH_MISMATCH', 'Downloaded part failed integrity validation.');
+        results[idx] = data;
+        downloaded += data.byteLength;
+        completedCount += 1;
         this.onProgress?.({
           phase: 'downloading',
-          bytesDownloaded: downloaded + current,
+          bytesDownloaded: downloaded,
           totalBytes: manifest.object.size,
-          completedParts: index,
+          completedParts: completedCount,
           totalParts: parts.length,
         });
-      });
-      throwIfAborted(signal);
-      if (!(result.data instanceof Uint8Array) || result.data.byteLength !== part.size) {
-        throw new DownloadError('PART_SIZE_MISMATCH', 'Downloaded Telegram part size does not match manifest.');
       }
-      const partHash = bytesToHex(sha256(result.data));
-      if (partHash.toLowerCase() !== part.sha256.toLowerCase()) {
-        throw new DownloadError('PART_HASH_MISMATCH', 'Downloaded Telegram part failed integrity validation.');
-      }
-      fullHash.update(result.data);
-      if (sink) await sink(result.data);
-      if (collect) chunks.push(result.data);
-      downloaded += result.data.byteLength;
-      this.onProgress?.({
-        phase: 'downloading',
-        bytesDownloaded: downloaded,
-        totalBytes: manifest.object.size,
-        completedParts: index + 1,
-        totalParts: parts.length,
-      });
+    };
+    const workers = Array.from({ length: Math.min(concurrency, parts.length) }, runWorker);
+    await Promise.all(workers);
+    // Commit in order: hash, write; progress already counted per part
+    for (let i = 0; i < parts.length; i++) {
+      const data = results[i];
+      fullHash.update(data);
+      if (sink) await sink(data);
+      if (collect) chunks.push(data);
     }
-    if (
-      downloaded !== manifest.object.size ||
-      bytesToHex(fullHash.digest()).toLowerCase() !== objectHash.toLowerCase()
-    ) {
-      throw new DownloadError('OBJECT_HASH_MISMATCH', 'Downloaded Telegram object failed integrity validation.');
-    }
+    if (downloaded !== manifest.object.size || bytesToHex(fullHash.digest()).toLowerCase() !== objectHash.toLowerCase())
+      throw new DownloadError('OBJECT_HASH_MISMATCH', 'Downloaded object failed integrity validation.');
     this.onProgress?.({
       phase: 'completed',
       bytesDownloaded: downloaded,

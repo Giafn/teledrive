@@ -25,6 +25,10 @@ export async function sha256(value: string | ArrayBuffer | Uint8Array): Promise<
   return hex(new Uint8Array(await crypto.subtle.digest('SHA-256', data as BufferSource)));
 }
 
+export async function sha256Base64url(value: string): Promise<string> {
+  return base64url(new Uint8Array(await crypto.subtle.digest('SHA-256', textEncoder.encode(value))));
+}
+
 export async function secretHash(value: string, secret: string): Promise<string> {
   const key = await crypto.subtle.importKey(
     'raw',

@@ -8,23 +8,35 @@ import {
   type FolderChildrenResponse,
   type FolderItem,
   type ObjectListItem,
+  type StoragePoolResponse,
   type WorkspaceResponse,
 } from '../lib/api';
-import { createUploadController, type UploadController, type UploadProgress } from '../lib/upload-controller';
+import {
+  createUploadController,
+  createUploadQueue,
+  type UploadController,
+  type UploadProgress,
+} from '../lib/upload-controller';
 import {
   createDownloadController,
   isPreviewMimeSupported,
   type DownloadProgress,
   DownloadError,
 } from '../lib/download-controller';
-import { telegramGateway, type TelegramAuthState } from '../lib/telegram-gateway';
 import styles from './page.module.css';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
-type Upload = { id: string; file: File; controller: UploadController; progress?: UploadProgress; error?: string };
+type Upload = {
+  id: string;
+  file: File;
+  controller: UploadController;
+  progress?: UploadProgress;
+  error?: string;
+};
 type DownloadItem = { id: string; name: string; mime: string; size: number | null };
 type DownloadAction = {
   controller: ReturnType<typeof createDownloadController>;
+  name: string;
   progress?: DownloadProgress;
   error?: string;
   done?: boolean;
@@ -154,47 +166,41 @@ function message(error: unknown) {
   }
   return 'Terjadi kesalahan. Coba lagi.';
 }
-function telegramError(error: unknown) {
+function controllerError(error: unknown) {
   const text = message(error);
-  const lower = text.toLowerCase();
-  const code = text
-    .match(/\b[A-Z][A-Z0-9_]{2,63}\b/g)
-    ?.find((token) => /^(?:TG_|API_|AUTH_|CHANNEL_|FLOOD_|NETWORK_|PHONE_|SESSION_|RPC_)/.test(token));
-  const suffix = code ? ` (${code})` : '';
-  if (text.includes('TG_AUTH_REQUIRED') || lower.includes('not authorized') || lower.includes('unauthorized'))
-    return `Hubungkan akun Telegram sebelum upload${suffix || ' (TG_AUTH_REQUIRED)'}.`;
-  if (lower.includes('api_id') || lower.includes('api hash') || lower.includes('configuration'))
-    return `Konfigurasi Telegram belum lengkap — periksa API ID dan API hash deployment${suffix}.`;
-  if (lower.includes('channel'))
-    return `Channel Telegram belum dikonfigurasi atau tidak dapat diakses — periksa username dan izin admin${suffix}.`;
-  if (lower.includes('network') || lower.includes('connection') || lower.includes('timeout'))
-    return `Koneksi Telegram bermasalah — periksa jaringan lalu coba lagi${suffix}.`;
-  return 'Permintaan Telegram gagal — coba lagi.';
+  const code = error instanceof ApiError ? error.code : text.match(/\bBOT_[A-Z_]+\b/)?.[0];
+  if (code === 'BOT_NOT_CONFIGURED' || code === 'BOT_CHANNEL_MISSING' || code === 'BOT_CHANNEL_NOT_BOUND')
+    return 'Bot atau channel belum siap. Buka Pengaturan untuk menyelesaikan setup.';
+  if (code === 'BOT_CHALLENGE_EXPIRED') return 'Kode setup kedaluwarsa. Buka Pengaturan untuk menghubungkan ulang bot.';
+  if (code === 'BOT_TOKEN_INVALID') return 'Token bot tidak valid. Periksa token BotFather lalu coba lagi.';
+  if (code === 'BOT_PART_ATTEMPT_AMBIGUOUS' || code === 'BOT_PART_ATTEMPT_IN_PROGRESS')
+    return 'Bagian file menunggu kepastian Worker. Gunakan “Abandon attempt dan coba lagi” untuk melanjutkan sesi ini.';
+  return text || 'Permintaan upload gagal. Coba lagi.';
 }
 function downloadError(error: unknown) {
   if (error instanceof DownloadError) {
     const guidance: Record<string, string> = {
-      TG_AUTH_REQUIRED: 'Hubungkan akun Telegram sebelum mengunduh.',
-      CHANNEL_MISSING: 'Konfigurasi channel Telegram belum tersedia.',
+      TG_AUTH_REQUIRED: 'Bot belum terhubung. Buka Pengaturan untuk melanjutkan.',
+      CHANNEL_MISSING: 'Channel privat belum terhubung. Buka Pengaturan untuk melanjutkan.',
       DOWNLOAD_TOO_LARGE: 'File terlalu besar untuk fallback browser ini.',
       STREAMSAVER_UNAVAILABLE:
         'Browser tidak mendukung unduhan besar langsung. Gunakan Chrome atau Edge terbaru melalui HTTPS.',
       PREVIEW_UNSUPPORTED_MIME: 'Tipe file ini hanya dapat diunduh.',
       PREVIEW_TOO_LARGE: 'Preview dibatasi hingga 200 MiB.',
       DOWNLOAD_ABORTED: 'Unduhan dibatalkan.',
-      TG_PART_DOWNLOAD_FAILED: 'Satu bagian file Telegram gagal setelah dicoba ulang. Coba lagi.',
+      TG_PART_DOWNLOAD_FAILED: 'Satu bagian file gagal setelah dicoba ulang. Coba lagi.',
     };
     return guidance[error.code] ?? 'Unduhan gagal. Coba lagi.';
   }
-  return telegramError(error);
+  return controllerError(error);
 }
 function formatSize(size: number | null) {
   if (size === null) return '—';
-  return size > 1024 ** 3
-    ? `${(size / 1024 ** 3).toFixed(1)} GB`
-    : size > 1024 ** 2
-      ? `${(size / 1024 ** 2).toFixed(1)} MB`
-      : `${Math.max(1, Math.round(size / 1024))} KB`;
+  return size > 1000 ** 3
+    ? `${(size / 1000 ** 3).toFixed(1)} GB`
+    : size > 1000 ** 2
+      ? `${(size / 1000 ** 2).toFixed(1)} MB`
+      : `${Math.max(1, Math.round(size / 1000))} KB`;
 }
 function mimeStyle(mime: string | null) {
   const value = mime?.toLowerCase() ?? '';
@@ -219,6 +225,8 @@ export default function Page() {
   const [sessionRestoreError, setSessionRestoreError] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState('');
+  const [googleBusy, setGoogleBusy] = useState(false);
+  const [googleError, setGoogleError] = useState('');
   const [workspace, setWorkspace] = useState<WorkspaceResponse | null>(null);
   const [folder, setFolder] = useState<FolderChildrenResponse | null>(null);
   const [recent, setRecent] = useState<ObjectListItem[]>([]);
@@ -236,6 +244,9 @@ export default function Page() {
   const [loadError, setLoadError] = useState('');
   const [query, setQuery] = useState('');
   const [layout, setLayout] = useState<'list' | 'grid'>('list');
+  const [pool, setPool] = useState<StoragePoolResponse | null>(null);
+  const [poolError, setPoolError] = useState('');
+  const poolReady = pool?.ready === true;
   const [sort, setSort] = useState('Terakhir diubah');
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [downloads, setDownloads] = useState<Record<string, DownloadAction>>({});
@@ -243,7 +254,8 @@ export default function Page() {
   const [drawer, setDrawer] = useState(false);
   const [folderDialog, setFolderDialog] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-  const settings = useRef({ chunkSize: 16 * 1024 * 1024, concurrency: 3 });
+  const settings = useRef({ chunkSize: 16 * 1024 * 1024 });
+  const uploadQueue = useRef(createUploadQueue());
   useEffect(() => {
     setMenuId(null);
     setSelected({});
@@ -269,9 +281,9 @@ export default function Page() {
       onProgress: (progress) =>
         setDownloads((current) => ({ ...current, [item.id]: { ...current[item.id], controller, progress } })),
     });
-    setDownloads((current) => ({ ...current, [item.id]: { controller } }));
+    setDownloads((current) => ({ ...current, [item.id]: { controller, name: item.name } }));
     controller
-      .save(item.id)
+      .save(item.id, { name: item.name, size: item.size ?? 0 })
       .then(() =>
         setDownloads((current) => ({ ...current, [item.id]: { ...current[item.id], controller, done: true } })),
       )
@@ -298,6 +310,7 @@ export default function Page() {
   }
   async function enterApp(authUser: { displayName: string; username: string }) {
     setUser(authUser);
+    void probePool();
     setLoading(true);
     setLoadError('');
     try {
@@ -309,6 +322,26 @@ export default function Page() {
       setLoadError(message(error));
     } finally {
       setLoading(false);
+    }
+  }
+  async function probePool() {
+    setPoolError('');
+    try {
+      setPool(await api.getStoragePool());
+    } catch (error) {
+      setPool(null);
+      setPoolError(message(error));
+    }
+  }
+  async function openGoogle(mode: 'login' | 'link') {
+    if (googleBusy) return;
+    setGoogleBusy(true);
+    setGoogleError('');
+    try {
+      window.location.assign(await api.googleAuthorizationUrl(mode));
+    } catch (error) {
+      setGoogleError(message(error));
+      setGoogleBusy(false);
     }
   }
   async function restoreSession() {
@@ -325,6 +358,16 @@ export default function Page() {
   }
   useEffect(() => {
     void restoreSession();
+  }, []);
+  useEffect(() => {
+    const knownErrors: Record<string, string> = {
+      GOOGLE_AUTH_FAILED: 'Login Google gagal. Coba lagi.',
+      google_denied: 'Login Google dibatalkan.',
+      google_failed: 'Login Google gagal. Coba lagi.',
+      google_link_failed: 'Pengaitan Google gagal. Coba lagi.',
+    };
+    const code = new URLSearchParams(window.location.search).get('error');
+    if (code && knownErrors[code]) setGoogleError(knownErrors[code]);
   }, []);
   async function loadSpecial(nextView: 'recent' | 'trash', append = false) {
     setView(nextView);
@@ -377,14 +420,14 @@ export default function Page() {
         if (action === 'delete') await api.softDeleteFolder(id);
         if (action === 'restore') await api.restoreFolder(id);
         if (action === 'purge') {
-          if (!window.confirm('Hapus folder permanen dari metadata? Isi Telegram tidak ikut dihapus.')) return;
+          if (!window.confirm('Hapus folder permanen dari metadata? Blob channel tidak ikut dihapus.')) return;
           await api.permanentDeleteFolder(id);
         }
       } else {
         if (action === 'delete') await api.softDeleteObject(id);
         if (action === 'restore') await api.restoreObject(id);
         if (action === 'purge') {
-          if (!window.confirm('Hapus file permanen dari metadata? Isi Telegram tidak ikut dihapus.')) return;
+          if (!window.confirm('Hapus file permanen dari metadata? Blob channel tidak ikut dihapus.')) return;
           await api.permanentDeleteObject(id);
         }
       }
@@ -454,7 +497,7 @@ export default function Page() {
     );
   }
   function uploadFiles(files: FileList | File[]) {
-    if (!workspace) return;
+    if (!workspace || !poolReady) return;
     Array.from(files).forEach((file) => {
       const id = crypto.randomUUID();
       let controller: UploadController;
@@ -462,36 +505,61 @@ export default function Page() {
         file,
         folderId: folder?.folder.id ?? workspace.rootFolder.id,
         chunkSize: settings.current.chunkSize,
-        concurrency: settings.current.concurrency,
+        concurrency: 1,
         onProgress: (progress) =>
           setUploads((items) => items.map((item) => (item.id === id ? { ...item, progress } : item))),
-      });
+      } as Parameters<typeof createUploadController>[0]);
       const item = { id, file, controller };
       setUploads((items) => [item, ...items]);
       setDrawer(true);
-      controller
-        .start()
+      uploadQueue.current
+        .enqueue(() => controller.start())
         .then(() => loadFolder(folder?.folder.id ?? workspace.rootFolder.id))
         .catch((error) => {
           if (error?.name !== 'UploadCancelledError')
-            setUploads((items) => items.map((x) => (x.id === id ? { ...x, error: message(error) } : x)));
+            setUploads((items) => items.map((x) => (x.id === id ? { ...x, error: controllerError(error) } : x)));
         });
     });
   }
   async function retryUpload(item: Upload) {
+    const blocked = item.progress?.error?.attemptStatus;
+    if (blocked) {
+      try {
+        if (
+          blocked === 'ambiguous' &&
+          !window.confirm(
+            'Abandon attempt dan coba lagi? Telegram mungkin sudah menerima bagian file ini, sehingga orphan atau duplikat bisa tertinggal.',
+          )
+        )
+          return;
+        if (blocked === 'ambiguous') await item.controller.abandonPartAttempt(item.progress?.blockedPartNo);
+        setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, error: undefined } : x)));
+        uploadQueue.current
+          .enqueue(() => item.controller.resumeSameUpload())
+          .then(() => loadFolder(folder?.folder.id ?? workspace!.rootFolder.id))
+          .catch((error) =>
+            setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, error: controllerError(error) } : x))),
+          );
+      } catch (error) {
+        setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, error: controllerError(error) } : x)));
+      }
+      return;
+    }
     const controller = createUploadController({
       file: item.file,
       folderId: folder?.folder.id ?? workspace?.rootFolder.id,
       chunkSize: settings.current.chunkSize,
-      concurrency: settings.current.concurrency,
+      concurrency: 1,
       onProgress: (progress) =>
         setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, controller, progress, error: undefined } : x))),
-    });
+    } as Parameters<typeof createUploadController>[0]);
     setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, controller, error: undefined } : x)));
-    controller
-      .start()
+    uploadQueue.current
+      .enqueue(() => controller.start())
       .then(() => loadFolder(folder?.folder.id ?? workspace!.rootFolder.id))
-      .catch((error) => setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, error: message(error) } : x))));
+      .catch((error) =>
+        setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, error: controllerError(error) } : x))),
+      );
   }
   async function createFolder(name: string) {
     if (!name.trim() || !workspace) return;
@@ -523,6 +591,9 @@ export default function Page() {
           await enterApp(nextUser);
           setSessionReady(true);
         }}
+        googleBusy={googleBusy}
+        googleError={googleError}
+        onGoogle={() => openGoogle('login')}
       />
     );
   const items = (folder?.items ?? [])
@@ -544,7 +615,7 @@ export default function Page() {
           </span>
           ruang<span className={styles.dot}>.</span>
         </div>
-        <button className={styles.uploadButton} onClick={() => fileInput.current?.click()}>
+        <button className={styles.uploadButton} disabled={!poolReady} onClick={() => fileInput.current?.click()}>
           <Icon name="upload" /> Unggah file
         </button>
         <nav aria-label="Navigasi utama" className={styles.nav}>
@@ -563,7 +634,7 @@ export default function Page() {
         <div className={styles.sideBottom}>
           <div className={styles.storageLabel}>
             <span>Penyimpanan</span>
-            <b>Telegram</b>
+            <b>{poolReady ? 'Pool siap' : 'Memeriksa…'}</b>
           </div>
           <div className={styles.storageBar}>
             <i />
@@ -616,7 +687,16 @@ export default function Page() {
           />
         )}
         {view === 'settings' ? (
-          <Settings settings={settings} onLogout={logout} />
+          <Settings
+            settings={settings}
+            pool={pool}
+            poolError={poolError}
+            onRefreshPool={probePool}
+            onLogout={logout}
+            googleBusy={googleBusy}
+            googleError={googleError}
+            onGoogleLink={() => openGoogle('link')}
+          />
         ) : view !== 'drive' ? (
           <SpecialView
             title={view === 'recent' ? 'Terbaru' : 'Sampah'}
@@ -658,11 +738,20 @@ export default function Page() {
                 <button className={styles.secondaryButton} onClick={() => setFolderDialog(true)}>
                   <Icon name="plus" size={16} /> Folder baru
                 </button>
-                <button className={styles.primaryButton} onClick={() => fileInput.current?.click()}>
+                <button
+                  className={styles.primaryButton}
+                  disabled={!poolReady}
+                  onClick={() => fileInput.current?.click()}
+                >
                   <Icon name="upload" size={16} /> Unggah
                 </button>
               </div>
             </div>
+            {!poolReady && (
+              <div className={styles.notice} role="status">
+                Storage pool belum siap. Periksa Pengaturan untuk informasi status.
+              </div>
+            )}
             <div className={styles.toolbar}>
               <span className={styles.itemCount}>{loading ? 'Memuat…' : `${items.length} item`}</span>
               <div className={styles.toolbarRight}>
@@ -727,6 +816,20 @@ export default function Page() {
           </>
         )}
       </section>
+      <nav className={styles.bottomNav} aria-label="Navigasi utama">
+        <NavItem
+          icon="drive"
+          label="Drive"
+          active={view === 'drive'}
+          onClick={() => {
+            setView('drive');
+            if (workspace) loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
+          }}
+        />
+        <NavItem icon="clock" label="Terbaru" active={view === 'recent'} onClick={() => loadSpecial('recent')} />
+        <NavItem icon="trash" label="Sampah" active={view === 'trash'} onClick={() => loadSpecial('trash')} />
+        <NavItem icon="settings" label="Pengaturan" active={view === 'settings'} onClick={() => setView('settings')} />
+      </nav>
       <input
         ref={fileInput}
         hidden
@@ -743,7 +846,7 @@ export default function Page() {
           <span>
             <b>{active.length} upload aktif</b>
             <small>
-              {active[0].progress?.phase === 'hashing' ? 'Menghitung SHA-256' : 'Mengunggah langsung ke Telegram'}
+              {active[0].progress?.phase === 'hashing' ? 'Menghitung SHA-256' : 'Mengunggah ke channel privat'}
             </small>
           </span>
           <Icon name="chevron" size={16} />
@@ -779,6 +882,16 @@ export default function Page() {
           onConfirm={completeMove}
         />
       )}
+      <DownloadToasts
+        downloads={downloads}
+        onDismiss={(id) =>
+          setDownloads((current) => {
+            const next = { ...current };
+            delete next[id];
+            return next;
+          })
+        }
+      />
     </main>
   );
 }
@@ -963,12 +1076,18 @@ function AuthScreen({
   onBusy,
   onError,
   onSuccess,
+  onGoogle,
+  googleBusy,
+  googleError,
 }: {
   busy: boolean;
   error: string;
   onBusy: (v: boolean) => void;
   onError: (v: string) => void;
   onSuccess: (u: { displayName: string; username: string }) => void;
+  onGoogle: () => Promise<void>;
+  googleBusy: boolean;
+  googleError: string;
 }) {
   const [register, setRegister] = useState(false);
   const [username, setUsername] = useState('');
@@ -1044,6 +1163,14 @@ function AuthScreen({
         <button className={styles.primaryButton} disabled={busy} onClick={submit}>
           {busy ? 'Menyiapkan passkey…' : register ? 'Daftar dengan passkey' : 'Masuk dengan passkey'}
         </button>
+        {googleError && (
+          <div className={styles.formError} role="alert">
+            {googleError}
+          </div>
+        )}
+        <button className={styles.googleButton} disabled={busy || googleBusy} onClick={() => void onGoogle()}>
+          {googleBusy ? 'Membuka Google…' : 'Masuk dengan Google'}
+        </button>
         <p className={styles.authSwitch}>
           {register ? 'Sudah punya akun?' : 'Belum punya akun?'}{' '}
           <button
@@ -1056,7 +1183,9 @@ function AuthScreen({
             {register ? 'Masuk' : 'Daftar'}
           </button>
         </p>
-        <small className={styles.secureNote}>Butuh browser modern dan secure origin (HTTPS atau localhost).</small>
+        <small className={styles.secureNote}>
+          Google dan passkey mengautentikasi akun Ruang, bukan kredensial bot.
+        </small>
       </div>
     </main>
   );
@@ -1287,9 +1416,7 @@ function PreviewModal({
             <div className={styles.previewLoading} aria-live="polite">
               <span className={styles.spinner} />
               <b>Menyiapkan pratinjau…</b>
-              <small>
-                {percent}% · {progress?.completedParts ?? 0}/{progress?.totalParts ?? 0} bagian
-              </small>
+              <small>{percent}%</small>
               <button className={styles.textButton} onClick={onClose}>
                 Batalkan
               </button>
@@ -1339,6 +1466,54 @@ function DownloadButton({
       </button>
       {action?.error && <small className={styles.downloadError}>{action.error}</small>}
     </span>
+  );
+}
+function DownloadToasts({
+  downloads,
+  onDismiss,
+}: {
+  downloads: Record<string, DownloadAction>;
+  onDismiss: (id: string) => void;
+}) {
+  const entries = Object.entries(downloads).filter(([, action]) => action.progress || action.error || action.done);
+  if (!entries.length) return null;
+  return (
+    <div className={styles.downloadToasts} role="region" aria-label="Unduhan">
+      {entries.map(([id, action]) => {
+        const percent = action.progress?.totalBytes
+          ? Math.round((action.progress.bytesDownloaded / action.progress.totalBytes) * 100)
+          : 0;
+        return (
+          <div
+            key={id}
+            className={`${styles.downloadToast} ${action.error ? styles.downloadToastError : ''} ${action.done ? styles.downloadToastDone : ''}`}
+          >
+            <div className={styles.downloadToastTitle}>
+              <b title={action.name}>{action.name}</b>
+              <button
+                className={styles.downloadToastClose}
+                onClick={() => onDismiss(id)}
+                aria-label={`Tutup unduhan ${action.name}`}
+              >
+                <Icon name="close" size={14} />
+              </button>
+            </div>
+            {action.error ? (
+              <small>{action.error}</small>
+            ) : action.done ? (
+              <small>Selesai</small>
+            ) : (
+              <>
+                <div className={styles.downloadToastBar}>
+                  <i style={{ width: `${percent}%` }} />
+                </div>
+                <small>Sedang mendownload… {percent}%</small>
+              </>
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 function Empty({ query }: { query: string }) {
@@ -1545,54 +1720,54 @@ function ObjectRow({
         {menuId === item.id && (
           <div className={styles.rowMenuPopup} role="menu">
             {trash ? (
-              <>
-                <button role="menuitem" onClick={() => onMutate('object', 'restore', item.id, item.name)}>
-                  Pulihkan
-                </button>
-                <button
-                  role="menuitem"
-                  className={styles.dangerAction}
-                  onClick={() => onMutate('object', 'purge', item.id, item.name)}
-                >
-                  Hapus metadata permanen
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    setMenuId(null);
-                    onDownload(downloadable);
-                  }}
-                >
-                  {download?.error
-                    ? 'Coba lagi'
-                    : download?.done
-                      ? 'Selesai'
-                      : download?.progress?.totalBytes
-                        ? `Unduh ${Math.round((download.progress.bytesDownloaded / download.progress.totalBytes) * 100)}%`
-                        : 'Unduh file'}
-                </button>
-                {download?.error && <small className={styles.downloadError}>{download.error}</small>}
-                <button role="menuitem" onClick={() => onMutate('object', 'rename', item.id, item.name)}>
-                  Ganti nama
-                </button>
-                <button role="menuitem" onClick={() => onMove([{ id: item.id, kind: 'object', name: item.name }])}>
-                  Pindahkan ke
-                </button>
-                <button
-                  role="menuitem"
-                  className={styles.dangerAction}
-                  onClick={() => onMutate('object', 'delete', item.id, item.name)}
-                >
-                  Pindahkan ke sampah
-                </button>
-              </>
-            )}
-          </div>
-        )}
-      </span>
+                <>
+                  <button role="menuitem" onClick={() => onMutate('object', 'restore', item.id, item.name)}>
+                    Pulihkan
+                  </button>
+                  <button
+                    role="menuitem"
+                    className={styles.dangerAction}
+                    onClick={() => onMutate('object', 'purge', item.id, item.name)}
+                  >
+                    Hapus metadata permanen
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      setMenuId(null);
+                      onDownload(downloadable);
+                    }}
+                  >
+                    {download?.error
+                      ? 'Coba lagi'
+                      : download?.done
+                        ? 'Selesai'
+                        : download?.progress?.totalBytes
+                          ? `Unduh ${Math.round((download.progress.bytesDownloaded / download.progress.totalBytes) * 100)}%`
+                          : 'Unduh file'}
+                  </button>
+                  {download?.error && <small className={styles.downloadError}>{download.error}</small>}
+                  <button role="menuitem" onClick={() => onMutate('object', 'rename', item.id, item.name)}>
+                    Ganti nama
+                  </button>
+                  <button role="menuitem" onClick={() => onMove([{ id: item.id, kind: 'object', name: item.name }])}>
+                    Pindahkan ke
+                  </button>
+                  <button
+                    role="menuitem"
+                    className={styles.dangerAction}
+                    onClick={() => onMutate('object', 'delete', item.id, item.name)}
+                  >
+                    Pindahkan ke sampah
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </span>
     </article>
   );
 }
@@ -1648,7 +1823,7 @@ function UploadDrawer({
       <div className={styles.drawerHead}>
         <div>
           <b>Antrean upload</b>
-          <small>{uploads.length} file · status nyata</small>
+          <small>{uploads.length} file · antrean Bot</small>
         </div>
         <button onClick={onClose} aria-label="Tutup antrean">
           <Icon name="close" />
@@ -1686,14 +1861,18 @@ function UploadDrawer({
                 </div>
                 <small>
                   {progress
-                    ? `${percent}% · ${progress.completedParts}/${progress.totalParts} bagian`
+                    ? `${progress.phase === 'hashing' ? 'Menghitung hash' : 'Sedang mengunggah'} · ${percent}%`
                     : 'Menunggu mulai'}
                 </small>
-                {item.error && <small className={styles.uploadError}>{telegramError(item.error)}</small>}
+                {item.error && <small className={styles.uploadError}>{controllerError(item.error)}</small>}
               </div>
               {item.error ? (
                 <button className={styles.retryButton} onClick={() => onRetry(item)}>
-                  Coba lagi
+                  {item.progress?.error?.attemptStatus === 'ambiguous'
+                    ? 'Abandon attempt dan coba lagi'
+                    : item.progress?.error?.attemptStatus === 'in_progress'
+                      ? 'Lanjutkan attempt'
+                      : 'Coba lagi'}
                 </button>
               ) : done ? (
                 <Icon name="check" size={17} />
@@ -1724,70 +1903,29 @@ function UploadDrawer({
 
 function Settings({
   settings,
+  pool,
+  poolError,
+  onRefreshPool,
   onLogout,
+  onGoogleLink,
+  googleBusy,
+  googleError,
 }: {
-  settings: React.MutableRefObject<{ chunkSize: number; concurrency: number }>;
+  settings: React.MutableRefObject<{ chunkSize: number }>;
+  pool: StoragePoolResponse | null;
+  poolError: string;
+  onRefreshPool: () => Promise<void>;
   onLogout: () => Promise<void>;
+  onGoogleLink: () => Promise<void>;
+  googleBusy: boolean;
+  googleError: string;
 }) {
-  const [auth, setAuth] = useState<TelegramAuthState>({ state: 'logged_out' });
-  const [session, setSession] = useState<{ connected: boolean; authorized: boolean } | null>(null);
-  const [phone, setPhone] = useState('');
-  const [code, setCode] = useState('');
-  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
   const [probing, setProbing] = useState(true);
-  async function probe() {
-    setProbing(true);
-    setError('');
-    try {
-      const result = await telegramGateway.checkSession();
-      setSession(result);
-      setAuth(result.authorized ? { state: 'authorized' } : { state: 'logged_out' });
-    } catch (e) {
-      setSession(null);
-      setError(telegramError(e));
-    } finally {
-      setProbing(false);
-    }
-  }
   useEffect(() => {
-    void probe();
+    setProbing(true);
+    onRefreshPool().finally(() => setProbing(false));
   }, []);
-  async function run(action: () => Promise<TelegramAuthState>, probeAfter = false) {
-    setBusy(true);
-    setError('');
-    try {
-      const state = await action();
-      setAuth(state);
-      if (probeAfter) await probe();
-    } catch (e) {
-      setError(telegramError(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function send() {
-    const value = phone;
-    setPhone('');
-    if (value) await run(() => telegramGateway.sendCode(value));
-  }
-  async function signIn() {
-    const value = code;
-    setCode('');
-    if (value) await run(() => telegramGateway.signIn(value), true);
-  }
-  async function checkPassword() {
-    const value = password;
-    setPassword('');
-    if (value) await run(() => telegramGateway.checkPassword(value), true);
-  }
-  async function resend() {
-    await run(() => telegramGateway.resendCode());
-  }
-  async function logoutTelegram() {
-    await run(() => telegramGateway.logout(), true);
-  }
   async function exportData() {
     setError('');
     try {
@@ -1802,7 +1940,6 @@ function Settings({
       setError(message(e));
     }
   }
-  const authorized = session?.authorized === true;
   return (
     <div className={styles.settings}>
       <div className={styles.eyebrow}>PREFERENSI</div>
@@ -1812,85 +1949,44 @@ function Settings({
         <div className={styles.settingTitle}>
           <span className={styles.telegramMark}>✦</span>
           <div>
-            <h2>Koneksi Telegram</h2>
-            <p>{probing ? 'Memeriksa otorisasi…' : authorized ? 'Sesi terotorisasi' : 'Belum terotorisasi'}</p>
+            <h2>Penyimpanan</h2>
+            <p>
+              {probing
+                ? 'Memeriksa status…'
+                : poolError
+                  ? poolError
+                  : pool
+                    ? `${pool.channel} · ${pool.botCount} bot`
+                    : 'Informasi pool tidak tersedia'}
+            </p>
           </div>
           <span className={styles.statusTag}>
-            {probing ? 'Memeriksa' : authorized ? 'Terotorisasi' : 'Perlu sambung ulang'}
+            {probing ? 'Memeriksa' : poolError ? 'Gagal' : pool?.ready ? 'Siap' : pool ? 'Belum siap' : 'Tidak diketahui'}
           </span>
         </div>
-        {!probing && !authorized && (
-          <p className={styles.reconnectGuide}>
-            Sesi Telegram belum terotorisasi di browser ini. Hubungkan kembali untuk upload; kredensial tetap diproses
-            lokal.
-          </p>
-        )}
-        {auth.state === 'logged_out' && !authorized && (
-          <div className={styles.telegramFlow}>
-            <label className={styles.field}>
-              Nomor telepon
-              <input
-                inputMode="tel"
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                placeholder="+62…"
-                autoComplete="off"
-              />
-            </label>
-            <button className={styles.primaryButton} disabled={busy || !phone} onClick={send}>
-              Kirim kode
-            </button>
-          </div>
-        )}
-        {auth.state === 'code_sent' && (
-          <div className={styles.telegramFlow}>
-            <p className={styles.flowHint}>Kode dikirim lewat Telegram. Kode hanya digunakan di browser.</p>
-            <label className={styles.field}>
-              Kode OTP
-              <input
-                inputMode="numeric"
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                autoComplete="one-time-code"
-              />
-            </label>
-            <div className={styles.flowButtons}>
-              <button className={styles.primaryButton} disabled={busy || !code} onClick={signIn}>
-                Verifikasi
-              </button>
-              <button className={styles.textButton} disabled={busy} onClick={resend}>
-                Kirim ulang
-              </button>
-            </div>
-          </div>
-        )}
-        {auth.state === 'password_required' && (
-          <div className={styles.telegramFlow}>
-            <p className={styles.flowHint}>Telegram meminta password 2FA. Tidak disimpan atau dikirim ke API.</p>
-            <label className={styles.field}>
-              Password 2FA
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete="off"
-              />
-            </label>
-            <button className={styles.primaryButton} disabled={busy || !password} onClick={checkPassword}>
-              Lanjutkan
-            </button>
-          </div>
-        )}
-        {authorized && (
-          <div className={styles.flowButtons}>
-            <button className={styles.secondaryButton} disabled={probing} onClick={probe}>
-              Buktikan otorisasi Telegram
-            </button>
-            <button className={styles.textButton} onClick={logoutTelegram}>
-              Keluar dari Telegram
-            </button>
-          </div>
-        )}
+        <div className={styles.settingLine}>
+          <span>
+            <b>Channel</b>
+            <small>{pool?.channel ?? '—'}</small>
+          </span>
+        </div>
+        <div className={styles.settingLine}>
+          <span>
+            <b>Jumlah bot</b>
+            <small>{pool ? `${pool.botCount} bot aktif` : '—'}</small>
+          </span>
+        </div>
+        <div className={styles.settingLine}>
+          <span>
+            <b>Diagnostik</b>
+            <small>{pool?.reason ? `${pool.reason.code}: ${pool.reason.message}` : poolError || '—'}</small>
+          </span>
+        </div>
+        <div className={styles.flowButtons}>
+          <button className={styles.secondaryButton} onClick={() => void onRefreshPool()}>
+            Refresh status
+          </button>
+        </div>
         {error && (
           <div className={styles.formError} role="alert">
             <Icon name="info" size={16} />
@@ -1898,25 +1994,16 @@ function Settings({
           </div>
         )}
         <p className={styles.disclaimer}>
-          API ID/hash dan channel harus dikonfigurasi deployment. Pemeriksaan di atas membuktikan sesi Telegram
-          terotorisasi, bukan sekadar koneksi socket. Private channel bukan storage dengan SLA. Upload mobile dapat
-          berhenti saat browser berada di latar.
+          Bot dikelola oleh administrator. Storage pool menyediakan upload dan download otomatis untuk semua pengguna.
         </p>
+        {googleError && (
+          <div className={styles.formError} role="alert">
+            {googleError}
+          </div>
+        )}
       </section>
       <section className={styles.settingsCard}>
         <h2>Upload</h2>
-        <div className={styles.settingLine}>
-          <span>
-            <b>Concurrency</b>
-            <small>Bagian bersamaan untuk upload berikutnya</small>
-          </span>
-          <select defaultValue="3" onChange={(e) => (settings.current.concurrency = Number(e.target.value))}>
-            <option value="1">1 bagian</option>
-            <option value="2">2 bagian</option>
-            <option value="3">3 bagian</option>
-            <option value="4">4 bagian</option>
-          </select>
-        </div>
         <div className={styles.settingLine}>
           <span>
             <b>Ukuran bagian</b>
@@ -1935,9 +2022,13 @@ function Settings({
       <section className={styles.settingsCard}>
         <h2>Data</h2>
         <p className={styles.disclaimer}>
-          Ekspor manifest untuk recovery metadata. File blob tidak pernah diproksikan melalui Worker.
+          Ekspor manifest untuk recovery metadata. Worker mengalirkan bagian file terbatas, bukan seluruh file
+          sekaligus.
         </p>
         <div className={styles.flowButtons}>
+          <button className={styles.secondaryButton} disabled={googleBusy} onClick={() => void onGoogleLink()}>
+            {googleBusy ? 'Membuka Google…' : 'Hubungkan Google'}
+          </button>
           <button className={styles.textButton} onClick={exportData}>
             Ekspor metadata JSON <Icon name="download" size={16} />
           </button>

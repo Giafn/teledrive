@@ -1,4 +1,5 @@
 import { Hono, type Context } from 'hono';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import {
   generateAuthenticationOptions,
   generateRegistrationOptions,
@@ -16,6 +17,8 @@ import {
   redactJson,
   secretHash,
   serializeCookie,
+  sha256,
+  sha256Base64url,
 } from './security';
 import type {
   AppEnv,
@@ -28,6 +31,7 @@ import type {
   UserRow,
 } from './types';
 import { canAbort, canCommitPart, canComplete, uploadIsOpen } from './upload-state';
+import { createMultipartStream, StreamingBodyError } from './bot-transfer';
 import {
   canEditObject,
   decodeMetadataCursor,
@@ -39,6 +43,12 @@ import {
 const app = new Hono<AppEnv>();
 const SESSION_COOKIE = '__Host-td_session';
 const CSRF_COOKIE = 'td_csrf';
+const GOOGLE_OAUTH_STATE_COOKIE = '__Host-td_oauth_state';
+const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
+const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
+const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
+const GOOGLE_ISSUER = 'https://accounts.google.com';
+const GOOGLE_SCOPE = 'openid email profile';
 const MAX_JSON_BYTES = 256 * 1024;
 const MAX_NAME_LENGTH = 255;
 const MIN_CHUNK_SIZE = 8 * 1024 * 1024;
@@ -50,7 +60,7 @@ const authRate = new Map<string, { startedAt: number; count: number }>();
 
 class HttpError extends Error {
   constructor(
-    readonly status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 500,
+    readonly status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 500 | 502,
     readonly code: string,
     message: string,
   ) {
@@ -226,7 +236,7 @@ async function validateMutationCsrf(c: Context<AppEnv>): Promise<void> {
     return;
   }
 
-  if (c.req.path.startsWith('/v1/auth/passkey/')) {
+  if (c.req.path.startsWith('/v1/auth/passkey/') || c.req.path === '/v1/auth/google/start') {
     const cookieToken = requestCookie(c, CSRF_COOKIE);
     if (cookieToken && constantTimeEqual(cookieToken, csrf)) return;
   }
@@ -291,12 +301,21 @@ function changes(result: { meta?: { changes?: number } }): number {
   return result.meta?.changes ?? 0;
 }
 
-async function purgeChallenges(db: D1Database): Promise<void> {
-  const current = Date.now();
+export async function purgeChallenges(db: D1Database, at = Date.now()): Promise<void> {
+  const current = at;
   const expired = new Date(current).toISOString();
   const oldUsed = new Date(current - 10 * 60_000).toISOString();
   await db
     .prepare('DELETE FROM webauthn_challenges WHERE expires_at <= ? OR (used_at IS NOT NULL AND used_at < ?)')
+    .bind(expired, oldUsed)
+    .run();
+}
+
+export async function purgeOAuthTransactions(db: D1Database, at = Date.now()): Promise<void> {
+  const expired = new Date(at).toISOString();
+  const oldUsed = new Date(at - 10 * 60_000).toISOString();
+  await db
+    .prepare('DELETE FROM oauth_transactions WHERE expires_at <= ? OR (used_at IS NOT NULL AND used_at < ?)')
     .bind(expired, oldUsed)
     .run();
 }
@@ -316,13 +335,6 @@ function rateLimitAuth(c: Context<AppEnv>): void {
       if (timestamp - value.startedAt >= 60_000) authRate.delete(entry);
     }
   }
-}
-
-function verifyTelegramWebhookSecret(c: Context<AppEnv>): void {
-  requireConfig(c.env, 'TELEGRAM_WEBHOOK_SECRET');
-  const secret = c.req.header('X-Telegram-Bot-Api-Secret-Token');
-  if (!secret || !constantTimeEqual(secret, c.env.TELEGRAM_WEBHOOK_SECRET))
-    fail(403, 'WEBHOOK_REJECTED', 'Webhook rejected');
 }
 
 async function workspaceForUser(c: Context<AppEnv>, userId: string) {
@@ -453,7 +465,7 @@ app.use('*', async (c, next) => {
     c.header('Access-Control-Allow-Origin', c.env.APP_ORIGIN);
     c.header('Access-Control-Allow-Credentials', 'true');
     c.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    c.header('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token, X-Bootstrap-Token, X-Request-ID');
+    c.header('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token, X-Bootstrap-Token, X-Request-ID, X-Part-Size, X-Part-SHA256, X-Idempotency-Key');
     c.header('Access-Control-Max-Age', '600');
     c.header('Vary', 'Origin');
     applySecurityHeaders(c);
@@ -469,7 +481,7 @@ app.use('*', async (c, next) => {
 });
 
 app.use('*', async (c, next) => {
-  if (MUTATING_METHODS.has(c.req.method) && c.req.path !== '/v1/webhooks/telegram') {
+  if (MUTATING_METHODS.has(c.req.method) && !c.req.path.startsWith('/v1/webhooks/telegram')) {
     if (!isExactOrigin(c.req.header('Origin'), c.env.APP_ORIGIN))
       fail(403, 'ORIGIN_REQUIRED', 'Exact application origin required');
     await validateMutationCsrf(c);
@@ -482,10 +494,18 @@ app.use('/v1/auth/passkey/*', async (c, next) => {
   await next();
 });
 
+app.use('/v1/auth/google/start', async (c, next) => {
+  rateLimitAuth(c);
+  await next();
+});
+
 app.use('*', async (c, next) => {
   if (MUTATING_METHODS.has(c.req.method) && c.req.method !== 'DELETE') {
-    if (c.req.path === '/v1/webhooks/telegram') verifyTelegramWebhookSecret(c);
     const contentType = c.req.header('Content-Type')?.split(';', 1)[0].trim().toLowerCase();
+    if (c.req.method === 'PUT' && /^\/v1\/bot\/uploads\/[^/]+\/parts\/\d+$/u.test(c.req.path)) {
+      await next();
+      return;
+    }
     if (contentType !== 'application/json') fail(415, 'JSON_REQUIRED', 'application/json required');
     const length = Number(c.req.header('Content-Length') ?? 0);
     if (length > MAX_JSON_BYTES) fail(413, 'JSON_TOO_LARGE', 'Metadata JSON body is too large');
@@ -836,6 +856,220 @@ app.post('/v1/auth/logout', async (c) => {
   c.header('Set-Cookie', serializeCookie(CSRF_COOKIE, '', { maxAge: 0, sameSite: 'Lax' }), { append: true });
   return c.json({ ok: true });
 });
+
+async function googleRedirect(c: Context<AppEnv>, error?: string): Promise<Response> {
+  const url = new URL(c.env.APP_ORIGIN);
+  if (error) url.searchParams.set('error', error);
+  return c.redirect(url.toString(), 302);
+}
+
+app.post('/v1/auth/google/start', async (c) => {
+  requireConfig(c.env, 'APP_ORIGIN', 'APP_SESSION_SECRET', 'GOOGLE_CLIENT_ID', 'GOOGLE_CALLBACK_URL');
+  const body = record(await readJson<unknown>(c));
+  const mode = body.mode === 'link' ? 'link' : body.mode === 'login' ? 'login' : fail(422, 'INVALID_FIELD', 'mode is invalid');
+  await purgeOAuthTransactions(c.env.DB);
+  let userId: string | null = null;
+  let issuedSessionId: string | null = null;
+  if (mode === 'link') {
+    const session = await requireSession(c);
+    userId = session.id;
+    issuedSessionId = session.session_id;
+  }
+  const state = randomToken(24);
+  const nonce = randomToken(16);
+  const verifier = randomToken(32);
+  const challenge = await sha256Base64url(verifier);
+  const timestamp = now();
+  const expires = new Date(Date.now() + 10 * 60_000).toISOString();
+  await c.env.DB.prepare(
+    `
+    INSERT INTO oauth_transactions (id, provider, state_hash, nonce_hash, code_verifier, mode, user_id, issued_session_id, expires_at, used_at, created_at)
+    VALUES (?, 'google', ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+  `,
+  )
+    .bind(
+      randomToken(18),
+      await secretHash(state, c.env.APP_SESSION_SECRET),
+      await secretHash(nonce, c.env.APP_SESSION_SECRET),
+      verifier,
+      mode,
+      userId,
+      issuedSessionId,
+      expires,
+      timestamp,
+    )
+    .run();
+  c.header(
+    'Set-Cookie',
+    serializeCookie(GOOGLE_OAUTH_STATE_COOKIE, state, { httpOnly: true, maxAge: 600, sameSite: 'Lax' }),
+  );
+  const params = new URLSearchParams({
+    client_id: c.env.GOOGLE_CLIENT_ID!,
+    redirect_uri: c.env.GOOGLE_CALLBACK_URL!,
+    response_type: 'code',
+    scope: GOOGLE_SCOPE,
+    state,
+    nonce,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    prompt: 'select_account',
+  });
+  return c.json({ authorizationUrl: `${GOOGLE_AUTH_ENDPOINT}?${params.toString()}` });
+});
+
+app.get('/v1/auth/google/callback', async (c) => {
+  requireConfig(
+    c.env,
+    'APP_ORIGIN',
+    'APP_SESSION_SECRET',
+    'GOOGLE_CLIENT_ID',
+    'GOOGLE_CLIENT_SECRET',
+    'GOOGLE_CALLBACK_URL',
+  );
+  const stateParam = c.req.query('state');
+  const code = c.req.query('code');
+  const googleError = c.req.query('error');
+  const stateCookie = requestCookie(c, GOOGLE_OAUTH_STATE_COOKIE);
+  if (googleError === 'access_denied') return googleRedirect(c, 'google_denied');
+  if (googleError) return googleRedirect(c, 'google_failed');
+  if (!stateParam || !code || !stateCookie || !constantTimeEqual(stateCookie, stateParam))
+    return googleRedirect(c, 'google_failed');
+  const claimed = await c.env.DB.prepare(
+    `
+    UPDATE oauth_transactions SET used_at = ?
+    WHERE provider = 'google' AND state_hash = ? AND used_at IS NULL AND expires_at > ?
+  `,
+  )
+    .bind(now(), await secretHash(stateParam, c.env.APP_SESSION_SECRET), now())
+    .run();
+  if (changes(claimed) !== 1) return googleRedirect(c, 'google_failed');
+  const tx = await first<{
+    id: string;
+    nonce_hash: string;
+    code_verifier: string;
+    mode: 'login' | 'link';
+    user_id: string | null;
+    issued_session_id: string | null;
+  }>(
+    c.env.DB,
+    "SELECT id, nonce_hash, code_verifier, mode, user_id, issued_session_id FROM oauth_transactions WHERE provider = 'google' AND state_hash = ?",
+    await secretHash(stateParam, c.env.APP_SESSION_SECRET),
+  );
+  if (!tx) return googleRedirect(c, 'google_failed');
+  c.header('Set-Cookie', serializeCookie(GOOGLE_OAUTH_STATE_COOKIE, '', { httpOnly: true, maxAge: 0, sameSite: 'Lax' }));
+  const tokenResponse = await fetch(GOOGLE_TOKEN_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: c.env.GOOGLE_CLIENT_ID!,
+      client_secret: c.env.GOOGLE_CLIENT_SECRET!,
+      redirect_uri: c.env.GOOGLE_CALLBACK_URL!,
+      grant_type: 'authorization_code',
+      code_verifier: tx.code_verifier,
+    }),
+  });
+  const tokenJson = (await tokenResponse.json().catch(() => ({}))) as Record<string, unknown>;
+  const idToken = tokenJson.id_token;
+  if (!tokenResponse.ok || typeof idToken !== 'string' || idToken.length > 16_384)
+    return googleRedirect(c, 'google_failed');
+  let payload: Awaited<ReturnType<typeof jwtVerify>>['payload'];
+  try {
+    const jwks = createRemoteJWKSet(new URL(GOOGLE_JWKS_URL));
+    const verification = await jwtVerify(idToken, jwks, {
+      issuer: GOOGLE_ISSUER,
+      audience: c.env.GOOGLE_CLIENT_ID,
+      algorithms: ['RS256'],
+    });
+    payload = verification.payload;
+  } catch {
+    return googleRedirect(c, 'google_failed');
+  }
+  const nonce = payload.nonce;
+  if (typeof nonce !== 'string' || !constantTimeEqual(await secretHash(nonce, c.env.APP_SESSION_SECRET), tx.nonce_hash))
+    return googleRedirect(c, 'google_failed');
+  const issuer = payload.iss;
+  const subject = payload.sub;
+  if (issuer !== GOOGLE_ISSUER || typeof subject !== 'string' || subject.length === 0)
+    return googleRedirect(c, 'google_failed');
+  const identity = await first<{ user_id: string }>(
+    c.env.DB,
+    "SELECT user_id FROM auth_identities WHERE provider = 'google' AND issuer = ? AND subject = ?",
+    issuer,
+    subject,
+  );
+  if (tx.mode === 'link') {
+    const session = await getSession(c);
+    if (!session || session.session_id !== tx.issued_session_id || session.id !== tx.user_id)
+      return googleRedirect(c, 'google_link_failed');
+    if (identity && identity.user_id !== session.id) return googleRedirect(c, 'google_link_failed');
+    if (!identity) {
+      await c.env.DB.prepare(
+        "INSERT INTO auth_identities (id, user_id, provider, issuer, subject, created_at, last_used_at) VALUES (?, ?, 'google', ?, ?, ?, ?)",
+      )
+        .bind(randomToken(18), session.id, issuer, subject, now(), now())
+        .run();
+    }
+    return googleRedirect(c);
+  }
+  if (identity) {
+    const user = await first<UserRow>(
+      c.env.DB,
+      "SELECT id, username, display_name, status FROM users WHERE id = ? AND status = 'active'",
+      identity.user_id,
+    );
+    if (!user) return googleRedirect(c, 'google_failed');
+    await setSession(c, user.id);
+    return googleRedirect(c);
+  }
+  const email = typeof payload.email === 'string' ? payload.email : '';
+  const emailLocal = email.split('@')[0] ?? '';
+  const baseUsername = emailLocal.toLocaleLowerCase('en-US').replace(/[^a-z0-9._-]+/gu, '') || 'user';
+  const displayName = typeof payload.name === 'string' && payload.name ? payload.name : emailLocal;
+  const username = await uniqueUsername(c.env.DB, baseUsername);
+  const userId = randomToken(18);
+  const created = now();
+  const workspaceId = randomToken(18);
+  const rootId = randomToken(18);
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "INSERT INTO users (id, username, display_name, status, created_at, updated_at) VALUES (?, ?, ?, 'active', ?, ?)",
+      ).bind(userId, username, displayName, created, created),
+      c.env.DB.prepare(
+        "INSERT INTO auth_identities (id, user_id, provider, issuer, subject, created_at, last_used_at) VALUES (?, ?, 'google', ?, ?, ?, ?)",
+      ).bind(randomToken(18), userId, issuer, subject, created, created),
+      c.env.DB.prepare("INSERT INTO workspaces (id, owner_id, name, created_at, updated_at) VALUES (?, ?, 'My Drive', ?, ?)").bind(
+        workspaceId,
+        userId,
+        created,
+        created,
+      ),
+      c.env.DB.prepare(
+        `INSERT INTO folders (id, workspace_id, parent_id, name, normalized_name, path_key, created_at, updated_at)
+        VALUES (?, ?, NULL, 'My Drive', 'my drive', ?, ?, ?)`,
+      ).bind(rootId, workspaceId, rootId, created, created),
+      c.env.DB.prepare(
+        "INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at) VALUES (?, ?, 'google.registered', 'user', ?, ?)",
+      ).bind(randomToken(18), userId, userId, created),
+    ]);
+  } catch (error) {
+    if (isConstraintError(error)) fail(409, 'GOOGLE_IDENTITY_EXISTS', 'Google account is already registered');
+    throw error;
+  }
+  await setSession(c, userId);
+  return googleRedirect(c);
+});
+
+async function uniqueUsername(db: D1Database, base: string): Promise<string> {
+  let username = base.slice(0, 128);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const existing = await first<{ id: string }>(db, 'SELECT id FROM users WHERE username = ?', username);
+    if (!existing) return username;
+    username = `${base.slice(0, 100)}-${randomToken(6)}`;
+  }
+  fail(500, 'USERNAME_EXHAUSTED', 'Could not allocate a unique username');
+}
 
 app.get('/v1/folders/:id/children', async (c) => {
   const session = await requireSession(c);
@@ -1736,6 +1970,381 @@ app.get('/v1/export', async (c) => {
   return c.json({ exportedAt: now(), workspace, folders, objects, parts });
 });
 
+type TelegramBot = { id: string; token: string };
+type TelegramPoolReasonCode =
+  | 'READY'
+  | 'CHANNEL_MISSING'
+  | 'NO_VALID_BOTS'
+  | 'GET_CHAT_TRANSPORT_FAILURE'
+  | 'GET_CHAT_API_REJECTION'
+  | 'INVALID_TELEGRAM_PAYLOAD';
+type TelegramPoolReason = { code: TelegramPoolReasonCode; message: string };
+type TelegramPool = { channelId: string; botCount: number; channel: string; reason: TelegramPoolReason };
+
+const telegramPoolReasons: Record<TelegramPoolReasonCode, TelegramPoolReason> = {
+  READY: { code: 'READY', message: 'Storage pool is ready' },
+  CHANNEL_MISSING: { code: 'CHANNEL_MISSING', message: 'Shared Telegram channel is not configured' },
+  NO_VALID_BOTS: { code: 'NO_VALID_BOTS', message: 'No valid Telegram bot tokens are configured' },
+  GET_CHAT_TRANSPORT_FAILURE: { code: 'GET_CHAT_TRANSPORT_FAILURE', message: 'Telegram getChat transport failed' },
+  GET_CHAT_API_REJECTION: { code: 'GET_CHAT_API_REJECTION', message: 'Telegram getChat API rejected the request' },
+  INVALID_TELEGRAM_PAYLOAD: { code: 'INVALID_TELEGRAM_PAYLOAD', message: 'Telegram getChat response was invalid' },
+};
+
+export function poolBotIndex(key: string, botCount: number): number {
+  if (botCount < 1) return 0;
+  let hash = 2166136261;
+  for (let index = 0; index < key.length; index += 1) hash = Math.imul(hash ^ key.charCodeAt(index), 16777619);
+  return (hash >>> 0) % botCount;
+}
+
+function telegramBots(env: Bindings): TelegramBot[] {
+  return (env.TELEGRAM_BOT_TOKENS ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const separator = entry.indexOf(':');
+      return separator > 0 ? { id: entry.slice(0, separator), token: entry } : null;
+    })
+    .filter((bot): bot is TelegramBot => Boolean(bot?.id && bot.token));
+}
+
+function telegramPayloadRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function telegramDescription(value: unknown, token: string): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const secret = token.slice(token.indexOf(':') + 1);
+  const sanitized = value
+    .replaceAll(token, '[redacted]')
+    .replaceAll(secret, '[redacted]')
+    .replace(/[\u0000-\u001f\u007f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!sanitized) return undefined;
+  return sanitized.length > 256 ? `${sanitized.slice(0, 253)}...` : sanitized;
+}
+
+function telegramApiRejection(status: number, description: unknown, token: string): TelegramPoolReason {
+  const safeDescription = telegramDescription(description, token);
+  return {
+    code: 'GET_CHAT_API_REJECTION',
+    message: `Telegram getChat API rejected the request (HTTP ${status})${safeDescription ? `: ${safeDescription}` : ''}`,
+  };
+}
+
+async function telegramCall(token: string, method: string, body?: BodyInit, headers?: HeadersInit): Promise<Response> {
+  const init: RequestInit & { cf?: { httpProtocol: 'http1' } } = {
+    method: body ? 'POST' : 'GET',
+    body,
+    headers: {
+      'User-Agent': 'curl/8.4.0',
+      ...headers,
+    },
+    cf: { httpProtocol: 'http1' },
+  };
+  return fetch(`https://api.telegram.org/bot${token}/${method}`, init);
+}
+
+async function telegramPool(c: Context<AppEnv>): Promise<TelegramPool> {
+  const channel = (c.env.TELEGRAM_SHARED_CHANNEL ?? '').trim();
+  const bots = telegramBots(c.env);
+  if (!channel)
+    return {
+      channelId: '',
+      botCount: bots.length,
+      channel: '',
+      reason: telegramPoolReasons.CHANNEL_MISSING,
+    };
+  if (bots.length === 0)
+    return {
+      channelId: '',
+      botCount: 0,
+      channel: '',
+      reason: telegramPoolReasons.NO_VALID_BOTS,
+    };
+  const cached = await first<{ channel_id: string; bot_count: number }>(c.env.DB, 'SELECT channel_id, bot_count FROM telegram_pool WHERE id = 1');
+  if (cached && cached.bot_count === bots.length && typeof cached.channel_id === 'string' && cached.channel_id)
+    return { channelId: cached.channel_id, botCount: bots.length, channel, reason: telegramPoolReasons.READY };
+  let response: Response;
+  try {
+    response = await telegramCall(bots[0].token, 'getChat', JSON.stringify({ chat_id: channel }), {
+      'Content-Type': 'application/json',
+    });
+  } catch (error) {
+    // ponytail: temporary safe local diagnostic; remove after env mismatch is resolved.
+    console.info('telegram pool getChat', {
+      botId: bots[0].id,
+      tokenLength: bots[0].token.length,
+      tokenFingerprint: (await sha256(bots[0].token)).slice(0, 12),
+      channel,
+      telegramStatus: null,
+      telegramDescription: error instanceof Error ? error.name : 'Unknown error',
+    });
+    return { channelId: '', botCount: bots.length, channel, reason: telegramPoolReasons.GET_CHAT_TRANSPORT_FAILURE };
+  }
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    console.info('telegram pool getChat', {
+      botId: bots[0].id,
+      tokenLength: bots[0].token.length,
+      tokenFingerprint: (await sha256(bots[0].token)).slice(0, 12),
+      channel,
+      telegramStatus: response.status,
+      telegramDescription: 'Invalid JSON response',
+    });
+    if (!response.ok)
+      return {
+        channelId: '',
+        botCount: bots.length,
+        channel,
+        reason: telegramApiRejection(response.status, undefined, bots[0].token),
+      };
+    return { channelId: '', botCount: bots.length, channel, reason: telegramPoolReasons.INVALID_TELEGRAM_PAYLOAD };
+  }
+  const payloadRecord = telegramPayloadRecord(payload);
+  // ponytail: temporary safe local diagnostic; remove after env mismatch is resolved.
+  let getMeStatus: number | null = null;
+  try {
+    getMeStatus = (await telegramCall(bots[0].token, 'getMe', undefined)).status;
+  } catch {
+    getMeStatus = null;
+  }
+  console.info('telegram pool getChat', {
+    botId: bots[0].id,
+    tokenLength: bots[0].token.length,
+    tokenFingerprint: (await sha256(bots[0].token)).slice(0, 12),
+    channel,
+    telegramStatus: response.status,
+    telegramDescription: telegramDescription(payloadRecord?.description, bots[0].token) ?? null,
+    getMeStatus,
+    telegramHeaders: {
+      server: response.headers.get('server'),
+      cfRay: response.headers.get('cf-ray'),
+      contentType: response.headers.get('content-type'),
+    },
+  });
+  if (!response.ok || payloadRecord?.ok === false)
+    return {
+      channelId: '',
+      botCount: bots.length,
+      channel,
+      reason: telegramApiRejection(response.status, payloadRecord?.description, bots[0].token),
+    };
+  const result = telegramPayloadRecord(payloadRecord?.result);
+  const rawChannelId = result?.id;
+  const channelId =
+    typeof rawChannelId === 'string' && rawChannelId.length > 0
+      ? rawChannelId
+      : typeof rawChannelId === 'number' && Number.isSafeInteger(rawChannelId)
+        ? String(rawChannelId)
+        : '';
+  if (payloadRecord?.ok !== true || !channelId)
+    return { channelId: '', botCount: bots.length, channel, reason: telegramPoolReasons.INVALID_TELEGRAM_PAYLOAD };
+  await c.env.DB.prepare(
+    `INSERT INTO telegram_pool (id, channel_id, bot_count, verified_at) VALUES (1, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET channel_id = excluded.channel_id, bot_count = excluded.bot_count, verified_at = excluded.verified_at`,
+  ).bind(channelId, bots.length, now()).run();
+  return { channelId, botCount: bots.length, channel, reason: telegramPoolReasons.READY };
+}
+
+function botAttemptResponse(attempt: Record<string, unknown>, partNo: number) {
+  return { partNo, status: botAttemptStatus(attempt.state), idempotencyKey: attempt.idempotency_key ?? null };
+}
+
+function botAttemptStatus(state: unknown): string {
+  switch (state) {
+    case 'ambiguous':
+      return 'ambiguous';
+    case 'committed':
+      return 'committed';
+    case 'abandoned':
+      return 'abandoned';
+    case 'reserved':
+    case 'sending':
+    case 'sent':
+      return 'in_progress';
+    default:
+      return 'not_started';
+  }
+}
+
+app.get('/v1/telegram/pool', async (c) => {
+  const pool = await telegramPool(c);
+  return c.json({ channel: pool.channel, botCount: pool.botCount, ready: Boolean(pool.channelId), reason: pool.reason });
+});
+
+app.post('/v1/bot/uploads', async (c) => {
+  const session = await requireSession(c);
+  const body = metadataOnly(record(await readJson<unknown>(c)));
+  const { name, normalized } = normalizedName(body.name);
+  const size = integerValue(body.size, 'size', 0, 5 * 1024 * 1024 * 1024);
+  const mime = stringValue(body.mime ?? 'application/octet-stream', 'mime', 128);
+  const chunkSize = integerValue(body.chunkSize ?? 16 * 1024 * 1024, 'chunkSize', MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+  const partCount = integerValue(body.partCount, 'partCount', 0, MAX_PARTS);
+  if (partCount !== (size === 0 ? 0 : Math.ceil(size / chunkSize))) fail(422, 'PART_COUNT_MISMATCH', 'partCount does not match size and chunkSize');
+  const sha256Value = hashValue(body.sha256, 'sha256');
+  const idempotencyKey = stringValue(body.idempotencyKey, 'idempotencyKey', 200);
+  const { workspace, folder } = await folderForUser(c, session.id, optionalString(body.folderId, 'folderId'));
+  const objectId = randomToken(18);
+  const uploadId = randomToken(18);
+  const timestamp = now();
+  const expires = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+  await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO objects (id, workspace_id, folder_id, name, normalized_name, mime, size, sha256, part_count, status, storage_backend, created_at, updated_at)
+      SELECT ?, f.workspace_id, f.id, ?, ?, ?, ?, ?, ?, 'uploading', 'bot_api', ?, ? FROM folders f WHERE f.id = ? AND f.workspace_id = ? AND f.deleted_at IS NULL`)
+      .bind(objectId, name, normalized, mime, size, sha256Value, partCount, timestamp, timestamp, folder.id, workspace.id),
+    c.env.DB.prepare(`INSERT INTO upload_sessions (id, user_id, object_id, status, chunk_size, expected_part_count, idempotency_key, expires_at, created_at, updated_at) VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)`)
+      .bind(uploadId, session.id, objectId, chunkSize, partCount, idempotencyKey, expires, timestamp, timestamp),
+    audit(c.env.DB, session.id, 'upload.started', 'object', objectId),
+  ]);
+  const createdObject = await first<{ id: string }>(c.env.DB, 'SELECT o.id FROM objects o WHERE o.id = ?', objectId);
+  return c.json({ id: uploadId, objectId: createdObject?.id ?? objectId, status: 'created', chunkSize, expectedPartCount: partCount, expiresAt: expires, parts: [] });
+});
+
+app.put('/v1/bot/uploads/:id/parts/:no', async (c) => {
+  const session = await requireSession(c);
+  const upload = await uploadForUser(c, session.id, c.req.param('id'));
+  const partNo = integerValue(Number(c.req.param('no')), 'partNo', 0, Math.max(0, upload.expected_part_count - 1));
+  if (upload.expected_part_count === 0) fail(409, 'NO_PARTS_EXPECTED', 'Empty upload has no parts');
+  const size = integerValue(Number(c.req.header('X-Part-Size')), 'partSize', 1, MAX_CHUNK_SIZE);
+  const sha256Value = hashValue(c.req.header('X-Part-SHA256'), 'partSha256');
+  const idempotencyKey = stringValue(c.req.header('X-Idempotency-Key'), 'idempotencyKey', 200);
+  const expectedSize = partNo === upload.expected_part_count - 1 ? upload.object_size - upload.chunk_size * (upload.expected_part_count - 1) : upload.chunk_size;
+  if (size !== expectedSize) fail(422, 'PART_SIZE_MISMATCH', 'Part size does not match upload manifest');
+  const pool = await telegramPool(c);
+  if (!pool.channelId || pool.botCount === 0) fail(409, 'TELEGRAM_POOL_NOT_READY', 'Telegram bot pool is not ready');
+  const botIndex = poolBotIndex(idempotencyKey, pool.botCount);
+  const existingPart = await first<PartRow>(c.env.DB, 'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? AND part_no = ?', upload.object_id, partNo);
+  if (existingPart) {
+    if (existingPart.size !== size || existingPart.sha256 !== sha256Value || existingPart.idempotency_key !== idempotencyKey) fail(409, 'PART_IDEMPOTENCY_CONFLICT', 'Part already committed with different metadata');
+    return c.json(partResponse(existingPart));
+  }
+  const existingAttempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
+  if (existingAttempt && existingAttempt.idempotency_key !== idempotencyKey && existingAttempt.state !== 'abandoned')
+    fail(409, 'PART_IDEMPOTENCY_CONFLICT', 'Part already has another attempt');
+  if (existingAttempt?.state === 'abandoned') {
+    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'reserved', idempotency_key = ?, expected_size = ?, expected_sha256 = ?, reserved_at = ?, bot_index = ?, updated_at = ? WHERE id = ? AND state = 'abandoned'`)
+      .bind(idempotencyKey, size, sha256Value, now(), botIndex, now(), existingAttempt.id).run();
+    existingAttempt.idempotency_key = idempotencyKey;
+    existingAttempt.state = 'reserved';
+  }
+  if (existingAttempt && ['ambiguous', 'sending'].includes(String(existingAttempt.state))) {
+    if (existingAttempt.state === 'sending' && existingAttempt.sending_lease_until && Date.parse(String(existingAttempt.sending_lease_until)) <= Date.now()) {
+      await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until <= ?`).bind(now(), now(), existingAttempt.id, existingAttempt.send_generation, now()).run();
+    } else fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt requires explicit resolution');
+  }
+  const attemptId = String(existingAttempt?.id ?? randomToken(18));
+  const timestamp = now();
+  if (!existingAttempt) {
+    const reserved = await c.env.DB.prepare(`INSERT INTO bot_part_attempts (id, upload_session_id, part_no, idempotency_key, expected_size, expected_sha256, state, reserved_at, created_at, updated_at, bot_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(attemptId, upload.id, partNo, idempotencyKey, size, sha256Value, 'reserved', timestamp, timestamp, timestamp, botIndex).run();
+    if (changes(reserved) !== 1) fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt already exists');
+  }
+  const generation = randomToken(18);
+  // Lease must cover upstream browser upload, worker forward, and part hashing.
+  // Conservative floor of ~100 KB/s upstream: 16 MiB part can take minutes on a slow link.
+  const lease = new Date(Date.now() + Math.max(60_000, Math.ceil(size / 100_000) * 1000 + 60_000)).toISOString();
+  const claimed = await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'sending', sending_at = ?, send_generation = ?, sending_lease_until = ?, updated_at = ? WHERE id = ? AND state = 'reserved'`).bind(timestamp, generation, lease, timestamp, attemptId).run();
+  if (changes(claimed) !== 1) fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt is already being sent');
+  const bot = telegramBots(c.env)[botIndex];
+  const boundary = `----teledrive-${randomToken(12)}`;
+  const { stream, state } = createMultipartStream(c.req.raw.body ?? new ReadableStream(), boundary, pool.channelId, upload.object_name, upload.mime, size, sha256Value, c.req.raw.signal);
+  let response: Response;
+  try {
+    response = await telegramCall(bot.token, 'sendDocument', stream, { 'Content-Type': `multipart/form-data; boundary=${boundary}` });
+    if (!state.completed) throw new StreamingBodyError('Stream did not complete');
+  } catch (error) {
+    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ?`).bind(now(), now(), attemptId, generation).run();
+    if (error instanceof StreamingBodyError) fail(422, 'PART_STREAM_INVALID', error.message);
+    fail(502, 'TELEGRAM_TRANSPORT_ERROR', 'Telegram transport failed');
+  }
+  if (response.status === 429) {
+    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ? WHERE id = ? AND send_generation = ?`).bind(now(), now(), attemptId, generation).run();
+    const retryAfter = response.headers.get('Retry-After');
+    if (retryAfter) c.header('Retry-After', retryAfter);
+    c.header('Access-Control-Expose-Headers', 'Retry-After');
+    fail(429, 'TELEGRAM_RATE_LIMITED', 'Telegram rate limit reached');
+  }
+  if (!response.ok) {
+    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ? WHERE id = ? AND send_generation = ?`).bind(now(), now(), attemptId, generation).run();
+    fail(502, 'TELEGRAM_ERROR', 'Telegram upload failed');
+  }
+  const payload = (await response.json()) as { ok?: boolean; result?: { message_id?: string | number; document?: { file_id?: string } } };
+  const messageId = String(payload.result?.message_id ?? '');
+  const fileId = payload.result?.document?.file_id ?? '';
+  if (!payload.ok || !messageId || !fileId) fail(502, 'TELEGRAM_ERROR', 'Telegram upload response invalid');
+  const sent = await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'sent', telegram_message_id = ?, telegram_file_id = ?, sent_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until > ?`).bind(messageId, fileId, now(), now(), attemptId, generation, now()).run();
+  if (changes(sent) !== 1) fail(409, 'PART_ATTEMPT_STALE', 'Part attempt was superseded');
+  const partId = randomToken(18);
+  const committed = await c.env.DB.batch([
+    c.env.DB.prepare(`INSERT INTO object_parts (id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(partId, upload.object_id, partNo, size, sha256Value, messageId, fileId, idempotencyKey, now(), botIndex),
+    c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'committed', committed_at = ?, updated_at = ? WHERE id = ? AND state = 'sent' AND send_generation = ?`).bind(now(), now(), attemptId, generation),
+    audit(c.env.DB, session.id, 'upload.part_committed', 'object', upload.object_id),
+  ]);
+  if (changes(committed[1]) !== 1) fail(409, 'PART_ATTEMPT_STALE', 'Part attempt was superseded');
+  return c.json({ id: partId, partNo, size, sha256: sha256Value, messageId, botFileId: fileId, idempotencyKey, createdAt: now() });
+});
+
+app.get('/v1/bot/uploads/:id/parts/:no/attempt', async (c) => {
+  const session = await requireSession(c);
+  const upload = await uploadForUser(c, session.id, c.req.param('id'));
+  const partNo = integerValue(Number(c.req.param('no')), 'partNo', 0, MAX_PARTS);
+  let attempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
+  if (attempt?.state === 'sending' && attempt.sending_lease_until && Date.parse(String(attempt.sending_lease_until)) <= Date.now()) {
+    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until <= ?`).bind(now(), now(), attempt.id, attempt.send_generation, now()).run();
+    attempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
+  }
+  if (!attempt) return c.json({ partNo, status: 'not_started' });
+  return c.json(botAttemptResponse(attempt, partNo));
+});
+
+app.post('/v1/bot/uploads/:id/parts/:no/attempt/abandon', async (c) => {
+  const session = await requireSession(c);
+  const upload = await uploadForUser(c, session.id, c.req.param('id'));
+  const partNo = integerValue(Number(c.req.param('no')), 'partNo', 0, MAX_PARTS);
+  const attempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
+  if (!attempt) fail(404, 'PART_ATTEMPT_NOT_FOUND', 'Part attempt not found');
+  const result = await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ? WHERE id = ? AND send_generation = ? AND state IN ('ambiguous', 'reserved', 'sent')`).bind(now(), now(), attempt.id, attempt.send_generation).run();
+  if (changes(result) !== 1) fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt cannot be abandoned');
+  return c.json({ partNo, status: 'abandoned' });
+});
+
+app.get('/v1/bot/objects/:id/manifest', async (c) => {
+  const session = await requireSession(c);
+  const object = await objectForUser(c, session.id, c.req.param('id'));
+  const parts = await all<PartRow>(c.env.DB, 'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? ORDER BY part_no ASC', object.id);
+  return c.json({ object: { id: object.id, folderId: object.folder_id, name: object.name, mime: object.mime, size: object.size, sha256: object.sha256, partCount: object.part_count, status: object.status, createdAt: object.created_at, updatedAt: object.updated_at }, parts: parts.map((part) => ({ partNo: part.part_no, size: part.size, sha256: part.sha256 })) });
+});
+
+app.get('/v1/bot/objects/:id/parts/:no/content', async (c) => {
+  const session = await requireSession(c);
+  const object = await objectForUser(c, session.id, c.req.param('id'));
+  const partNo = integerValue(Number(c.req.param('no')), 'partNo', 0, MAX_PARTS);
+  const part = await first<PartRow>(c.env.DB, 'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? AND part_no = ?', object.id, partNo);
+  if (!part?.bot_file_id) fail(404, 'PART_NOT_FOUND', 'Part not found');
+  const bots = telegramBots(c.env);
+  const bot = bots[part.bot_index ?? 0];
+  const fileResponse = await telegramCall(bot.token, 'getFile', JSON.stringify({ file_id: part.bot_file_id }), { 'Content-Type': 'application/json' });
+  if (!fileResponse.ok) fail(502, 'TELEGRAM_ERROR', 'Telegram file lookup failed');
+  const file = (await fileResponse.json()) as { ok?: boolean; result?: { file_path?: string } };
+  if (!file.ok || !file.result?.file_path) fail(502, 'TELEGRAM_ERROR', 'Telegram file lookup failed');
+  const content = await fetch(`https://api.telegram.org/file/bot${bot.token}/${file.result.file_path}`);
+  if (!content.ok || !content.body) fail(502, 'TELEGRAM_ERROR', 'Telegram file download failed');
+  return new Response(content.body, { status: 200, headers: { 'Content-Type': object.mime, 'Cache-Control': 'no-store' } });
+});
+
+/* Legacy per-user Telegram onboarding was removed; configuration belongs in Worker env. */
+app.all('/v1/telegram/link', (c) => c.notFound());
+app.all('/v1/webhooks/telegram', (c) => c.notFound());
+app.all('/v1/telegram/bot', (c) => c.notFound());
+app.all('/v1/telegram/bot/*', (c) => c.notFound());
+
+/*
 app.get('/v1/telegram/link', async (c) => {
   const session = await requireSession(c);
   const link = await first<{
@@ -1818,6 +2427,7 @@ app.post('/v1/webhooks/telegram', async (c) => {
     message: 'Telegram identifiers linked; bot/channel permissions still require explicit verification.',
   });
 });
+*/
 
 app.onError((error, c) => {
   const requestId = c.get('requestId') ?? 'unknown';

@@ -35,7 +35,8 @@ function environment(session?: Record<string, unknown>): Bindings {
     RP_NAME: 'Test',
     BOOTSTRAP_TOKEN: 'bootstrap',
     APP_SESSION_SECRET: secret,
-    TELEGRAM_WEBHOOK_SECRET: 'webhook',
+    TELEGRAM_BOT_TOKENS: '111:token-one',
+    TELEGRAM_SHARED_CHANNEL: '@pool',
   };
 }
 

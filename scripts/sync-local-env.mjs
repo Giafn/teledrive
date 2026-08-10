@@ -5,21 +5,23 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sourcePath = resolve(root, '.env.local');
 
-const webKeys = [
-  'NEXT_PUBLIC_API_URL',
-  'NEXT_PUBLIC_TELEGRAM_API_ID',
-  'NEXT_PUBLIC_TELEGRAM_API_HASH',
-  'NEXT_PUBLIC_TELEGRAM_CHANNEL',
-];
+const webKeys = ['NEXT_PUBLIC_API_URL'];
 const workerKeys = [
   'APP_ORIGIN',
   'RP_ID',
   'RP_NAME',
   'BOOTSTRAP_TOKEN',
   'APP_SESSION_SECRET',
-  'TELEGRAM_WEBHOOK_SECRET',
+  'TELEGRAM_BOT_TOKENS',
+  'TELEGRAM_SHARED_CHANNEL',
+  'GOOGLE_CLIENT_ID',
+  'GOOGLE_CLIENT_SECRET',
+  'GOOGLE_CALLBACK_URL',
 ];
 const allKeys = [...webKeys, ...workerKeys];
+// Pool config is legitimately empty until the admin supplies bots/channel; the app
+// reports a not-ready pool and blocks uploads instead of misbehaving.
+const optionalKeys = ['TELEGRAM_BOT_TOKENS', 'TELEGRAM_SHARED_CHANNEL'];
 
 class EnvSyncError extends Error {}
 
@@ -60,7 +62,7 @@ function main() {
   }
 
   const values = Object.fromEntries(allKeys.map((key) => [key, process.env[key] ?? '']));
-  const missing = allKeys.filter((key) => values[key].trim() === '');
+  const missing = allKeys.filter((key) => !optionalKeys.includes(key) && values[key].trim() === '');
   if (missing.length > 0) fail(`missing non-empty values in root .env.local: ${missing.join(', ')}`);
 
   writeAtomic(resolve(root, 'apps/web/.env.local'), render(webKeys, values, 'apps/web/.env.local'));

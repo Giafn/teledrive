@@ -22,7 +22,11 @@ export interface Bindings {
   RP_NAME: string;
   BOOTSTRAP_TOKEN: string;
   APP_SESSION_SECRET: string;
-  TELEGRAM_WEBHOOK_SECRET: string;
+  TELEGRAM_BOT_TOKENS: string;
+  TELEGRAM_SHARED_CHANNEL: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
+  GOOGLE_CALLBACK_URL?: string;
   SESSION_TTL_SECONDS?: string;
 }
 
@@ -62,10 +66,12 @@ export interface UploadRow {
   object_name: string;
   mime: string;
   object_size: number;
+  /** Client-asserted object digest; Worker verifies streamed part digests only. */
   object_sha256: string | null;
   object_status: string;
   object_deleted_at: string | null;
   folder_id: string;
+  storage_backend?: 'legacy' | 'bot_api';
 }
 
 export interface PartRow {
@@ -78,4 +84,5 @@ export interface PartRow {
   bot_file_id: string | null;
   idempotency_key: string;
   created_at: string;
+  bot_index: number;
 }

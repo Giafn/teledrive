@@ -58,6 +58,95 @@ describe('MetadataApiClient object and listing methods', () => {
     expect(JSON.parse(String(mutations[0].init.body))).toEqual({ name: 'renamed', folderId: 'folder-1' });
   });
 
+  it('fetches storage pool via GET /v1/telegram/pool with cookies and parses response', async () => {
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const client = new MetadataApiClient({
+      baseUrl: 'https://api.example.test',
+      fetch: async (input, init = {}) => {
+        const url = new URL(String(input));
+        calls.push({ path: url.pathname, init });
+        if (url.pathname === '/v1/auth/csrf') return json({ csrfToken: 'csrf-token' });
+        if (url.pathname === '/v1/telegram/pool')
+          return json({
+            channel: '123',
+            botCount: 3,
+            ready: true,
+            reason: { code: 'READY', message: 'Storage pool is ready' },
+          });
+        if (url.pathname === '/v1/bot/uploads')
+          return json({
+            id: 'upload-1',
+            objectId: 'object-1',
+            status: 'created',
+            chunkSize: 8,
+            expectedPartCount: 1,
+            expiresAt: '2099-01-01',
+            file_id: 'hidden',
+          });
+        if (url.pathname.endsWith('/attempt')) return json({ partNo: 0, status: 'not_started', file_id: 'hidden' });
+        if (url.pathname.endsWith('/content')) return new Response(new Uint8Array([1, 2, 3]));
+        if (url.pathname.includes('/manifest'))
+          return json({
+            object: {
+              id: 'object-1',
+              folderId: 'folder-1',
+              name: 'x',
+              mime: 'application/octet-stream',
+              size: 3,
+              sha256: 'a'.repeat(64),
+              partCount: 1,
+              status: 'completed',
+              createdAt: '2099-01-01',
+              updatedAt: '2099-01-01',
+              file_path: 'hidden',
+            },
+            parts: [{ partNo: 0, size: 3, sha256: 'a'.repeat(64), file_id: 'hidden' }],
+          });
+        return json({ partNo: 0, size: 3, sha256: 'a'.repeat(64), file_id: 'hidden' });
+      },
+    });
+
+    await expect(client.getStoragePool()).resolves.toEqual({
+      channel: '123',
+      botCount: 3,
+      ready: true,
+      reason: { code: 'READY', message: 'Storage pool is ready' },
+    });
+
+    const poolCall = calls.find(({ path }) => path === '/v1/telegram/pool');
+    expect(poolCall).toBeDefined();
+    expect(poolCall?.init.method ?? 'GET').toBe('GET');
+    expect(poolCall?.init.credentials).toBe('include');
+    // No CSRF header for GET pool endpoint
+    expect(new Headers(poolCall?.init.headers).has('X-CSRF-Token')).toBe(false);
+  });
+
+  it('parses diagnostic storage pool rejection reasons', async () => {
+    const client = new MetadataApiClient({
+      baseUrl: 'https://api.example.test',
+      fetch: async () =>
+        json({
+          channel: '@pool',
+          botCount: 2,
+          ready: false,
+          reason: {
+            code: 'GET_CHAT_API_REJECTION',
+            message: 'Telegram getChat API rejected the request (HTTP 400): chat not found',
+          },
+        }),
+    });
+
+    await expect(client.getStoragePool()).resolves.toEqual({
+      channel: '@pool',
+      botCount: 2,
+      ready: false,
+      reason: {
+        code: 'GET_CHAT_API_REJECTION',
+        message: 'Telegram getChat API rejected the request (HTTP 400): chat not found',
+      },
+    });
+  });
+
   it('updates folders through the typed PATCH route with CSRF, cookies, and JSON body', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const client = new MetadataApiClient({

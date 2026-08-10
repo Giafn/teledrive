@@ -4,3 +4,6 @@
 **/.wrangler/
 **/*.d.ts
 **/*.tsbuildinfo
+
+# Vendored StreamSaver runtime; keep byte-identical with upstream release.
+apps/web/public/streamsaver/

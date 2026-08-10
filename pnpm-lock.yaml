@@ -20,9 +20,6 @@ importers:
 
   apps/web:
     dependencies:
-      '@mtcute/web':
-        specifier: 0.31.0
-        version: 0.31.0
       '@noble/hashes':
         specifier: 2.2.0
         version: 2.2.0
@@ -63,6 +60,9 @@ importers:
       hono:
         specifier: ^4.7.11
         version: 4.13.0
+      jose:
+        specifier: ^6.0.11
+        version: 6.2.8
     devDependencies:
       typescript:
         specifier: ^5.8.3
@@ -241,15 +241,6 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@fuman/io@0.0.21':
-    resolution: {integrity: sha512-8tSqmAUBWFdYrQUednl3I3VxLudaVXfyCqmPyiaDAXgmABTnjD2LvbXoJ7StrV9bvlrwVmwE+smwiKXSJtji0g==}
-
-  '@fuman/net@0.0.21':
-    resolution: {integrity: sha512-4PbDA2f6SfR5CtOs7omZNrrRh1X23KQBI0XmpL/r1fVd726H6+IfhDRxm/fgNKlLgMwe6pGbI/hzt8JU0y0sgw==}
-
-  '@fuman/utils@0.0.21':
-    resolution: {integrity: sha512-2N5bPK18uGgZRans+ZQ33SE+xSGj4BZNnJbSUnGdH/i4ADTdz/ziC/16Qy3/Jqzbrwr21IpuKObnELp8DDfkDQ==}
-
   '@hexagon/base64@1.1.28':
     resolution: {integrity: sha512-lhqDEAvWixy3bZ+UOYbPwUbBkwBq5C1LAJ/xPC8Oi+lL54oyakv/npbA0aU2hgCsx/1NUd4IBvV03+aUBWxerw==}
 
@@ -258,21 +249,6 @@ packages:
 
   '@levischuck/tiny-cbor@0.2.11':
     resolution: {integrity: sha512-llBRm4dT4Z89aRsm6u2oEZ8tfwL/2l6BwpZ7JcyieouniDECM5AqNgr/y08zalEIvW3RSK4upYyybDcmjXqAow==}
-
-  '@mtcute/core@0.31.0':
-    resolution: {integrity: sha512-54w+3/4iZaQcY2eDxeswSrD9gutkDF+YWVKC97yU7JEJkdwpUvCmoGLcsxjAK6AQu5ipO8/+vPM0AdUZVFUtQg==}
-
-  '@mtcute/file-id@0.31.0':
-    resolution: {integrity: sha512-hf0ZdPapa/zdtDlRzoffPEmFYHhC3HpkA5KvxJrRaKTP9boXLJ0qrgYSKPE/58Q247bcAccZxRXJg0c9d6hKzA==}
-
-  '@mtcute/tl-runtime@0.31.0':
-    resolution: {integrity: sha512-WQmSidKtLc2bqhp6GUuuA+SPt95kCfTNsEJ+WiTXRscN/NddkK7KTuUmvRO4LYz3Qic3JyD2WvDDOg9P00ktFA==}
-
-  '@mtcute/wasm@0.31.0':
-    resolution: {integrity: sha512-w63BQpL1o/LOP6hzBeLKQw4GIr8kAmCOgztfrjJfBho8M544Euf/FyH8+WXxdmJmiLiUB2ZEL0C3k4a3U+2t8Q==}
-
-  '@mtcute/web@0.31.0':
-    resolution: {integrity: sha512-iW1EUYYyqYt0ZLTnfxvDUxkj+G5K7+iQ0ffqWYPduL831v+zurri6/sbgQ6tzCTIjgFKMKjBOZ/K6PvAl0vW/w==}
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     resolution: {integrity: sha512-oTXEIha4SsuXdTA4Iyskj0kpdx2yVXdhd75c2v3xGrHFfVMsbhTPZU/nMPL4sWKo4pBHm3aucLaqGlF696dTyQ==}
@@ -528,9 +504,6 @@ packages:
   '@types/estree@1.0.9':
     resolution: {integrity: sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==}
 
-  '@types/events@3.0.0':
-    resolution: {integrity: sha512-EaObqwIvayI5a8dCzhFrjKzVwKLxjoG9T6Ppd5CEo07LRKfQ8Yokw54r5+Wq7FaBQ+yXRvQAYPrHwya1/UFt9g==}
-
   '@types/node@22.10.2':
     resolution: {integrity: sha512-Xxr6BBRCAOQixvonOye19wnzyDiUtTeqldOOmj3CkeblonbccA12PFwlufvRdrpjXxqnmUaeiU5EOA+7s5diUQ==}
 
@@ -654,14 +627,14 @@ packages:
     resolution: {integrity: sha512-jhunvfHWxd7J5EFfSgH4xsYJzSe/lfqbUCxiyyeaQasUsXeEHXtzVid+7EOGByc5JnFa23SSFL3Y2RV/z1T+eQ==}
     engines: {node: '>=16.9.0'}
 
+  jose@6.2.8:
+    resolution: {integrity: sha512-Bsdjwm3Qsd/P0jR+BHDe3LytDfY7WBq2HmCCLIwuVRHMuEC9ae7/R474GIUdF1NgCyZjzVo/A9DOiOBtXq8ZoQ==}
+
   js-tokens@4.0.0:
     resolution: {integrity: sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==}
 
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
-
-  long@5.3.2:
-    resolution: {integrity: sha512-mNAgZ1GmyNhD7AuqnTG3/VQ26o760+ZYBPKjPvugO8+nLbYfX6TVpJPseBvopbdY+qpZ/lKUnmEc1LeZYS3QAA==}
 
   loose-envify@1.4.0:
     resolution: {integrity: sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==}
@@ -993,52 +966,11 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@fuman/io@0.0.21':
-    dependencies:
-      '@fuman/utils': 0.0.21
-
-  '@fuman/net@0.0.21':
-    dependencies:
-      '@fuman/io': 0.0.21
-      '@fuman/utils': 0.0.21
-
-  '@fuman/utils@0.0.21': {}
-
   '@hexagon/base64@1.1.28': {}
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
   '@levischuck/tiny-cbor@0.2.11': {}
-
-  '@mtcute/core@0.31.0':
-    dependencies:
-      '@fuman/io': 0.0.21
-      '@fuman/net': 0.0.21
-      '@fuman/utils': 0.0.21
-      '@mtcute/file-id': 0.31.0
-      '@mtcute/tl-runtime': 0.31.0
-      '@types/events': 3.0.0
-      long: 5.3.2
-
-  '@mtcute/file-id@0.31.0':
-    dependencies:
-      '@fuman/utils': 0.0.21
-      '@mtcute/tl-runtime': 0.31.0
-      long: 5.3.2
-
-  '@mtcute/tl-runtime@0.31.0':
-    dependencies:
-      '@fuman/utils': 0.0.21
-      long: 5.3.2
-
-  '@mtcute/wasm@0.31.0': {}
-
-  '@mtcute/web@0.31.0':
-    dependencies:
-      '@fuman/net': 0.0.21
-      '@fuman/utils': 0.0.21
-      '@mtcute/core': 0.31.0
-      '@mtcute/wasm': 0.31.0
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     optional: true
@@ -1278,8 +1210,6 @@ snapshots:
 
   '@types/estree@1.0.9': {}
 
-  '@types/events@3.0.0': {}
-
   '@types/node@22.10.2':
     dependencies:
       undici-types: 6.20.0
@@ -1421,11 +1351,11 @@ snapshots:
 
   hono@4.13.0: {}
 
+  jose@6.2.8: {}
+
   js-tokens@4.0.0: {}
 
   js-tokens@9.0.1: {}
-
-  long@5.3.2: {}
 
   loose-envify@1.4.0:
     dependencies:

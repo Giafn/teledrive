@@ -67,7 +67,8 @@ describe('DELETE /v1/objects/:id/permanent', () => {
       RP_NAME: 'Test',
       BOOTSTRAP_TOKEN: 'bootstrap',
       APP_SESSION_SECRET: secret,
-      TELEGRAM_WEBHOOK_SECRET: 'webhook',
+      TELEGRAM_BOT_TOKENS: '111:token-one',
+      TELEGRAM_SHARED_CHANNEL: '@pool',
     };
 
     const response = await app.fetch(

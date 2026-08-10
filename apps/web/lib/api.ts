@@ -42,84 +42,8 @@ export type FolderUpdateInput = { name?: string; parentId?: string | null };
 export type FolderUpdateResponse = { id: string; name: string; parentId: string | null };
 export type MutationResponse = { ok: true; deleted?: boolean; restored?: boolean };
 
-/** Kept for current UI callers; upload-controller supplies complete metadata. */
-export type UploadMetadata = {
-  name: string;
-  size: number;
-  mime: string;
-  folderId: string;
-  lastModified: number;
-  partCount: number;
-};
-
-export type UploadStartInput = {
-  name: string;
-  size: number;
-  mime: string;
-  folderId?: string | null;
-  chunkSize: number;
-  partCount: number;
-  sha256: string;
-  idempotencyKey: string;
-};
-
-export type UploadSession = {
-  id: string;
-  objectId: string;
-  status: string;
-  chunkSize: number;
-  expectedPartCount: number;
-  expiresAt: string;
-};
-
-export type UploadPartInput = {
-  partNo: number;
-  size: number;
-  sha256: string;
-  messageId: string;
-  botFileId?: string | null;
-  idempotencyKey: string;
-};
-
-export type UploadPart = UploadPartInput & {
-  id: string;
-  objectId: string;
-  botFileId: string | null;
-  createdAt: string;
-};
-
-export type UploadResponse = UploadSession & {
-  object: {
-    id: string;
-    name: string;
-    mime: string;
-    size: number;
-    sha256: string | null;
-    status: string;
-  };
-  parts: UploadPart[];
-};
-
-export type CompleteUploadInput = { partCount: number; size: number; sha256: string };
-export type CompleteUploadResponse = { objectId: string; status: string; idempotent: boolean };
-export type AbortUploadResponse = { ok: true; status: string };
-
-export type ManifestResponse = {
-  object: {
-    id: string;
-    folderId: string;
-    name: string;
-    mime: string;
-    size: number;
-    sha256: string | null;
-    partCount: number;
-    status: string;
-    deletedAt: string | null;
-    createdAt: string;
-    updatedAt: string;
-  };
-  parts: UploadPart[];
-};
+export type BotCompleteUploadInput = { partCount: number; size: number; sha256: string };
+export type BotAbortUploadResponse = { ok: true; status: string };
 
 export type ExportFolder = {
   id: string;
@@ -151,8 +75,6 @@ export type ExportPart = {
   part_no: number;
   size: number;
   sha256: string;
-  message_id: string;
-  bot_file_id: string | null;
   idempotency_key: string;
   created_at: string;
 };
@@ -174,6 +96,65 @@ export type PasskeyAuthenticateOptionsResponse = {
 };
 export type AuthResponse = { user: ApiUser; csrfToken: string };
 export type CurrentSessionResponse = { user: ApiUser | null };
+export type GoogleAuthorizationMode = 'login' | 'link';
+
+export type StoragePoolReasonCode =
+  | 'READY'
+  | 'CHANNEL_MISSING'
+  | 'NO_VALID_BOTS'
+  | 'GET_CHAT_HTTP_FAILURE'
+  | 'GET_CHAT_TRANSPORT_FAILURE'
+  | 'GET_CHAT_API_REJECTION'
+  | 'INVALID_TELEGRAM_PAYLOAD';
+export type StoragePoolReason = { code: StoragePoolReasonCode; message: string };
+export type StoragePoolResponse = {
+  channel: string;
+  botCount: number;
+  ready: boolean;
+  /** Optional for compatibility with older Workers. */
+  reason?: StoragePoolReason;
+};
+
+export type BotUploadStartInput = {
+  name: string;
+  size: number;
+  mime: string;
+  folderId?: string | null;
+  chunkSize: number;
+  partCount: number;
+  sha256: string;
+  idempotencyKey: string;
+};
+export type BotUploadSession = {
+  id: string;
+  objectId: string;
+  status: string;
+  chunkSize: number;
+  expectedPartCount: number;
+  expiresAt: string;
+};
+export type BotPart = { partNo: number; size: number; sha256: string };
+export type BotPartUploadInput = { size: number; sha256: string; idempotencyKey: string };
+export type BotAttemptStatus = {
+  partNo: number;
+  status: 'not_started' | 'in_progress' | 'ambiguous' | 'committed' | 'abandoned';
+  createdAt?: string;
+  updatedAt?: string;
+};
+export type BotObject = {
+  id: string;
+  folderId: string;
+  name: string;
+  mime: string;
+  size: number;
+  sha256: string | null;
+  partCount: number;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+};
+export type BotManifestResponse = { object: BotObject; parts: BotPart[] };
+export type BotCompleteUploadResponse = { objectId: string; status: string; idempotent: boolean };
 
 export class ApiError extends Error {
   constructor(
@@ -181,6 +162,7 @@ export class ApiError extends Error {
     message: string,
     readonly status: number,
     readonly requestId?: string,
+    readonly retryAfter?: number,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -205,8 +187,10 @@ export interface ApiClient {
   ): Promise<AuthResponse>;
   authenticatePasskeyOptions(userName: string): Promise<PasskeyAuthenticateOptionsResponse>;
   authenticatePasskeyVerify(challengeId: string, response: AuthenticationResponseJSON): Promise<AuthResponse>;
+  googleAuthorizationUrl(mode: GoogleAuthorizationMode): Promise<string>;
   getCurrentSession(): Promise<ApiUser | null>;
   logout(): Promise<{ ok: true }>;
+  getStoragePool(): Promise<StoragePoolResponse>;
   getWorkspace(): Promise<WorkspaceResponse>;
   listFolderChildren(folderId: string, options?: { limit?: number; cursor?: string }): Promise<FolderChildrenResponse>;
   listRecent(options?: { limit?: number; cursor?: string }): Promise<PaginatedObjectResponse>;
@@ -220,12 +204,16 @@ export interface ApiClient {
   softDeleteFolder(folderId: string): Promise<MutationResponse>;
   restoreFolder(folderId: string): Promise<MutationResponse>;
   permanentDeleteFolder(folderId: string): Promise<MutationResponse>;
-  startUpload(metadata: UploadStartInput | UploadMetadata): Promise<UploadSession>;
-  getUpload(uploadId: string): Promise<UploadResponse>;
-  commitPart(uploadId: string, part: UploadPartInput | Omit<UploadPartInput, 'idempotencyKey'>): Promise<UploadPart>;
-  completeUpload(uploadId: string, metadata?: CompleteUploadInput): Promise<CompleteUploadResponse>;
-  abortUpload(uploadId: string): Promise<AbortUploadResponse>;
-  getManifest(objectId: string): Promise<ManifestResponse>;
+  startBotUpload(input: BotUploadStartInput): Promise<BotUploadSession>;
+  uploadBotPart(uploadId: string, partNo: number, body: BodyInit, input: BotPartUploadInput): Promise<BotPart>;
+  getBotUpload(uploadId: string): Promise<BotUploadSession>;
+  getBotPartAttempt(uploadId: string, partNo: number): Promise<BotAttemptStatus>;
+  abandonBotPartAttempt(uploadId: string, partNo: number): Promise<BotAttemptStatus & { consequence?: string }>;
+  completeBotUpload(uploadId: string, metadata: BotCompleteUploadInput): Promise<BotCompleteUploadResponse>;
+  abortBotUpload(uploadId: string): Promise<BotAbortUploadResponse>;
+  getBotManifest(objectId: string): Promise<BotManifestResponse>;
+  getBotPartContent(objectId: string, partNo: number): Promise<Response>;
+  getBotPartBytes(objectId: string, partNo: number): Promise<Uint8Array>;
   exportWorkspace(): Promise<ExportResponse>;
 }
 
@@ -245,7 +233,170 @@ function safeApiError(response: Response, body: unknown): ApiError {
   const code = stringField(error?.code) ?? `HTTP_${response.status}`;
   const message = stringField(error?.message) ?? `API request failed (${response.status})`;
   const requestId = stringField(error?.requestId) ?? stringField(response.headers.get('X-Request-ID'));
-  return new ApiError(code, message, response.status, requestId);
+  const retryHeader = response.headers.get('Retry-After');
+  const retryAfter = retryHeader && /^\d+$/u.test(retryHeader) ? Number(retryHeader) : undefined;
+  return new ApiError(
+    code,
+    message,
+    response.status,
+    requestId,
+    retryAfter !== undefined && Number.isSafeInteger(retryAfter) ? retryAfter : undefined,
+  );
+}
+
+function safeStoragePoolReason(value: unknown): StoragePoolReason {
+  const root = record(value);
+  const codes = new Set<StoragePoolReasonCode>([
+    'READY',
+    'CHANNEL_MISSING',
+    'NO_VALID_BOTS',
+    'GET_CHAT_HTTP_FAILURE',
+    'GET_CHAT_TRANSPORT_FAILURE',
+    'GET_CHAT_API_REJECTION',
+    'INVALID_TELEGRAM_PAYLOAD',
+  ]);
+  if (
+    !root ||
+    typeof root.code !== 'string' ||
+    !codes.has(root.code as StoragePoolReasonCode) ||
+    typeof root.message !== 'string' ||
+    root.message.length === 0 ||
+    root.message.length > 2048
+  )
+    throw new ApiError('INVALID_RESPONSE', 'Storage pool reason is invalid', 500);
+  return { code: root.code as StoragePoolReasonCode, message: root.message as string };
+}
+
+function safeBotSession(value: unknown): BotUploadSession {
+  const root = record(value);
+  if (
+    !root ||
+    typeof root.id !== 'string' ||
+    typeof root.objectId !== 'string' ||
+    typeof root.status !== 'string' ||
+    !Number.isSafeInteger(root.chunkSize) ||
+    !Number.isSafeInteger(root.expectedPartCount) ||
+    typeof root.expiresAt !== 'string'
+  ) {
+    throw new ApiError('INVALID_RESPONSE', 'Bot upload response is invalid', 500);
+  }
+  return {
+    id: root.id,
+    objectId: root.objectId,
+    status: root.status,
+    chunkSize: root.chunkSize as number,
+    expectedPartCount: root.expectedPartCount as number,
+    expiresAt: root.expiresAt,
+  };
+}
+
+function safeBotPart(value: unknown): BotPart {
+  const root = record(value);
+  if (
+    !root ||
+    !Number.isSafeInteger(root.partNo) ||
+    !Number.isSafeInteger(root.size) ||
+    typeof root.sha256 !== 'string'
+  )
+    throw new ApiError('INVALID_RESPONSE', 'Bot part response is invalid', 500);
+  return { partNo: root.partNo as number, size: root.size as number, sha256: root.sha256 };
+}
+
+function safeBotAttempt(value: unknown): BotAttemptStatus & { consequence?: string } {
+  const root = record(value);
+  const statuses = new Set(['not_started', 'in_progress', 'ambiguous', 'committed', 'abandoned']);
+  if (!root || !Number.isSafeInteger(root.partNo) || typeof root.status !== 'string' || !statuses.has(root.status))
+    throw new ApiError('INVALID_RESPONSE', 'Bot attempt response is invalid', 500);
+  return {
+    partNo: root.partNo as number,
+    status: root.status as BotAttemptStatus['status'],
+    ...(typeof root.createdAt === 'string' ? { createdAt: root.createdAt } : {}),
+    ...(typeof root.updatedAt === 'string' ? { updatedAt: root.updatedAt } : {}),
+    ...(typeof root.consequence === 'string' ? { consequence: root.consequence } : {}),
+  };
+}
+
+function safeBotObject(value: unknown): BotObject {
+  const root = record(value);
+  if (
+    !root ||
+    typeof root.id !== 'string' ||
+    typeof root.folderId !== 'string' ||
+    typeof root.name !== 'string' ||
+    typeof root.mime !== 'string' ||
+    !Number.isSafeInteger(root.size) ||
+    (root.sha256 !== null && typeof root.sha256 !== 'string') ||
+    !Number.isSafeInteger(root.partCount) ||
+    typeof root.status !== 'string' ||
+    typeof root.createdAt !== 'string' ||
+    typeof root.updatedAt !== 'string'
+  ) {
+    throw new ApiError('INVALID_RESPONSE', 'Bot object response is invalid', 500);
+  }
+  return {
+    id: root.id,
+    folderId: root.folderId,
+    name: root.name,
+    mime: root.mime,
+    size: root.size as number,
+    sha256: root.sha256,
+    partCount: root.partCount as number,
+    status: root.status,
+    createdAt: root.createdAt,
+    updatedAt: root.updatedAt,
+  };
+}
+
+function safeBotManifest(value: unknown): BotManifestResponse {
+  const root = record(value);
+  if (!root || !Array.isArray(root.parts))
+    throw new ApiError('INVALID_RESPONSE', 'Bot manifest response is invalid', 500);
+  return { object: safeBotObject(root.object), parts: root.parts.map(safeBotPart) };
+}
+
+function safeExport(value: unknown): ExportResponse {
+  const root = record(value);
+  const workspace = record(root?.workspace);
+  if (
+    !root ||
+    typeof root.exportedAt !== 'string' ||
+    !workspace ||
+    typeof workspace.id !== 'string' ||
+    typeof workspace.name !== 'string'
+  )
+    throw new ApiError('INVALID_RESPONSE', 'Export response is invalid', 500);
+  const folders = Array.isArray(root.folders) ? root.folders : [];
+  const objects = Array.isArray(root.objects) ? root.objects : [];
+  const parts = Array.isArray(root.parts) ? root.parts : [];
+  return {
+    exportedAt: root.exportedAt,
+    workspace: { id: workspace.id, name: workspace.name },
+    folders: folders as ExportFolder[],
+    objects: objects as ExportObject[],
+    parts: parts.map((part) => {
+      const item = record(part);
+      if (
+        !item ||
+        typeof item.id !== 'string' ||
+        typeof item.object_id !== 'string' ||
+        !Number.isSafeInteger(item.part_no) ||
+        !Number.isSafeInteger(item.size) ||
+        typeof item.sha256 !== 'string' ||
+        typeof item.idempotency_key !== 'string' ||
+        typeof item.created_at !== 'string'
+      )
+        throw new ApiError('INVALID_RESPONSE', 'Export response is invalid', 500);
+      return {
+        id: item.id,
+        object_id: item.object_id,
+        part_no: item.part_no as number,
+        size: item.size as number,
+        sha256: item.sha256,
+        idempotency_key: item.idempotency_key,
+        created_at: item.created_at,
+      };
+    }),
+  };
 }
 
 export class MetadataApiClient implements ApiClient {
@@ -260,7 +411,12 @@ export class MetadataApiClient implements ApiClient {
     this.fetcher = options.fetch ?? globalThis.fetch.bind(globalThis);
   }
 
-  private async request<T>(path: string, init: RequestInit = {}, csrf = false, retryCsrf = true): Promise<T> {
+  private async requestResponse(
+    path: string,
+    init: RequestInit = {},
+    csrf = false,
+    retryCsrf = true,
+  ): Promise<Response> {
     if (!this.baseUrl) throw new ApiError('API_CONFIGURATION_ERROR', 'NEXT_PUBLIC_API_URL is required', 500);
     const headers = new Headers(init.headers);
     if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
@@ -273,8 +429,8 @@ export class MetadataApiClient implements ApiClient {
       throw new ApiError('NETWORK_ERROR', 'API request could not be sent', 0);
     }
 
-    const body = await response.json().catch(() => undefined);
     if (!response.ok) {
+      const body = await response.json().catch(() => undefined);
       const error = safeApiError(response, body);
       if (
         csrf &&
@@ -284,10 +440,16 @@ export class MetadataApiClient implements ApiClient {
       ) {
         this.csrfToken = undefined;
         await this.getCsrf();
-        return this.request<T>(path, init, true, false);
+        return this.requestResponse(path, init, true, false);
       }
       throw error;
     }
+    return response;
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}, csrf = false): Promise<T> {
+    const response = await this.requestResponse(path, init, csrf);
+    const body = await response.json().catch(() => undefined);
     if (body === undefined) throw new ApiError('INVALID_RESPONSE', 'API returned invalid JSON', response.status);
     return body as T;
   }
@@ -361,6 +523,17 @@ export class MetadataApiClient implements ApiClient {
     return result;
   }
 
+  async googleAuthorizationUrl(mode: GoogleAuthorizationMode): Promise<string> {
+    const result = await this.request<{ authorizationUrl: unknown }>(
+      '/v1/auth/google/start',
+      { method: 'POST', body: JSON.stringify({ mode }) },
+      true,
+    );
+    if (typeof result.authorizationUrl !== 'string' || result.authorizationUrl.length === 0)
+      throw new ApiError('INVALID_RESPONSE', 'Google authorization response is invalid', 500);
+    return result.authorizationUrl;
+  }
+
   async getCurrentSession(): Promise<ApiUser | null> {
     const result = await this.request<CurrentSessionResponse>('/v1/auth/session');
     return result.user;
@@ -370,6 +543,26 @@ export class MetadataApiClient implements ApiClient {
     const result = await this.request<{ ok: true }>('/v1/auth/logout', { method: 'POST', body: '{}' }, true);
     this.csrfToken = undefined;
     return result;
+  }
+
+  async getStoragePool(): Promise<StoragePoolResponse> {
+    const result = await this.request<unknown>('/v1/telegram/pool');
+    const root = record(result);
+    const channel = stringField(root?.channel);
+    if (
+      !root ||
+      channel === undefined ||
+      !Number.isSafeInteger(root.botCount) ||
+      (root.botCount as number) < 0 ||
+      typeof root.ready !== 'boolean'
+    )
+      throw new ApiError('INVALID_RESPONSE', 'Storage pool response is invalid', 500);
+    return {
+      channel,
+      botCount: root.botCount as number,
+      ready: root.ready,
+      ...(root.reason === undefined ? {} : { reason: safeStoragePoolReason(root.reason) }),
+    };
   }
 
   getWorkspace() {
@@ -471,83 +664,81 @@ export class MetadataApiClient implements ApiClient {
     );
   }
 
-  startUpload(metadata: UploadStartInput | UploadMetadata) {
-    if (
-      !('sha256' in metadata) ||
-      !metadata.sha256 ||
-      !('chunkSize' in metadata) ||
-      !metadata.chunkSize ||
-      !('idempotencyKey' in metadata) ||
-      !metadata.idempotencyKey
-    ) {
+  startBotUpload(input: BotUploadStartInput): Promise<BotUploadSession> {
+    return this.request<unknown>('/v1/bot/uploads', { method: 'POST', body: JSON.stringify(input) }, true).then(
+      safeBotSession,
+    );
+  }
+
+  uploadBotPart(uploadId: string, partNo: number, body: BodyInit, input: BotPartUploadInput): Promise<BotPart> {
+    if (!input.idempotencyKey || !input.sha256 || !Number.isSafeInteger(input.size))
       return Promise.reject(
-        new ApiError('UPLOAD_METADATA_REQUIRED', 'Upload requires chunkSize, SHA-256, and idempotencyKey', 422),
+        new ApiError('UPLOAD_METADATA_REQUIRED', 'Part requires size, SHA-256, and idempotencyKey', 422),
       );
-    }
-    const body: UploadStartInput = {
-      name: metadata.name,
-      size: metadata.size,
-      mime: metadata.mime,
-      folderId: 'folderId' in metadata ? metadata.folderId : undefined,
-      chunkSize: metadata.chunkSize,
-      partCount: metadata.partCount,
-      sha256: metadata.sha256,
-      idempotencyKey: metadata.idempotencyKey,
-    };
-    return this.request<UploadSession>('/v1/uploads', { method: 'POST', body: JSON.stringify(body) }, true);
-  }
-
-  getUpload(uploadId: string) {
-    return this.request<UploadResponse>(`/v1/uploads/${encodeURIComponent(uploadId)}`);
-  }
-
-  commitPart(uploadId: string, part: UploadPartInput | Omit<UploadPartInput, 'idempotencyKey'>) {
-    if (!('idempotencyKey' in part) || !part.idempotencyKey) {
-      return Promise.reject(new ApiError('UPLOAD_METADATA_REQUIRED', 'Part requires idempotencyKey', 422));
-    }
-    const body: UploadPartInput = {
-      partNo: part.partNo,
-      size: part.size,
-      sha256: part.sha256,
-      messageId: part.messageId,
-      botFileId: part.botFileId,
-      idempotencyKey: part.idempotencyKey,
-    };
-    return this.request<UploadPart>(
-      `/v1/uploads/${encodeURIComponent(uploadId)}/parts/${part.partNo}`,
+    return this.request<unknown>(
+      `/v1/bot/uploads/${encodeURIComponent(uploadId)}/parts/${partNo}`,
       {
         method: 'PUT',
-        body: JSON.stringify(body),
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Part-Size': String(input.size),
+          'X-Part-SHA256': input.sha256,
+          'X-Idempotency-Key': input.idempotencyKey,
+        },
+        body,
       },
       true,
+    ).then(safeBotPart);
+  }
+
+  getBotUpload(uploadId: string): Promise<BotUploadSession> {
+    return this.request<unknown>(`/v1/bot/uploads/${encodeURIComponent(uploadId)}`).then(safeBotSession);
+  }
+
+  getBotPartAttempt(uploadId: string, partNo: number): Promise<BotAttemptStatus> {
+    return this.request<unknown>(`/v1/bot/uploads/${encodeURIComponent(uploadId)}/parts/${partNo}/attempt`).then(
+      safeBotAttempt,
     );
   }
 
-  completeUpload(uploadId: string, metadata?: CompleteUploadInput) {
-    if (!metadata)
-      return Promise.reject(
-        new ApiError('UPLOAD_METADATA_REQUIRED', 'Complete requires partCount, size, and SHA-256', 422),
-      );
-    return this.request<CompleteUploadResponse>(
+  abandonBotPartAttempt(uploadId: string, partNo: number): Promise<BotAttemptStatus & { consequence?: string }> {
+    return this.request<unknown>(
+      `/v1/bot/uploads/${encodeURIComponent(uploadId)}/parts/${partNo}/attempt/abandon`,
+      { method: 'POST', body: '{}' },
+      true,
+    ).then(safeBotAttempt);
+  }
+
+  completeBotUpload(uploadId: string, metadata: BotCompleteUploadInput): Promise<BotCompleteUploadResponse> {
+    return this.request<BotCompleteUploadResponse>(
       `/v1/uploads/${encodeURIComponent(uploadId)}/complete`,
-      {
-        method: 'POST',
-        body: JSON.stringify(metadata),
-      },
+      { method: 'POST', body: JSON.stringify(metadata) },
       true,
     );
   }
 
-  abortUpload(uploadId: string) {
-    return this.request<AbortUploadResponse>(`/v1/uploads/${encodeURIComponent(uploadId)}`, { method: 'DELETE' }, true);
+  abortBotUpload(uploadId: string): Promise<BotAbortUploadResponse> {
+    return this.request<BotAbortUploadResponse>(
+      `/v1/uploads/${encodeURIComponent(uploadId)}`,
+      { method: 'DELETE' },
+      true,
+    );
   }
 
-  getManifest(objectId: string) {
-    return this.request<ManifestResponse>(`/v1/objects/${encodeURIComponent(objectId)}/manifest`);
+  getBotManifest(objectId: string): Promise<BotManifestResponse> {
+    return this.request<unknown>(`/v1/bot/objects/${encodeURIComponent(objectId)}/manifest`).then(safeBotManifest);
+  }
+
+  getBotPartContent(objectId: string, partNo: number): Promise<Response> {
+    return this.requestResponse(`/v1/bot/objects/${encodeURIComponent(objectId)}/parts/${partNo}/content`);
+  }
+
+  async getBotPartBytes(objectId: string, partNo: number): Promise<Uint8Array> {
+    return new Uint8Array(await (await this.getBotPartContent(objectId, partNo)).arrayBuffer());
   }
 
   exportWorkspace() {
-    return this.request<ExportResponse>('/v1/export');
+    return this.request<unknown>('/v1/export').then(safeExport);
   }
 }
 
