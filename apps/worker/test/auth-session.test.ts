@@ -37,6 +37,7 @@ function environment(session?: Record<string, unknown>): Bindings {
     APP_SESSION_SECRET: secret,
     TELEGRAM_BOT_TOKENS: '111:token-one',
     TELEGRAM_SHARED_CHANNEL: '@pool',
+    GOOGLE_REGISTRATION_SECRET: 'registration-secret',
   };
 }
 

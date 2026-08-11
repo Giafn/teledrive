@@ -8,20 +8,36 @@ const sourcePath = resolve(root, '.env.local');
 const webKeys = ['NEXT_PUBLIC_API_URL'];
 const workerKeys = [
   'APP_ORIGIN',
-  'RP_ID',
-  'RP_NAME',
-  'BOOTSTRAP_TOKEN',
   'APP_SESSION_SECRET',
   'TELEGRAM_BOT_TOKENS',
   'TELEGRAM_SHARED_CHANNEL',
   'GOOGLE_CLIENT_ID',
   'GOOGLE_CLIENT_SECRET',
   'GOOGLE_CALLBACK_URL',
+  'GOOGLE_REGISTRATION_SECRET',
+  'TELEGRAM_LOGIN_CLIENT_ID',
+  'TELEGRAM_LOGIN_CLIENT_SECRET',
+  'TELEGRAM_LOGIN_CALLBACK_URL',
+  'TELEGRAM_REGISTRATION_SECRET',
+];
+const telegramOidcKeys = [
+  'TELEGRAM_LOGIN_CLIENT_ID',
+  'TELEGRAM_LOGIN_CLIENT_SECRET',
+  'TELEGRAM_LOGIN_CALLBACK_URL',
+  'TELEGRAM_REGISTRATION_SECRET',
 ];
 const allKeys = [...webKeys, ...workerKeys];
 // Pool config is legitimately empty until the admin supplies bots/channel; the app
 // reports a not-ready pool and blocks uploads instead of misbehaving.
-const optionalKeys = ['TELEGRAM_BOT_TOKENS', 'TELEGRAM_SHARED_CHANNEL'];
+// Telegram OIDC is additive; blank values keep existing Google/local setups usable.
+const optionalKeys = [
+  'TELEGRAM_BOT_TOKENS',
+  'TELEGRAM_SHARED_CHANNEL',
+  'TELEGRAM_LOGIN_CLIENT_ID',
+  'TELEGRAM_LOGIN_CLIENT_SECRET',
+  'TELEGRAM_LOGIN_CALLBACK_URL',
+  'TELEGRAM_REGISTRATION_SECRET',
+];
 
 class EnvSyncError extends Error {}
 
@@ -64,6 +80,10 @@ function main() {
   const values = Object.fromEntries(allKeys.map((key) => [key, process.env[key] ?? '']));
   const missing = allKeys.filter((key) => !optionalKeys.includes(key) && values[key].trim() === '');
   if (missing.length > 0) fail(`missing non-empty values in root .env.local: ${missing.join(', ')}`);
+  const configuredTelegramOidc = telegramOidcKeys.filter((key) => values[key].trim() !== '');
+  if (configuredTelegramOidc.length > 0 && configuredTelegramOidc.length < telegramOidcKeys.length) {
+    fail(`Telegram OIDC values must be configured together: ${telegramOidcKeys.join(', ')}`);
+  }
 
   writeAtomic(resolve(root, 'apps/web/.env.local'), render(webKeys, values, 'apps/web/.env.local'));
   writeAtomic(resolve(root, 'apps/worker/.dev.vars'), render(workerKeys, values, 'apps/worker/.dev.vars'));

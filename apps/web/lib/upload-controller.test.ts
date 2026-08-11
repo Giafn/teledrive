@@ -2,7 +2,7 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError, type ApiClient, type BotPart, type BotUploadSession } from './api';
-import { MAX_FILE_SIZE, UploadController } from './upload-controller';
+import { MAX_FILE_SIZE, UploadCancelledError, UploadController } from './upload-controller';
 
 const chunkSize = 8 * 1024 * 1024;
 
@@ -79,6 +79,55 @@ describe('UploadController', () => {
     expect(events).toEqual(['start', 'status:0', 'upload:0', 'status:1', 'upload:1', 'complete']);
     expect(result.partCount).toBe(2);
     expect(result.sha256).toBe(bytesToHex(sha256(new Uint8Array(await await new Blob([testFile()]).arrayBuffer()))));
+  });
+
+  it('keeps default part PUTs serial when storage pool reports many bots', async () => {
+    let activePuts = 0;
+    let maxActivePuts = 0;
+    const api = {
+      ...makeApi([]),
+      getStoragePool: vi.fn(async () => ({ botCount: 8 })),
+    };
+    api.uploadBotPart = async (_uploadId, partNo, _body, input) => {
+      activePuts += 1;
+      maxActivePuts = Math.max(maxActivePuts, activePuts);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      activePuts -= 1;
+      return { partNo, size: input.size, sha256: input.sha256 };
+    };
+
+    await expect(new UploadController({ file: testFile(), chunkSize, api }).start()).resolves.toMatchObject({
+      partCount: 2,
+    });
+    expect(maxActivePuts).toBe(1);
+    expect(api.getStoragePool).not.toHaveBeenCalled();
+  });
+
+  it('passes controller signal and cancels active part PUT', async () => {
+    let resolveActive: () => void = () => undefined;
+    const active = new Promise<void>((resolve) => {
+      resolveActive = resolve;
+    });
+    let activeSignal: AbortSignal | undefined;
+    const api = makeApi([]);
+    api.uploadBotPart = async (_uploadId, _partNo, _body, _input, _onProgress, signal) => {
+      activeSignal = signal;
+      resolveActive();
+      return new Promise<BotPart>((_resolve, reject) => {
+        const abort = () => reject(new ApiError('REQUEST_ABORTED', 'API request was aborted', 0));
+        if (!signal) abort();
+        else if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort, { once: true });
+      });
+    };
+    const controller = new UploadController({ file: testFile(), chunkSize, api });
+    const run = controller.start();
+
+    await active;
+    expect(activeSignal).toBeInstanceOf(AbortSignal);
+    await controller.cancel();
+    await expect(run).rejects.toBeInstanceOf(UploadCancelledError);
+    expect(controller.state).toBe('cancelled');
   });
 
   it('honors Retry-After before safely retrying a not-started part', async () => {
@@ -225,12 +274,12 @@ describe('UploadController', () => {
 
   it('polls in-progress status until it becomes committed without sending a duplicate', async () => {
     const events: string[] = [];
-    let first = true;
+    let polls = 0;
     const api = makeApi(events);
     api.getBotPartAttempt = async (_uploadId, partNo) => {
       events.push(`status:${partNo}`);
-      if (first) {
-        first = false;
+      polls += 1;
+      if (polls <= 61) {
         return { partNo, status: 'in_progress' };
       }
       return { partNo, status: 'committed' };
@@ -245,6 +294,28 @@ describe('UploadController', () => {
       }).start(),
     ).resolves.toMatchObject({ partCount: 1 });
     expect(events).not.toContain('upload:0');
+    expect(polls).toBe(62);
+  });
+
+  it('reports partial per-part byte progress before commit', async () => {
+    const progress: number[] = [];
+    const api = makeApi([]);
+    api.uploadBotPart = async (_uploadId, partNo, _body, input, onProgress) => {
+      onProgress?.(1);
+      onProgress?.(input.size + 100);
+      return { partNo, size: input.size, sha256: input.sha256 };
+    };
+    const controller = new UploadController({
+      file: new Blob([new Uint8Array([1, 2, 3])]) as Blob & { name: string; type: string },
+      api,
+      onProgress: (snapshot) => {
+        if (snapshot.state === 'uploading') progress.push(snapshot.bytesUploaded);
+      },
+    });
+
+    await expect(controller.start()).resolves.toMatchObject({ partCount: 1 });
+    expect(progress).toContain(1);
+    expect(progress.at(-1)).toBe(3);
   });
 
   it('rejects files over 5 GiB before hashing or API access', async () => {

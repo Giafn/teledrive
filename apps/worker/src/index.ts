@@ -1,16 +1,9 @@
 import { Hono, type Context } from 'hono';
 import { createRemoteJWKSet, jwtVerify } from 'jose';
-import {
-  generateAuthenticationOptions,
-  generateRegistrationOptions,
-  verifyAuthenticationResponse,
-  verifyRegistrationResponse,
-} from '@simplewebauthn/server';
 import { validateManifest } from './manifest';
 import {
   base64url,
   constantTimeEqual,
-  coerceD1PublicKey,
   cookieValue,
   isExactOrigin,
   randomToken,
@@ -20,16 +13,7 @@ import {
   sha256,
   sha256Base64url,
 } from './security';
-import type {
-  AppEnv,
-  Bindings,
-  D1Database,
-  D1PreparedStatement,
-  PartRow,
-  SessionRow,
-  UploadRow,
-  UserRow,
-} from './types';
+import type { AppEnv, Bindings, D1Database, PartRow, SessionRow, UploadRow, UserRow } from './types';
 import { canAbort, canCommitPart, canComplete, uploadIsOpen } from './upload-state';
 import { createMultipartStream, StreamingBodyError } from './bot-transfer';
 import {
@@ -44,12 +28,22 @@ const app = new Hono<AppEnv>();
 const SESSION_COOKIE = '__Host-td_session';
 const CSRF_COOKIE = 'td_csrf';
 const GOOGLE_OAUTH_STATE_COOKIE = '__Host-td_oauth_state';
+const TELEGRAM_OAUTH_STATE_COOKIE = '__Host-td_telegram_oauth_state';
 const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const GOOGLE_JWKS_URL = 'https://www.googleapis.com/oauth2/v3/certs';
 const GOOGLE_ISSUER = 'https://accounts.google.com';
 const GOOGLE_SCOPE = 'openid email profile';
+const TELEGRAM_AUTH_ENDPOINT = 'https://oauth.telegram.org/auth';
+const TELEGRAM_TOKEN_ENDPOINT = 'https://oauth.telegram.org/token';
+const TELEGRAM_JWKS_URL = 'https://oauth.telegram.org/.well-known/jwks.json';
+const TELEGRAM_ISSUER = 'https://oauth.telegram.org';
+const TELEGRAM_SCOPE = 'openid';
 const MAX_JSON_BYTES = 256 * 1024;
+const MAX_GOOGLE_REGISTRATION_SECRET_LENGTH = 1024;
+const MAX_TELEGRAM_REGISTRATION_SECRET_LENGTH = 1024;
+const OIDC_CLOCK_TOLERANCE_SECONDS = 60;
+const OIDC_MAX_TOKEN_AGE_SECONDS = 10 * 60;
 const MAX_NAME_LENGTH = 255;
 const MIN_CHUNK_SIZE = 8 * 1024 * 1024;
 const MAX_CHUNK_SIZE = 19 * 1024 * 1024;
@@ -236,7 +230,7 @@ async function validateMutationCsrf(c: Context<AppEnv>): Promise<void> {
     return;
   }
 
-  if (c.req.path.startsWith('/v1/auth/passkey/') || c.req.path === '/v1/auth/google/start') {
+  if (c.req.path === '/v1/auth/google/start' || c.req.path === '/v1/auth/telegram/start') {
     const cookieToken = requestCookie(c, CSRF_COOKIE);
     if (cookieToken && constantTimeEqual(cookieToken, csrf)) return;
   }
@@ -271,44 +265,8 @@ function metadataCursor(c: Context<AppEnv>) {
   return cursor;
 }
 
-function isWebAuthnResponse(value: unknown, authentication: boolean): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const response = (value as Record<string, unknown>).response;
-  if (!response || typeof response !== 'object' || Array.isArray(response)) return false;
-  const body = response as Record<string, unknown>;
-  const common =
-    typeof (value as Record<string, unknown>).id === 'string' &&
-    typeof (value as Record<string, unknown>).rawId === 'string' &&
-    (value as Record<string, unknown>).type === 'public-key' &&
-    typeof body.clientDataJSON === 'string';
-  return (
-    common &&
-    (authentication
-      ? typeof body.authenticatorData === 'string' && typeof body.signature === 'string'
-      : typeof body.attestationObject === 'string')
-  );
-}
-
-function bytesFromDb(value: unknown): Uint8Array<ArrayBuffer> {
-  try {
-    return coerceD1PublicKey(value);
-  } catch {
-    fail(500, 'DATABASE_ERROR', 'Stored credential is invalid');
-  }
-}
-
 function changes(result: { meta?: { changes?: number } }): number {
   return result.meta?.changes ?? 0;
-}
-
-export async function purgeChallenges(db: D1Database, at = Date.now()): Promise<void> {
-  const current = at;
-  const expired = new Date(current).toISOString();
-  const oldUsed = new Date(current - 10 * 60_000).toISOString();
-  await db
-    .prepare('DELETE FROM webauthn_challenges WHERE expires_at <= ? OR (used_at IS NOT NULL AND used_at < ?)')
-    .bind(expired, oldUsed)
-    .run();
 }
 
 export async function purgeOAuthTransactions(db: D1Database, at = Date.now()): Promise<void> {
@@ -337,37 +295,134 @@ function rateLimitAuth(c: Context<AppEnv>): void {
   }
 }
 
-async function workspaceForUser(c: Context<AppEnv>, userId: string) {
-  const workspace = await first<{ id: string; name: string }>(
+type WorkspaceAccess = { id: string; name: string; owner_id: string; is_owner: boolean };
+
+type WorkspaceAccessRow = { id: string; name: string; owner_id: string; is_owner: number | boolean };
+
+function workspaceAccess(row: WorkspaceAccessRow): WorkspaceAccess {
+  return { ...row, is_owner: Boolean(row.is_owner) };
+}
+
+async function workspaceForUser(c: Context<AppEnv>, userId: string, workspaceId?: string): Promise<WorkspaceAccess> {
+  const workspace = workspaceId
+    ? await first<WorkspaceAccessRow>(
+        c.env.DB,
+        `
+        SELECT w.id, w.name, w.owner_id, (w.owner_id = ?) AS is_owner
+        FROM workspaces w
+        WHERE w.id = ? AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))
+      `,
+        userId,
+        workspaceId,
+        userId,
+        userId,
+      )
+    : await first<WorkspaceAccessRow>(
+        c.env.DB,
+        `
+        SELECT w.id, w.name, w.owner_id, (w.owner_id = ?) AS is_owner
+        FROM workspaces w
+        WHERE w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        )
+        ORDER BY CASE WHEN w.owner_id = ? THEN 0 ELSE 1 END, w.id
+        LIMIT 1
+      `,
+        userId,
+        userId,
+        userId,
+        userId,
+      );
+  if (!workspace) fail(404, 'WORKSPACE_NOT_FOUND', 'Workspace not found');
+  return workspaceAccess(workspace);
+}
+
+async function accessibleWorkspaces(c: Context<AppEnv>, userId: string): Promise<WorkspaceAccess[]> {
+  const rows = await all<WorkspaceAccessRow>(
     c.env.DB,
-    'SELECT id, name FROM workspaces WHERE owner_id = ?',
+    `
+    SELECT w.id, w.name, w.owner_id, (w.owner_id = ?) AS is_owner
+    FROM workspaces w
+    WHERE w.owner_id = ? OR EXISTS (
+      SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+    )
+    ORDER BY CASE WHEN w.owner_id = ? THEN 0 ELSE 1 END, w.id
+  `,
+    userId,
+    userId,
+    userId,
     userId,
   );
-  if (!workspace) fail(500, 'WORKSPACE_MISSING', 'Workspace is missing');
-  return workspace;
+  return rows.map(workspaceAccess);
+}
+
+async function workspaceMembers(c: Context<AppEnv>, workspace: WorkspaceAccess) {
+  const owner = await first<{ username: string; display_name: string; status: UserRow['status'] }>(
+    c.env.DB,
+    'SELECT username, display_name, status FROM users WHERE id = ?',
+    workspace.owner_id,
+  );
+  const rows = await all<{
+    user_id: string;
+    username: string;
+    display_name: string;
+    status: UserRow['status'];
+    created_at: string;
+  }>(
+    c.env.DB,
+    `
+    SELECT wm.user_id, u.username, u.display_name, u.status, wm.created_at
+    FROM workspace_members wm JOIN users u ON u.id = wm.user_id
+    WHERE wm.workspace_id = ?
+    ORDER BY wm.created_at, wm.user_id
+  `,
+    workspace.id,
+  );
+  return [
+    {
+      userId: workspace.owner_id,
+      username: owner?.username ?? null,
+      displayName: owner?.display_name ?? null,
+      status: owner?.status,
+      role: 'owner' as const,
+      createdAt: null,
+    },
+    ...rows.map((row) => ({
+      userId: row.user_id,
+      username: row.username,
+      displayName: row.display_name,
+      status: row.status,
+      role: 'member' as const,
+      createdAt: row.created_at,
+    })),
+  ];
+}
+
+function requireWorkspaceOwner(workspace: WorkspaceAccess): void {
+  if (!workspace.is_owner) fail(403, 'WORKSPACE_OWNER_REQUIRED', 'Workspace owner required');
 }
 
 async function folderForUser(c: Context<AppEnv>, userId: string, folderId: string | undefined, includeDeleted = false) {
-  const workspace = await workspaceForUser(c, userId);
   const folder = folderId
     ? await first<{
         id: string;
+        workspace_id: string;
         parent_id: string | null;
         name: string;
         normalized_name: string;
         deleted_at: string | null;
-      }>(
-        c.env.DB,
-        `
-        SELECT f.id, f.parent_id, f.name, f.normalized_name, f.deleted_at
-        FROM folders f JOIN workspaces w ON w.id = f.workspace_id
-        WHERE f.id = ? AND w.owner_id = ? ${includeDeleted ? '' : 'AND f.deleted_at IS NULL'}
-      `,
-        folderId,
-        userId,
-      )
+      }>(c.env.DB, 'SELECT id, workspace_id, parent_id, name, normalized_name, deleted_at FROM folders WHERE id = ?', folderId)
+    : null;
+  const workspace = folder
+    ? await workspaceForUser(c, userId, folder.workspace_id)
+    : await workspaceForUser(c, userId);
+  const resolvedFolder = folder
+    ? folder
     : await first<{
         id: string;
+        workspace_id: string;
         parent_id: string | null;
         name: string;
         normalized_name: string;
@@ -375,23 +430,24 @@ async function folderForUser(c: Context<AppEnv>, userId: string, folderId: strin
       }>(
         c.env.DB,
         `
-        SELECT f.id, f.parent_id, f.name, f.normalized_name, f.deleted_at
-        FROM folders f WHERE f.workspace_id = ? AND f.parent_id IS NULL
-        ${includeDeleted ? '' : 'AND f.deleted_at IS NULL'}
+        SELECT id, workspace_id, parent_id, name, normalized_name, deleted_at
+        FROM folders WHERE workspace_id = ? AND parent_id IS NULL
+        ${includeDeleted ? '' : 'AND deleted_at IS NULL'}
       `,
         workspace.id,
       );
-  if (!folder) fail(404, 'FOLDER_NOT_FOUND', 'Folder not found');
-  return { workspace, folder };
+  if (!resolvedFolder || (!includeDeleted && resolvedFolder.deleted_at)) fail(404, 'FOLDER_NOT_FOUND', 'Folder not found');
+  return { workspace, folder: resolvedFolder };
 }
 
 async function uploadForUser(c: Context<AppEnv>, userId: string, uploadId: string): Promise<UploadRow> {
-  const upload = await first<UploadRow>(
+  const upload = await first<UploadRow & { workspace_id: string }>(
     c.env.DB,
     `
     SELECT us.id, us.user_id, us.object_id, us.status, us.chunk_size, us.expected_part_count,
            us.idempotency_key, us.expires_at, o.name AS object_name, o.mime,
-           o.size AS object_size, o.sha256 AS object_sha256, o.status AS object_status, o.deleted_at AS object_deleted_at, o.folder_id
+           o.size AS object_size, o.sha256 AS object_sha256, o.status AS object_status, o.deleted_at AS object_deleted_at,
+           o.folder_id, o.workspace_id
     FROM upload_sessions us JOIN objects o ON o.id = us.object_id
     WHERE us.id = ? AND us.user_id = ?
   `,
@@ -399,6 +455,7 @@ async function uploadForUser(c: Context<AppEnv>, userId: string, uploadId: strin
     userId,
   );
   if (!upload) fail(404, 'UPLOAD_NOT_FOUND', 'Upload session not found');
+  await workspaceForUser(c, userId, upload.workspace_id);
   return upload;
 }
 
@@ -421,31 +478,14 @@ async function objectForUser(c: Context<AppEnv>, userId: string, objectId: strin
     `
     SELECT o.id, o.workspace_id, o.folder_id, o.name, o.mime, o.size, o.sha256, o.part_count,
            o.status, o.deleted_at, o.created_at, o.updated_at
-    FROM objects o JOIN workspaces w ON w.id = o.workspace_id
-    WHERE o.id = ? AND w.owner_id = ? ${includeDeleted ? '' : 'AND o.deleted_at IS NULL'}
+    FROM objects o WHERE o.id = ?
   `,
     objectId,
-    userId,
   );
   if (!object) fail(404, 'OBJECT_NOT_FOUND', 'Object not found');
-  return object;
-}
-
-export function prepareBootstrapPasskeyStatement(
-  db: D1Database,
-  credentialId: string,
-  publicKey: unknown,
-  counter: number,
-  transport: string,
-  created: string,
-  userId: string,
-): D1PreparedStatement {
-  return db
-    .prepare(
-      `INSERT INTO passkeys (id, user_id, public_key, counter, transports, created_at)
-    SELECT ?, id, ?, ?, ?, ? FROM users WHERE id = ? AND status = 'active'`,
-    )
-    .bind(credentialId, publicKey, counter, transport, created, userId);
+  const workspace = await workspaceForUser(c, userId, object.workspace_id);
+  if (!includeDeleted && object.deleted_at) fail(404, 'OBJECT_NOT_FOUND', 'Object not found');
+  return { ...object, is_owner: workspace.is_owner };
 }
 
 // Request IDs and security headers are attached to every response, including errors.
@@ -465,7 +505,10 @@ app.use('*', async (c, next) => {
     c.header('Access-Control-Allow-Origin', c.env.APP_ORIGIN);
     c.header('Access-Control-Allow-Credentials', 'true');
     c.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    c.header('Access-Control-Allow-Headers', 'Content-Type, X-CSRF-Token, X-Bootstrap-Token, X-Request-ID, X-Part-Size, X-Part-SHA256, X-Idempotency-Key');
+    c.header(
+      'Access-Control-Allow-Headers',
+      'Content-Type, X-CSRF-Token, X-Bootstrap-Token, X-Request-ID, X-Part-Size, X-Part-SHA256, X-Idempotency-Key',
+    );
     c.header('Access-Control-Max-Age', '600');
     c.header('Vary', 'Origin');
     applySecurityHeaders(c);
@@ -489,12 +532,12 @@ app.use('*', async (c, next) => {
   await next();
 });
 
-app.use('/v1/auth/passkey/*', async (c, next) => {
+app.use('/v1/auth/google/start', async (c, next) => {
   rateLimitAuth(c);
   await next();
 });
 
-app.use('/v1/auth/google/start', async (c, next) => {
+app.use('/v1/auth/telegram/start', async (c, next) => {
   rateLimitAuth(c);
   await next();
 });
@@ -542,313 +585,6 @@ app.get('/v1/auth/session', async (c) => {
   return c.json({ user: { id: session.id, username: session.username, displayName: session.display_name } });
 });
 
-app.post('/v1/auth/passkey/register/options', async (c) => {
-  requireConfig(c.env, 'APP_ORIGIN', 'RP_ID', 'RP_NAME', 'BOOTSTRAP_TOKEN');
-  const body = record(await readJson<unknown>(c));
-  await purgeChallenges(c.env.DB);
-  const active = await first<{ count: number }>(
-    c.env.DB,
-    "SELECT COUNT(*) AS count FROM users WHERE status = 'active'",
-  );
-  const session = await getSession(c);
-  let user: UserRow | null = null;
-  let mode: 'bootstrap_registration' | 'add_passkey';
-  let issuedSessionId: string | null = null;
-  if ((active?.count ?? 0) === 0) {
-    const bootstrap = c.req.header('X-Bootstrap-Token');
-    if (!bootstrap || !constantTimeEqual(bootstrap, c.env.BOOTSTRAP_TOKEN))
-      fail(403, 'BOOTSTRAP_REQUIRED', 'Bootstrap token required');
-    const username = stringValue(body.userName, 'userName', 128).trim().toLocaleLowerCase('en-US');
-    if (!username) fail(422, 'INVALID_FIELD', 'userName is invalid');
-    const displayName = stringValue(body.displayName ?? username, 'displayName', 128).trim();
-    if (!displayName) fail(422, 'INVALID_FIELD', 'displayName is invalid');
-    user = await first<UserRow>(
-      c.env.DB,
-      'SELECT id, username, display_name, status FROM users WHERE username = ?',
-      username,
-    );
-    if (user && user.status !== 'pending') fail(403, 'BOOTSTRAP_CLOSED', 'Bootstrap registration is closed');
-    if (!user) {
-      user = { id: randomToken(18), username, display_name: displayName, status: 'pending' };
-    }
-    mode = 'bootstrap_registration';
-  } else {
-    if (!session) fail(401, 'AUTH_REQUIRED', 'Authenticated session required to add passkey');
-    user = session;
-    mode = 'add_passkey';
-    issuedSessionId = session.session_id;
-  }
-
-  const options = await generateRegistrationOptions({
-    rpName: c.env.RP_NAME,
-    rpID: c.env.RP_ID,
-    userName: user.username,
-    userDisplayName: user.display_name,
-    userID: new TextEncoder().encode(user.id),
-    attestationType: 'none',
-    timeout: 60_000,
-    authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
-  });
-  const challengeId = randomToken(18);
-  try {
-    const statements = [
-      ...(user.status === 'pending'
-        ? [
-            c.env.DB.prepare(
-              'INSERT INTO users (id, username, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-            ).bind(user.id, user.username, user.display_name, user.status, now(), now()),
-          ]
-        : []),
-      c.env.DB.prepare(
-        `
-        INSERT INTO webauthn_challenges (id, user_id, kind, mode, issued_session_id, challenge, metadata_json, expires_at, created_at)
-        VALUES (?, ?, 'registration', ?, ?, ?, ?, ?, ?)
-      `,
-      ).bind(
-        challengeId,
-        user.id,
-        mode,
-        issuedSessionId,
-        options.challenge,
-        JSON.stringify({ username: user.username }),
-        new Date(Date.now() + 5 * 60_000).toISOString(),
-        now(),
-      ),
-    ];
-    await c.env.DB.batch(statements);
-  } catch (error) {
-    if (isConstraintError(error) && mode === 'bootstrap_registration')
-      fail(409, 'BOOTSTRAP_IN_PROGRESS', 'Another bootstrap registration is in progress');
-    throw error;
-  }
-  return c.json({ challengeId, options });
-});
-
-app.post('/v1/auth/passkey/register/verify', async (c) => {
-  requireConfig(c.env, 'APP_ORIGIN', 'RP_ID', 'APP_SESSION_SECRET');
-  const body = record(await readJson<unknown>(c));
-  const challengeId = stringValue(body.challengeId, 'challengeId', 128);
-  if (!isWebAuthnResponse(body.response, false)) fail(422, 'INVALID_PASSKEY_RESPONSE', 'Passkey response is invalid');
-  const claimed = await c.env.DB.prepare(
-    `
-    UPDATE webauthn_challenges SET used_at = ?
-    WHERE id = ? AND kind = 'registration' AND mode IN ('bootstrap_registration', 'add_passkey')
-      AND used_at IS NULL AND expires_at > ?
-  `,
-  )
-    .bind(now(), challengeId, now())
-    .run();
-  if ((claimed.meta?.changes ?? 0) !== 1) fail(422, 'CHALLENGE_INVALID', 'Passkey challenge expired or already used');
-  const challenge = await first<{ user_id: string; challenge: string; mode: string; issued_session_id: string | null }>(
-    c.env.DB,
-    'SELECT user_id, challenge, mode, issued_session_id FROM webauthn_challenges WHERE id = ?',
-    challengeId,
-  );
-  if (!challenge?.user_id || !['bootstrap_registration', 'add_passkey'].includes(challenge.mode))
-    fail(422, 'CHALLENGE_INVALID', 'Passkey challenge invalid');
-  if (challenge.mode === 'bootstrap_registration') {
-    requireConfig(c.env, 'BOOTSTRAP_TOKEN');
-    const bootstrap = c.req.header('X-Bootstrap-Token');
-    if (!bootstrap || !constantTimeEqual(bootstrap, c.env.BOOTSTRAP_TOKEN))
-      fail(403, 'BOOTSTRAP_REQUIRED', 'Bootstrap token required');
-    const pending = await first<{ status: string }>(
-      c.env.DB,
-      'SELECT status FROM users WHERE id = ?',
-      challenge.user_id,
-    );
-    if (!pending || pending.status !== 'pending') fail(403, 'BOOTSTRAP_CLOSED', 'Bootstrap registration is closed');
-  } else {
-    const session = await getSession(c);
-    if (!session || session.session_id !== challenge.issued_session_id || session.id !== challenge.user_id) {
-      fail(401, 'AUTH_REQUIRED', 'Issuing session is no longer valid');
-    }
-  }
-  const response = body.response as Parameters<typeof verifyRegistrationResponse>[0]['response'];
-  let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
-  try {
-    verification = await verifyRegistrationResponse({
-      response,
-      expectedChallenge: challenge.challenge,
-      expectedOrigin: c.env.APP_ORIGIN,
-      expectedRPID: c.env.RP_ID,
-      requireUserVerification: true,
-    });
-  } catch {
-    fail(422, 'PASSKEY_VERIFICATION_FAILED', 'Passkey verification failed');
-  }
-  if (!verification.verified || !verification.registrationInfo)
-    fail(422, 'PASSKEY_VERIFICATION_FAILED', 'Passkey verification failed');
-  const credential = verification.registrationInfo.credential;
-  const user = await first<UserRow>(
-    c.env.DB,
-    'SELECT id, username, display_name, status FROM users WHERE id = ?',
-    challenge.user_id,
-  );
-  if (!user) fail(422, 'USER_NOT_FOUND', 'Registration user is invalid');
-  const created = now();
-  const credentialId = credential.id;
-  const transport = 'transports' in credential ? JSON.stringify(credential.transports ?? []) : '[]';
-  try {
-    const workspaceId = randomToken(18);
-    const rootId = randomToken(18);
-    const statements =
-      challenge.mode === 'bootstrap_registration'
-        ? [
-            c.env.DB.prepare(
-              "UPDATE users SET status = 'active', updated_at = ? WHERE id = ? AND status = 'pending' AND NOT EXISTS (SELECT 1 FROM users WHERE status = 'active')",
-            ).bind(created, user.id),
-            prepareBootstrapPasskeyStatement(
-              c.env.DB,
-              credentialId,
-              credential.publicKey,
-              credential.counter,
-              transport,
-              created,
-              user.id,
-            ),
-            c.env.DB.prepare(
-              `INSERT INTO workspaces (id, owner_id, name, created_at, updated_at)
-        SELECT ?, id, 'My Drive', ?, ? FROM users WHERE id = ? AND status = 'active'
-          AND NOT EXISTS (SELECT 1 FROM workspaces WHERE owner_id = ?)`,
-            ).bind(workspaceId, created, created, user.id, user.id),
-            c.env.DB.prepare(
-              `INSERT INTO folders (id, workspace_id, parent_id, name, normalized_name, path_key, created_at, updated_at)
-        SELECT ?, id, NULL, 'My Drive', 'my drive', ?, ?, ? FROM workspaces
-        WHERE owner_id = ? AND NOT EXISTS (SELECT 1 FROM folders WHERE workspace_id = workspaces.id AND parent_id IS NULL)`,
-            ).bind(rootId, rootId, created, created, user.id),
-            c.env.DB.prepare(
-              `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
-        SELECT ?, ?, 'passkey.registered', 'user', ?, ? WHERE EXISTS (SELECT 1 FROM passkeys WHERE id = ? AND user_id = ?)`,
-            ).bind(randomToken(18), user.id, user.id, created, credentialId, user.id),
-          ]
-        : [
-            c.env.DB.prepare(
-              `INSERT INTO passkeys (id, user_id, public_key, counter, transports, created_at)
-        SELECT ?, u.id, ?, ?, ?, ? FROM users u JOIN sessions s ON s.user_id = u.id
-        WHERE u.id = ? AND u.status = 'active' AND s.id = ? AND s.expires_at > ?`,
-            ).bind(
-              credentialId,
-              credential.publicKey,
-              credential.counter,
-              transport,
-              created,
-              user.id,
-              challenge.issued_session_id,
-              now(),
-            ),
-            c.env.DB.prepare(
-              `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
-        SELECT ?, ?, 'passkey.registered', 'user', ?, ? WHERE EXISTS (SELECT 1 FROM passkeys WHERE id = ? AND user_id = ?)`,
-            ).bind(randomToken(18), user.id, user.id, created, credentialId, user.id),
-          ];
-    const results = await c.env.DB.batch(statements);
-    const passkeyResult = challenge.mode === 'bootstrap_registration' ? results[1] : results[0];
-    if (changes(passkeyResult) !== 1) {
-      fail(
-        challenge.mode === 'bootstrap_registration' ? 409 : 401,
-        challenge.mode === 'bootstrap_registration' ? 'BOOTSTRAP_CLOSED' : 'AUTH_REQUIRED',
-        'Issuing authorization is no longer valid',
-      );
-    }
-  } catch (error) {
-    if (error instanceof HttpError) throw error;
-    if (isConstraintError(error)) fail(409, 'PASSKEY_EXISTS', 'Passkey is already registered');
-    throw error;
-  }
-  await c.env.DB.prepare('DELETE FROM webauthn_challenges WHERE id = ?').bind(challengeId).run();
-  const csrfToken = await setSession(c, user.id);
-  return c.json({ user: { id: user.id, username: user.username, displayName: user.display_name }, csrfToken });
-});
-
-app.post('/v1/auth/passkey/authenticate/options', async (c) => {
-  requireConfig(c.env, 'RP_ID');
-  const body = record(await readJson<unknown>(c));
-  await purgeChallenges(c.env.DB);
-  const username = stringValue(body.userName, 'userName', 128).trim().toLocaleLowerCase('en-US');
-  if (!username) fail(422, 'INVALID_FIELD', 'userName is invalid');
-  const user = await first<UserRow>(
-    c.env.DB,
-    "SELECT id, username, display_name, status FROM users WHERE username = ? AND status = 'active'",
-    username,
-  );
-  if (!user) fail(404, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const passkeys = await all<{ id: string }>(c.env.DB, 'SELECT id FROM passkeys WHERE user_id = ?', user.id);
-  if (passkeys.length === 0) fail(404, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const options = await generateAuthenticationOptions({
-    rpID: c.env.RP_ID,
-    allowCredentials: passkeys.map((passkey) => ({ id: passkey.id })),
-    userVerification: 'required',
-    timeout: 60_000,
-  });
-  const challengeId = randomToken(18);
-  await c.env.DB.prepare(
-    `
-    INSERT INTO webauthn_challenges (id, user_id, kind, mode, issued_session_id, challenge, metadata_json, expires_at, created_at)
-    VALUES (?, ?, 'authentication', 'authentication', NULL, ?, '{}', ?, ?)
-  `,
-  )
-    .bind(challengeId, user.id, options.challenge, new Date(Date.now() + 5 * 60_000).toISOString(), now())
-    .run();
-  return c.json({ challengeId, options });
-});
-
-app.post('/v1/auth/passkey/authenticate/verify', async (c) => {
-  requireConfig(c.env, 'APP_ORIGIN', 'RP_ID', 'APP_SESSION_SECRET');
-  const body = record(await readJson<unknown>(c));
-  const challengeId = stringValue(body.challengeId, 'challengeId', 128);
-  if (!isWebAuthnResponse(body.response, true)) fail(422, 'INVALID_PASSKEY_RESPONSE', 'Passkey response is invalid');
-  const claimed = await c.env.DB.prepare(
-    `
-    UPDATE webauthn_challenges SET used_at = ?
-    WHERE id = ? AND kind = 'authentication' AND used_at IS NULL AND expires_at > ?
-  `,
-  )
-    .bind(now(), challengeId, now())
-    .run();
-  if ((claimed.meta?.changes ?? 0) !== 1) fail(422, 'CHALLENGE_INVALID', 'Passkey challenge expired or already used');
-  const challenge = await first<{ user_id: string; challenge: string }>(
-    c.env.DB,
-    'SELECT user_id, challenge FROM webauthn_challenges WHERE id = ?',
-    challengeId,
-  );
-  if (!challenge) fail(422, 'CHALLENGE_INVALID', 'Passkey challenge invalid');
-  const passkey = await first<{ id: string; user_id: string; public_key: unknown; counter: number }>(
-    c.env.DB,
-    'SELECT id, user_id, public_key, counter FROM passkeys WHERE id = ?',
-    stringValue(body.response && (body.response as Record<string, unknown>).id, 'credentialId', 512),
-  );
-  if (!passkey || passkey.user_id !== challenge.user_id) fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const response = body.response as Parameters<typeof verifyAuthenticationResponse>[0]['response'];
-  let verification: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
-  try {
-    verification = await verifyAuthenticationResponse({
-      response,
-      expectedChallenge: challenge.challenge,
-      expectedOrigin: c.env.APP_ORIGIN,
-      expectedRPID: c.env.RP_ID,
-      credential: { id: passkey.id, publicKey: bytesFromDb(passkey.public_key), counter: passkey.counter },
-      requireUserVerification: true,
-    });
-  } catch {
-    fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  }
-  if (!verification.verified) fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const newCounter = verification.authenticationInfo.newCounter;
-  await c.env.DB.prepare('UPDATE passkeys SET counter = MAX(counter, ?), last_used_at = ? WHERE id = ?')
-    .bind(newCounter, now(), passkey.id)
-    .run();
-  const csrfToken = await setSession(c, challenge.user_id);
-  const user = await first<UserRow>(
-    c.env.DB,
-    'SELECT id, username, display_name, status FROM users WHERE id = ?',
-    challenge.user_id,
-  );
-  if (!user) fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  await audit(c.env.DB, user.id, 'session.created', 'user', user.id).run();
-  await c.env.DB.prepare('DELETE FROM webauthn_challenges WHERE id = ?').bind(challengeId).run();
-  return c.json({ user: { id: user.id, username: user.username, displayName: user.display_name }, csrfToken });
-});
-
 app.post('/v1/auth/logout', async (c) => {
   const session = await requireSession(c);
   await c.env.DB.prepare('DELETE FROM sessions WHERE id = ?').bind(session.session_id).run();
@@ -863,10 +599,38 @@ async function googleRedirect(c: Context<AppEnv>, error?: string): Promise<Respo
   return c.redirect(url.toString(), 302);
 }
 
+async function telegramRedirect(c: Context<AppEnv>, error?: string): Promise<Response> {
+  c.header(
+    'Set-Cookie',
+    serializeCookie(TELEGRAM_OAUTH_STATE_COOKIE, '', { httpOnly: true, maxAge: 0, sameSite: 'Lax' }),
+    { append: true },
+  );
+  const url = new URL(c.env.APP_ORIGIN);
+  if (error) url.searchParams.set('error', error);
+  return c.redirect(url.toString(), 302);
+}
+
 app.post('/v1/auth/google/start', async (c) => {
   requireConfig(c.env, 'APP_ORIGIN', 'APP_SESSION_SECRET', 'GOOGLE_CLIENT_ID', 'GOOGLE_CALLBACK_URL');
   const body = record(await readJson<unknown>(c));
-  const mode = body.mode === 'link' ? 'link' : body.mode === 'login' ? 'login' : fail(422, 'INVALID_FIELD', 'mode is invalid');
+  const mode =
+    body.mode === 'register'
+      ? 'register'
+      : body.mode === 'link'
+        ? 'link'
+        : body.mode === 'login'
+          ? 'login'
+          : fail(422, 'INVALID_FIELD', 'mode is invalid');
+  if (mode === 'register') {
+    requireConfig(c.env, 'GOOGLE_REGISTRATION_SECRET');
+    const secretInfo = stringValue(body.secretInfo, 'secretInfo', MAX_GOOGLE_REGISTRATION_SECRET_LENGTH);
+    const [providedDigest, expectedDigest] = await Promise.all([
+      sha256(secretInfo),
+      sha256(c.env.GOOGLE_REGISTRATION_SECRET),
+    ]);
+    if (!constantTimeEqual(providedDigest, expectedDigest))
+      fail(403, 'REGISTRATION_SECRET_INVALID', 'Registration secret is invalid');
+  }
   await purgeOAuthTransactions(c.env.DB);
   let userId: string | null = null;
   let issuedSessionId: string | null = null;
@@ -930,33 +694,37 @@ app.get('/v1/auth/google/callback', async (c) => {
   const code = c.req.query('code');
   const googleError = c.req.query('error');
   const stateCookie = requestCookie(c, GOOGLE_OAUTH_STATE_COOKIE);
-  if (googleError === 'access_denied') return googleRedirect(c, 'google_denied');
-  if (googleError) return googleRedirect(c, 'google_failed');
-  if (!stateParam || !code || !stateCookie || !constantTimeEqual(stateCookie, stateParam))
+  if (!stateParam || !stateCookie || !constantTimeEqual(stateCookie, stateParam))
     return googleRedirect(c, 'google_failed');
+  const stateHash = await secretHash(stateParam, c.env.APP_SESSION_SECRET);
   const claimed = await c.env.DB.prepare(
     `
     UPDATE oauth_transactions SET used_at = ?
     WHERE provider = 'google' AND state_hash = ? AND used_at IS NULL AND expires_at > ?
   `,
   )
-    .bind(now(), await secretHash(stateParam, c.env.APP_SESSION_SECRET), now())
+    .bind(now(), stateHash, now())
     .run();
   if (changes(claimed) !== 1) return googleRedirect(c, 'google_failed');
+  c.header(
+    'Set-Cookie',
+    serializeCookie(GOOGLE_OAUTH_STATE_COOKIE, '', { httpOnly: true, maxAge: 0, sameSite: 'Lax' }),
+  );
+  if (googleError === 'access_denied') return googleRedirect(c, 'google_denied');
+  if (googleError || !code) return googleRedirect(c, 'google_failed');
   const tx = await first<{
     id: string;
     nonce_hash: string;
     code_verifier: string;
-    mode: 'login' | 'link';
+    mode: 'login' | 'link' | 'register';
     user_id: string | null;
     issued_session_id: string | null;
   }>(
     c.env.DB,
     "SELECT id, nonce_hash, code_verifier, mode, user_id, issued_session_id FROM oauth_transactions WHERE provider = 'google' AND state_hash = ?",
-    await secretHash(stateParam, c.env.APP_SESSION_SECRET),
+    stateHash,
   );
   if (!tx) return googleRedirect(c, 'google_failed');
-  c.header('Set-Cookie', serializeCookie(GOOGLE_OAUTH_STATE_COOKIE, '', { httpOnly: true, maxAge: 0, sameSite: 'Lax' }));
   const tokenResponse = await fetch(GOOGLE_TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1022,6 +790,7 @@ app.get('/v1/auth/google/callback', async (c) => {
     await setSession(c, user.id);
     return googleRedirect(c);
   }
+  if (tx.mode !== 'register') return googleRedirect(c, 'google_failed');
   const email = typeof payload.email === 'string' ? payload.email : '';
   const emailLocal = email.split('@')[0] ?? '';
   const baseUsername = emailLocal.toLocaleLowerCase('en-US').replace(/[^a-z0-9._-]+/gu, '') || 'user';
@@ -1039,12 +808,9 @@ app.get('/v1/auth/google/callback', async (c) => {
       c.env.DB.prepare(
         "INSERT INTO auth_identities (id, user_id, provider, issuer, subject, created_at, last_used_at) VALUES (?, ?, 'google', ?, ?, ?, ?)",
       ).bind(randomToken(18), userId, issuer, subject, created, created),
-      c.env.DB.prepare("INSERT INTO workspaces (id, owner_id, name, created_at, updated_at) VALUES (?, ?, 'My Drive', ?, ?)").bind(
-        workspaceId,
-        userId,
-        created,
-        created,
-      ),
+      c.env.DB.prepare(
+        "INSERT INTO workspaces (id, owner_id, name, created_at, updated_at) VALUES (?, ?, 'My Drive', ?, ?)",
+      ).bind(workspaceId, userId, created, created),
       c.env.DB.prepare(
         `INSERT INTO folders (id, workspace_id, parent_id, name, normalized_name, path_key, created_at, updated_at)
         VALUES (?, ?, NULL, 'My Drive', 'my drive', ?, ?, ?)`,
@@ -1070,6 +836,329 @@ async function uniqueUsername(db: D1Database, base: string): Promise<string> {
   }
   fail(500, 'USERNAME_EXHAUSTED', 'Could not allocate a unique username');
 }
+
+function hasAudience(value: unknown, expected: string): boolean {
+  return value === expected || (Array.isArray(value) && value.every((item) => typeof item === 'string') && value.includes(expected));
+}
+
+function validTelegramTokenTimes(payload: Awaited<ReturnType<typeof jwtVerify>>['payload']): boolean {
+  const exp = payload.exp;
+  const iat = payload.iat;
+  const current = Math.floor(Date.now() / 1000);
+  if (typeof exp !== 'number' || typeof iat !== 'number' || !Number.isSafeInteger(exp) || !Number.isSafeInteger(iat))
+    return false;
+  if (exp <= current - OIDC_CLOCK_TOLERANCE_SECONDS || exp <= iat) return false;
+  return iat >= current - OIDC_MAX_TOKEN_AGE_SECONDS - OIDC_CLOCK_TOLERANCE_SECONDS && iat <= current + OIDC_CLOCK_TOLERANCE_SECONDS;
+}
+
+app.post('/v1/auth/telegram/start', async (c) => {
+  requireConfig(c.env, 'APP_ORIGIN', 'APP_SESSION_SECRET', 'TELEGRAM_LOGIN_CLIENT_ID', 'TELEGRAM_LOGIN_CALLBACK_URL');
+  const body = record(await readJson<unknown>(c));
+  const mode =
+    body.mode === 'register'
+      ? 'register'
+      : body.mode === 'login'
+        ? 'login'
+        : fail(422, 'INVALID_FIELD', 'mode is invalid');
+  if (mode === 'register') {
+    requireConfig(c.env, 'TELEGRAM_REGISTRATION_SECRET');
+    const secretInfo = stringValue(body.secretInfo, 'secretInfo', MAX_TELEGRAM_REGISTRATION_SECRET_LENGTH);
+    const [providedDigest, expectedDigest] = await Promise.all([
+      sha256(secretInfo),
+      sha256(c.env.TELEGRAM_REGISTRATION_SECRET!),
+    ]);
+    if (!constantTimeEqual(providedDigest, expectedDigest))
+      fail(403, 'REGISTRATION_SECRET_INVALID', 'Registration secret is invalid');
+  }
+  await purgeOAuthTransactions(c.env.DB);
+  const state = randomToken(24);
+  const nonce = randomToken(16);
+  const verifier = randomToken(32);
+  const challenge = await sha256Base64url(verifier);
+  const timestamp = now();
+  const expires = new Date(Date.now() + 10 * 60_000).toISOString();
+  await c.env.DB.prepare(
+    `
+    INSERT INTO oauth_transactions (id, provider, state_hash, nonce_hash, code_verifier, mode, user_id, issued_session_id, expires_at, used_at, created_at)
+    VALUES (?, 'telegram', ?, ?, ?, ?, NULL, NULL, ?, NULL, ?)
+  `,
+  )
+    .bind(
+      randomToken(18),
+      await secretHash(state, c.env.APP_SESSION_SECRET),
+      await secretHash(nonce, c.env.APP_SESSION_SECRET),
+      verifier,
+      mode,
+      expires,
+      timestamp,
+    )
+    .run();
+  c.header(
+    'Set-Cookie',
+    serializeCookie(TELEGRAM_OAUTH_STATE_COOKIE, state, { httpOnly: true, maxAge: 600, sameSite: 'Lax' }),
+  );
+  const params = new URLSearchParams({
+    client_id: c.env.TELEGRAM_LOGIN_CLIENT_ID!,
+    redirect_uri: c.env.TELEGRAM_LOGIN_CALLBACK_URL!,
+    response_type: 'code',
+    scope: TELEGRAM_SCOPE,
+    state,
+    nonce,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+  });
+  return c.json({ authorizationUrl: `${TELEGRAM_AUTH_ENDPOINT}?${params.toString()}` });
+});
+
+app.get('/v1/auth/telegram/callback', async (c) => {
+  requireConfig(
+    c.env,
+    'APP_ORIGIN',
+    'APP_SESSION_SECRET',
+    'TELEGRAM_LOGIN_CLIENT_ID',
+    'TELEGRAM_LOGIN_CLIENT_SECRET',
+    'TELEGRAM_LOGIN_CALLBACK_URL',
+  );
+  const stateParam = c.req.query('state');
+  const code = c.req.query('code');
+  const telegramError = c.req.query('error');
+  const stateCookie = requestCookie(c, TELEGRAM_OAUTH_STATE_COOKIE);
+  if (!stateParam || !stateCookie || !constantTimeEqual(stateCookie, stateParam))
+    return telegramRedirect(c, 'telegram_failed');
+
+  const stateHash = await secretHash(stateParam, c.env.APP_SESSION_SECRET);
+  const claimed = await c.env.DB.prepare(
+    `
+    UPDATE oauth_transactions SET used_at = ?
+    WHERE provider = 'telegram' AND state_hash = ? AND used_at IS NULL AND expires_at > ?
+  `,
+  )
+    .bind(now(), stateHash, now())
+    .run();
+  if (changes(claimed) !== 1) return telegramRedirect(c, 'telegram_failed');
+  if (telegramError === 'access_denied') return telegramRedirect(c, 'telegram_denied');
+  if (telegramError || !code) return telegramRedirect(c, 'telegram_failed');
+
+  const tx = await first<{
+    id: string;
+    nonce_hash: string;
+    code_verifier: string;
+    mode: 'login' | 'link' | 'register';
+  }>(
+    c.env.DB,
+    "SELECT id, nonce_hash, code_verifier, mode FROM oauth_transactions WHERE provider = 'telegram' AND state_hash = ?",
+    stateHash,
+  );
+  if (!tx) return telegramRedirect(c, 'telegram_failed');
+
+  let tokenResponse: Response;
+  try {
+    tokenResponse = await fetch(TELEGRAM_TOKEN_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${btoa(`${c.env.TELEGRAM_LOGIN_CLIENT_ID}:${c.env.TELEGRAM_LOGIN_CLIENT_SECRET}`)}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        code,
+        redirect_uri: c.env.TELEGRAM_LOGIN_CALLBACK_URL!,
+        grant_type: 'authorization_code',
+        code_verifier: tx.code_verifier,
+      }),
+    });
+  } catch {
+    return telegramRedirect(c, 'telegram_failed');
+  }
+  const tokenJson = (await tokenResponse.json().catch(() => ({}))) as Record<string, unknown>;
+  const idToken = tokenJson.id_token;
+  if (!tokenResponse.ok || typeof idToken !== 'string' || idToken.length > 16_384)
+    return telegramRedirect(c, 'telegram_failed');
+
+  let verification: Awaited<ReturnType<typeof jwtVerify>>;
+  try {
+    const jwks = createRemoteJWKSet(new URL(TELEGRAM_JWKS_URL));
+    verification = await jwtVerify(idToken, jwks, {
+      issuer: TELEGRAM_ISSUER,
+      audience: c.env.TELEGRAM_LOGIN_CLIENT_ID,
+      algorithms: ['RS256'],
+      clockTolerance: OIDC_CLOCK_TOLERANCE_SECONDS,
+      maxTokenAge: OIDC_MAX_TOKEN_AGE_SECONDS,
+      requiredClaims: ['iss', 'sub', 'aud', 'exp', 'iat'],
+    });
+  } catch {
+    return telegramRedirect(c, 'telegram_failed');
+  }
+  if (verification.protectedHeader?.alg !== 'RS256') return telegramRedirect(c, 'telegram_failed');
+  const payload = verification.payload;
+  if (
+    payload.iss !== TELEGRAM_ISSUER ||
+    !hasAudience(payload.aud, c.env.TELEGRAM_LOGIN_CLIENT_ID!) ||
+    !validTelegramTokenTimes(payload)
+  )
+    return telegramRedirect(c, 'telegram_failed');
+  const nonce = payload.nonce;
+  if (typeof nonce !== 'string' || !constantTimeEqual(await secretHash(nonce, c.env.APP_SESSION_SECRET), tx.nonce_hash))
+    return telegramRedirect(c, 'telegram_failed');
+  const subject = payload.sub;
+  if (typeof subject !== 'string' || subject.length === 0 || subject.length > 512)
+    return telegramRedirect(c, 'telegram_failed');
+  if (tx.mode !== 'login' && tx.mode !== 'register') return telegramRedirect(c, 'telegram_failed');
+
+  const identity = await first<{ user_id: string }>(
+    c.env.DB,
+    "SELECT user_id FROM auth_identities WHERE provider = 'telegram' AND issuer = ? AND subject = ?",
+    TELEGRAM_ISSUER,
+    subject,
+  );
+  if (tx.mode === 'login') {
+    if (!identity) return telegramRedirect(c, 'telegram_failed');
+    const user = await first<UserRow>(
+      c.env.DB,
+      "SELECT id, username, display_name, status FROM users WHERE id = ? AND status = 'active'",
+      identity.user_id,
+    );
+    if (!user) return telegramRedirect(c, 'telegram_failed');
+    await c.env.DB.prepare(
+      'UPDATE auth_identities SET last_used_at = ? WHERE provider = ? AND issuer = ? AND subject = ?',
+    )
+      .bind(now(), 'telegram', TELEGRAM_ISSUER, subject)
+      .run();
+    await setSession(c, user.id);
+    return telegramRedirect(c);
+  }
+  if (identity) return telegramRedirect(c, 'telegram_failed');
+
+  const username = await uniqueUsername(c.env.DB, `telegram-${randomToken(9).toLowerCase()}`);
+  const userId = randomToken(18);
+  const created = now();
+  const workspaceId = randomToken(18);
+  const rootId = randomToken(18);
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "INSERT INTO users (id, username, display_name, status, created_at, updated_at) VALUES (?, ?, 'Telegram User', 'active', ?, ?)",
+      ).bind(userId, username, created, created),
+      c.env.DB.prepare(
+        "INSERT INTO auth_identities (id, user_id, provider, issuer, subject, created_at, last_used_at) VALUES (?, ?, 'telegram', ?, ?, ?, ?)",
+      ).bind(randomToken(18), userId, TELEGRAM_ISSUER, subject, created, created),
+      c.env.DB.prepare(
+        "INSERT INTO workspaces (id, owner_id, name, created_at, updated_at) VALUES (?, ?, 'My Drive', ?, ?)",
+      ).bind(workspaceId, userId, created, created),
+      c.env.DB.prepare(
+        `INSERT INTO folders (id, workspace_id, parent_id, name, normalized_name, path_key, created_at, updated_at)
+        VALUES (?, ?, NULL, 'My Drive', 'my drive', ?, ?, ?)`,
+      ).bind(rootId, workspaceId, rootId, created, created),
+      c.env.DB.prepare(
+        "INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at) VALUES (?, ?, 'telegram.registered', 'user', ?, ?)",
+      ).bind(randomToken(18), userId, userId, created),
+    ]);
+  } catch (error) {
+    if (isConstraintError(error)) fail(409, 'TELEGRAM_IDENTITY_EXISTS', 'Telegram account is already registered');
+    throw error;
+  }
+  await setSession(c, userId);
+  return telegramRedirect(c);
+});
+
+app.get('/v1/workspaces', async (c) => {
+  const session = await requireSession(c);
+  const workspaces = await accessibleWorkspaces(c, session.id);
+  return c.json({
+    workspaces: await Promise.all(
+      workspaces.map(async (workspace) => ({
+        id: workspace.id,
+        name: workspace.name,
+        ownerId: workspace.owner_id,
+        isOwner: workspace.is_owner,
+        members: await workspaceMembers(c, workspace),
+      })),
+    ),
+  });
+});
+
+app.get('/v1/workspace', async (c) => {
+  const session = await requireSession(c);
+  const workspace = await workspaceForUser(c, session.id, optionalString(c.req.query('workspaceId'), 'workspaceId'));
+  const root = await first<{ id: string; name: string }>(
+    c.env.DB,
+    'SELECT id, name FROM folders WHERE workspace_id = ? AND parent_id IS NULL AND deleted_at IS NULL',
+    workspace.id,
+  );
+  if (!root) fail(500, 'ROOT_FOLDER_MISSING', 'Root folder is missing');
+  return c.json({
+    workspace: {
+      id: workspace.id,
+      name: workspace.name,
+      ownerId: workspace.owner_id,
+      isOwner: workspace.is_owner,
+      members: await workspaceMembers(c, workspace),
+    },
+    rootFolder: root,
+  });
+});
+
+app.get('/v1/workspaces/:id/members', async (c) => {
+  const session = await requireSession(c);
+  const workspace = await workspaceForUser(c, session.id, c.req.param('id'));
+  requireWorkspaceOwner(workspace);
+  return c.json({ workspaceId: workspace.id, members: await workspaceMembers(c, workspace) });
+});
+
+app.post('/v1/workspaces/:id/members', async (c) => {
+  const session = await requireSession(c);
+  const workspace = await workspaceForUser(c, session.id, c.req.param('id'));
+  requireWorkspaceOwner(workspace);
+  const body = record(await readJson<unknown>(c));
+  const userId = stringValue(body.userId, 'userId', 128);
+  if (body.workspaceId !== undefined && stringValue(body.workspaceId, 'workspaceId', 128) !== workspace.id)
+    fail(422, 'WORKSPACE_MISMATCH', 'Workspace must be selected by route');
+  if (userId === workspace.owner_id) fail(409, 'OWNER_CANNOT_BE_MEMBER', 'Workspace owner is already implicit');
+  if (userId === session.id) fail(409, 'SELF_MEMBER_FORBIDDEN', 'Owner cannot add self as member');
+  const target = await first<{ id: string; status: UserRow['status'] }>(
+    c.env.DB,
+    'SELECT id, status FROM users WHERE id = ?',
+    userId,
+  );
+  if (!target || target.status !== 'active') fail(404, 'MEMBER_USER_NOT_FOUND', 'Active member user not found');
+  const existing = await first<{ user_id: string }>(
+    c.env.DB,
+    'SELECT user_id FROM workspace_members WHERE workspace_id = ?',
+    workspace.id,
+  );
+  if (existing) {
+    if (existing.user_id === userId) fail(409, 'MEMBER_ALREADY_EXISTS', 'User is already a workspace member');
+    fail(409, 'WORKSPACE_MEMBER_LIMIT', 'Workspace already has a member');
+  }
+  const timestamp = now();
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        'INSERT INTO workspace_members (workspace_id, user_id, created_by, created_at) VALUES (?, ?, ?, ?)',
+      ).bind(workspace.id, userId, session.id, timestamp),
+      audit(c.env.DB, session.id, 'workspace.member_added', 'user', userId),
+    ]);
+  } catch (error) {
+    if (isConstraintError(error)) fail(409, 'WORKSPACE_MEMBER_LIMIT', 'Workspace already has a member');
+    throw error;
+  }
+  return c.json({ workspaceId: workspace.id, member: { userId, role: 'member', createdAt: timestamp } });
+});
+
+app.delete('/v1/workspaces/:id/members/:userId', async (c) => {
+  const session = await requireSession(c);
+  const workspace = await workspaceForUser(c, session.id, c.req.param('id'));
+  requireWorkspaceOwner(workspace);
+  const userId = stringValue(c.req.param('userId'), 'userId', 128);
+  if (userId === workspace.owner_id) fail(409, 'OWNER_CANNOT_BE_REMOVED', 'Workspace owner cannot be removed');
+  const result = await c.env.DB.prepare(
+    'DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+  )
+    .bind(workspace.id, userId)
+    .run();
+  if (changes(result) !== 1) fail(404, 'MEMBER_NOT_FOUND', 'Workspace member not found');
+  await audit(c.env.DB, session.id, 'workspace.member_removed', 'user', userId).run();
+  return c.json({ workspaceId: workspace.id, userId, removed: true });
+});
 
 app.get('/v1/folders/:id/children', async (c) => {
   const session = await requireSession(c);
@@ -1130,18 +1219,6 @@ app.get('/v1/folders/:id/children', async (c) => {
   });
 });
 
-app.get('/v1/workspace', async (c) => {
-  const session = await requireSession(c);
-  const workspace = await workspaceForUser(c, session.id);
-  const root = await first<{ id: string; name: string }>(
-    c.env.DB,
-    'SELECT id, name FROM folders WHERE workspace_id = ? AND parent_id IS NULL AND deleted_at IS NULL',
-    workspace.id,
-  );
-  if (!root) fail(500, 'ROOT_FOLDER_MISSING', 'Root folder is missing');
-  return c.json({ workspace, rootFolder: root });
-});
-
 app.get('/v1/objects/recent', async (c) => {
   const session = await requireSession(c);
   const cursor = metadataCursor(c);
@@ -1169,11 +1246,14 @@ app.get('/v1/objects/recent', async (c) => {
     `
     SELECT o.id, o.folder_id, o.name, o.mime, o.size, o.sha256, o.part_count, o.created_at, o.updated_at
     FROM objects o JOIN workspaces w ON w.id = o.workspace_id
-    WHERE w.owner_id = ? AND o.status = 'completed' AND o.deleted_at IS NULL
+    WHERE (w.owner_id = ? OR EXISTS (
+      SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+    )) AND o.status = 'completed' AND o.deleted_at IS NULL
       AND (o.updated_at < ? OR (o.updated_at = ? AND (o.created_at < ? OR (o.created_at = ? AND o.id > ?))))
     ORDER BY o.updated_at DESC, o.created_at DESC, o.id ASC
     LIMIT ?
   `,
+    session.id,
     session.id,
     after.sortAt,
     after.sortAt,
@@ -1215,6 +1295,7 @@ app.get('/v1/trash', async (c) => {
     id: string;
     parent_id: string | null;
     folder_id: string | null;
+    workspace_id: string;
     name: string;
     mime: string | null;
     size: number | null;
@@ -1224,24 +1305,35 @@ app.get('/v1/trash', async (c) => {
     created_at: string;
     updated_at: string;
     sort_at: string;
+    can_permanently_delete: number;
   }>(
     c.env.DB,
     `
     SELECT * FROM (
-      SELECT 'folder' AS kind, f.id, f.parent_id, NULL AS folder_id, f.name, NULL AS mime, NULL AS size,
-             NULL AS sha256, NULL AS part_count, f.deleted_at, f.created_at, f.updated_at, f.deleted_at AS sort_at
+      SELECT 'folder' AS kind, f.id, f.parent_id, NULL AS folder_id, w.id AS workspace_id, f.name, NULL AS mime, NULL AS size,
+             NULL AS sha256, NULL AS part_count, f.deleted_at, f.created_at, f.updated_at, f.deleted_at AS sort_at,
+             CASE WHEN w.owner_id = ? THEN 1 ELSE 0 END AS can_permanently_delete
       FROM folders f JOIN workspaces w ON w.id = f.workspace_id
-      WHERE w.owner_id = ? AND f.deleted_at IS NOT NULL
+      WHERE (w.owner_id = ? OR EXISTS (
+        SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+      )) AND f.deleted_at IS NOT NULL
       UNION ALL
-      SELECT 'object' AS kind, o.id, NULL AS parent_id, o.folder_id, o.name, o.mime, o.size,
-             o.sha256, o.part_count, o.deleted_at, o.created_at, o.updated_at, o.deleted_at AS sort_at
+      SELECT 'object' AS kind, o.id, NULL AS parent_id, o.folder_id, w.id AS workspace_id, o.name, o.mime, o.size,
+             o.sha256, o.part_count, o.deleted_at, o.created_at, o.updated_at, o.deleted_at AS sort_at,
+             CASE WHEN w.owner_id = ? THEN 1 ELSE 0 END AS can_permanently_delete
       FROM objects o JOIN workspaces w ON w.id = o.workspace_id
-      WHERE w.owner_id = ? AND o.status = 'deleted' AND o.deleted_at IS NOT NULL
+      WHERE (w.owner_id = ? OR EXISTS (
+        SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+      )) AND o.status = 'deleted' AND o.deleted_at IS NOT NULL
     ) entries
     WHERE sort_at < ? OR (sort_at = ? AND (kind > ? OR (kind = ? AND id > ?)))
     ORDER BY sort_at DESC, kind ASC, id ASC
     LIMIT ?
   `,
+    session.id,
+    session.id,
+    session.id,
+    session.id,
     session.id,
     session.id,
     after.sortAt,
@@ -1258,6 +1350,8 @@ app.get('/v1/trash', async (c) => {
       ? {
           type: 'folder' as const,
           id: row.id,
+          workspaceId: row.workspace_id,
+          canPermanentlyDelete: row.can_permanently_delete === 1,
           parentId: row.parent_id,
           name: row.name,
           deletedAt: row.deleted_at,
@@ -1268,6 +1362,8 @@ app.get('/v1/trash', async (c) => {
       : {
           type: 'object' as const,
           id: row.id,
+          workspaceId: row.workspace_id,
+          canPermanentlyDelete: row.can_permanently_delete === 1,
           folderId: row.folder_id,
           name: row.name,
           mime: row.mime,
@@ -1453,6 +1549,7 @@ app.post('/v1/folders/:id/restore', async (c) => {
 app.delete('/v1/folders/:id/permanent', async (c) => {
   const session = await requireSession(c);
   const existing = await folderForUser(c, session.id, c.req.param('id'), true);
+  requireWorkspaceOwner(existing.workspace);
   if (!existing.folder.parent_id) fail(409, 'ROOT_FOLDER', 'Root folder cannot be deleted');
   if (!existing.folder.deleted_at)
     fail(409, 'FOLDER_NOT_SOFT_DELETED', 'Folder must be soft-deleted before permanent deletion');
@@ -1515,11 +1612,15 @@ app.post('/v1/uploads', async (c) => {
   const timestamp = now();
   const expires = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
   try {
-    await c.env.DB.batch([
+    const results = await c.env.DB.batch([
       c.env.DB.prepare(
         `INSERT INTO objects (id, workspace_id, folder_id, name, normalized_name, mime, size, sha256, part_count, status, created_at, updated_at)
         SELECT ?, f.workspace_id, f.id, ?, ?, ?, ?, ?, ?, 'uploading', ?, ? FROM folders f
-        WHERE f.id = ? AND f.workspace_id = ? AND f.deleted_at IS NULL`,
+        JOIN workspaces w ON w.id = f.workspace_id
+        WHERE f.id = ? AND f.workspace_id = ? AND f.deleted_at IS NULL
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))`,
       ).bind(
         objectId,
         name,
@@ -1532,10 +1633,18 @@ app.post('/v1/uploads', async (c) => {
         timestamp,
         folder.id,
         workspace.id,
+        session.id,
+        session.id,
       ),
       c.env.DB.prepare(
         `INSERT INTO upload_sessions (id, user_id, object_id, status, chunk_size, expected_part_count, idempotency_key, expires_at, created_at, updated_at)
-        VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)`,
+        SELECT ?, ?, ?, 'created', ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM objects o JOIN workspaces w ON w.id = o.workspace_id
+          WHERE o.id = ? AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+        )`,
       ).bind(
         uploadId,
         session.id,
@@ -1546,9 +1655,19 @@ app.post('/v1/uploads', async (c) => {
         expires,
         timestamp,
         timestamp,
+        objectId,
+        session.id,
+        session.id,
       ),
-      audit(c.env.DB, session.id, 'upload.started', 'object', objectId),
+      c.env.DB.prepare(
+        `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
+        SELECT ?, ?, 'upload.started', 'object', ?, ? FROM objects o JOIN workspaces w ON w.id = o.workspace_id
+        WHERE o.id = ? AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))`,
+      ).bind(randomToken(18), session.id, objectId, timestamp, objectId, session.id, session.id),
     ]);
+    if (results.some((result) => changes(result) !== 1)) fail(409, 'WORKSPACE_ACCESS_REVOKED', 'Workspace access changed; retry');
   } catch (error) {
     if (isConstraintError(error)) {
       const raced = await first<UploadRow>(
@@ -1697,8 +1816,12 @@ app.put('/v1/uploads/:id/parts/:no', async (c) => {
       c.env.DB.prepare(
         `INSERT INTO object_parts (id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? FROM upload_sessions us JOIN objects o ON o.id = us.object_id
-        WHERE us.id = ? AND us.status IN ('created', 'uploading', 'paused') AND us.expires_at > ?
-          AND o.status = 'uploading' AND o.deleted_at IS NULL`,
+          JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = ? AND us.user_id = ? AND us.status IN ('created', 'uploading', 'paused') AND us.expires_at > ?
+          AND o.status = 'uploading' AND o.deleted_at IS NULL
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))`,
       ).bind(
         partId,
         upload.object_id,
@@ -1710,19 +1833,33 @@ app.put('/v1/uploads/:id/parts/:no', async (c) => {
         idempotencyKey,
         timestamp,
         upload.id,
+        session.id,
         timestamp,
+        session.id,
+        session.id,
       ),
       c.env.DB.prepare(
         `UPDATE upload_sessions SET status = 'uploading', updated_at = ?
-        WHERE id = ? AND status IN ('created', 'uploading', 'paused') AND expires_at > ?
-          AND EXISTS (SELECT 1 FROM objects WHERE id = ? AND status = 'uploading' AND deleted_at IS NULL)`,
-      ).bind(timestamp, upload.id, timestamp, upload.object_id),
+        WHERE id = ? AND user_id = ? AND status IN ('created', 'uploading', 'paused') AND expires_at > ?
+          AND EXISTS (
+            SELECT 1 FROM objects o JOIN workspaces w ON w.id = o.workspace_id
+            WHERE o.id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+              AND (w.owner_id = ? OR EXISTS (
+                SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+              ))
+          )`,
+      ).bind(timestamp, upload.id, session.id, timestamp, upload.object_id, session.id, session.id),
       c.env.DB.prepare(
         `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
-        SELECT ?, ?, 'upload.part_committed', 'object', ?, ? WHERE EXISTS (SELECT 1 FROM object_parts WHERE id = ?)`,
-      ).bind(randomToken(18), session.id, upload.object_id, timestamp, partId),
+        SELECT ?, ?, 'upload.part_committed', 'object', ?, ?
+        FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = ? AND us.user_id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          )) AND EXISTS (SELECT 1 FROM object_parts WHERE id = ?)`,
+      ).bind(randomToken(18), session.id, upload.object_id, timestamp, upload.id, session.id, session.id, session.id, partId),
     ]);
-    if (changes(results[0]) !== 1 || changes(results[1]) !== 1) fail(409, 'UPLOAD_CLOSED', 'Upload session is closed');
+    if (results.some((result) => changes(result) !== 1)) fail(409, 'UPLOAD_CLOSED', 'Upload session is closed');
   } catch (error) {
     if (error instanceof HttpError) {
       const raced = await first<PartRow>(
@@ -1815,19 +1952,37 @@ app.post('/v1/uploads/:id/complete', async (c) => {
   const results = await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE objects SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'uploading' AND deleted_at IS NULL
-      AND EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status IN ('created', 'uploading', 'paused', 'verifying') AND expires_at > ?)`,
-    ).bind(timestamp, upload.object_id, upload.id, timestamp),
+      AND EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN workspaces w ON w.id = objects.workspace_id
+        WHERE us.id = ? AND us.user_id = ? AND us.object_id = objects.id
+          AND us.status IN ('created', 'uploading', 'paused', 'verifying') AND us.expires_at > ?
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    ).bind(timestamp, upload.object_id, upload.id, session.id, timestamp, session.id, session.id),
     c.env.DB.prepare(
       `UPDATE upload_sessions SET status = 'completed', updated_at = ? WHERE id = ?
-      AND status IN ('created', 'uploading', 'paused', 'verifying') AND expires_at > ?
-      AND EXISTS (SELECT 1 FROM objects WHERE id = ? AND status = 'completed')`,
-    ).bind(timestamp, upload.id, timestamp, upload.object_id),
+      AND user_id = ? AND status IN ('created', 'uploading', 'paused', 'verifying') AND expires_at > ?
+      AND EXISTS (
+        SELECT 1 FROM objects o JOIN workspaces w ON w.id = o.workspace_id
+        WHERE o.id = ? AND o.status = 'completed'
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    ).bind(timestamp, upload.id, session.id, timestamp, upload.object_id, session.id, session.id),
     c.env.DB.prepare(
       `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
-      SELECT ?, ?, 'upload.completed', 'object', ?, ? WHERE EXISTS (SELECT 1 FROM objects WHERE id = ? AND status = 'completed' AND updated_at = ?)`,
-    ).bind(randomToken(18), session.id, upload.object_id, timestamp, upload.object_id, timestamp),
+      SELECT ?, ?, 'upload.completed', 'object', ?, ?
+      FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+      WHERE us.id = ? AND us.user_id = ? AND us.object_id = ? AND o.status = 'completed' AND o.updated_at = ?
+        AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))`,
+    ).bind(randomToken(18), session.id, upload.object_id, timestamp, upload.id, session.id, upload.object_id, timestamp, session.id, session.id),
   ]);
-  if (changes(results[0]) !== 1 || changes(results[1]) !== 1) fail(409, 'UPLOAD_CLOSED', 'Upload session is closed');
+  if (results.some((result) => changes(result) !== 1)) fail(409, 'UPLOAD_CLOSED', 'Upload session is closed');
   return c.json({ objectId: upload.object_id, status: 'completed', idempotent: false });
 });
 
@@ -1842,18 +1997,36 @@ app.delete('/v1/uploads/:id', async (c) => {
   const results = await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE upload_sessions SET status = 'aborted', updated_at = ? WHERE id = ?
-      AND status IN ('created', 'uploading', 'paused', 'verifying', 'failed')`,
-    ).bind(timestamp, upload.id),
+      AND user_id = ? AND status IN ('created', 'uploading', 'paused', 'verifying', 'failed')
+      AND EXISTS (
+        SELECT 1 FROM objects o JOIN workspaces w ON w.id = o.workspace_id
+        WHERE o.id = upload_sessions.object_id
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    ).bind(timestamp, upload.id, session.id, session.id, session.id),
     c.env.DB.prepare(
       `UPDATE objects SET status = 'aborted', updated_at = ? WHERE id = ? AND status = 'uploading' AND deleted_at IS NULL
-      AND EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'aborted')`,
-    ).bind(timestamp, upload.object_id, upload.id),
+      AND EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN workspaces w ON w.id = objects.workspace_id
+        WHERE us.id = ? AND us.user_id = ? AND us.status = 'aborted'
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    ).bind(timestamp, upload.object_id, upload.id, session.id, session.id, session.id),
     c.env.DB.prepare(
       `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
-      SELECT ?, ?, 'upload.aborted', 'object', ?, ? WHERE EXISTS (SELECT 1 FROM upload_sessions WHERE id = ? AND status = 'aborted')`,
-    ).bind(randomToken(18), session.id, upload.object_id, timestamp, upload.id),
+      SELECT ?, ?, 'upload.aborted', 'object', ?, ?
+      FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+      WHERE us.id = ? AND us.user_id = ? AND us.status = 'aborted'
+        AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))`,
+    ).bind(randomToken(18), session.id, upload.object_id, timestamp, upload.id, session.id, session.id, session.id),
   ]);
-  if (changes(results[0]) !== 1 || changes(results[1]) !== 1) fail(409, 'UPLOAD_CLOSED', 'Upload session is closed');
+  if (results.some((result) => changes(result) !== 1)) fail(409, 'UPLOAD_CLOSED', 'Upload session is closed');
   return c.json({ ok: true, status: 'aborted' });
 });
 
@@ -1919,6 +2092,7 @@ app.post('/v1/objects/:id/restore', async (c) => {
 app.delete('/v1/objects/:id/permanent', async (c) => {
   const session = await requireSession(c);
   const object = await objectForUser(c, session.id, c.req.param('id'));
+  if (!object.is_owner) fail(403, 'WORKSPACE_OWNER_REQUIRED', 'Workspace owner required');
   if (object.status !== 'deleted' || !object.deleted_at)
     fail(409, 'OBJECT_NOT_SOFT_DELETED', 'Object must be soft-deleted before permanent deletion');
   const result = await c.env.DB.prepare(
@@ -1946,7 +2120,7 @@ app.delete('/v1/objects/:id/permanent', async (c) => {
 
 app.get('/v1/export', async (c) => {
   const session = await requireSession(c);
-  const workspace = await workspaceForUser(c, session.id);
+  const workspace = await workspaceForUser(c, session.id, optionalString(c.req.query('workspaceId'), 'workspaceId'));
   const folders = await all(
     c.env.DB,
     'SELECT id, parent_id, name, normalized_name, path_key, deleted_at, created_at, updated_at FROM folders WHERE workspace_id = ? ORDER BY id',
@@ -2064,7 +2238,10 @@ async function telegramPool(c: Context<AppEnv>): Promise<TelegramPool> {
       channel: '',
       reason: telegramPoolReasons.NO_VALID_BOTS,
     };
-  const cached = await first<{ channel_id: string; bot_count: number }>(c.env.DB, 'SELECT channel_id, bot_count FROM telegram_pool WHERE id = 1');
+  const cached = await first<{ channel_id: string; bot_count: number }>(
+    c.env.DB,
+    'SELECT channel_id, bot_count FROM telegram_pool WHERE id = 1',
+  );
   if (cached && cached.bot_count === bots.length && typeof cached.channel_id === 'string' && cached.channel_id)
     return { channelId: cached.channel_id, botCount: bots.length, channel, reason: telegramPoolReasons.READY };
   let response: Response;
@@ -2147,7 +2324,9 @@ async function telegramPool(c: Context<AppEnv>): Promise<TelegramPool> {
   await c.env.DB.prepare(
     `INSERT INTO telegram_pool (id, channel_id, bot_count, verified_at) VALUES (1, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET channel_id = excluded.channel_id, bot_count = excluded.bot_count, verified_at = excluded.verified_at`,
-  ).bind(channelId, bots.length, now()).run();
+  )
+    .bind(channelId, bots.length, now())
+    .run();
   return { channelId, botCount: bots.length, channel, reason: telegramPoolReasons.READY };
 }
 
@@ -2174,18 +2353,27 @@ function botAttemptStatus(state: unknown): string {
 
 app.get('/v1/telegram/pool', async (c) => {
   const pool = await telegramPool(c);
-  return c.json({ channel: pool.channel, botCount: pool.botCount, ready: Boolean(pool.channelId), reason: pool.reason });
+  return c.json({
+    channel: pool.channel,
+    botCount: pool.botCount,
+    ready: Boolean(pool.channelId),
+    reason: pool.reason,
+  });
 });
 
 app.post('/v1/bot/uploads', async (c) => {
   const session = await requireSession(c);
   const body = metadataOnly(record(await readJson<unknown>(c)));
   const { name, normalized } = normalizedName(body.name);
-  const size = integerValue(body.size, 'size', 0, 5 * 1024 * 1024 * 1024);
+  const maxBotUploadBytes = 5 * 1024 * 1024 * 1024;
+  if (typeof body.size === 'number' && body.size > maxBotUploadBytes)
+    fail(413, 'UPLOAD_TOO_LARGE', 'Upload exceeds the maximum supported size');
+  const size = integerValue(body.size, 'size', 0, maxBotUploadBytes);
   const mime = stringValue(body.mime ?? 'application/octet-stream', 'mime', 128);
   const chunkSize = integerValue(body.chunkSize ?? 16 * 1024 * 1024, 'chunkSize', MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
   const partCount = integerValue(body.partCount, 'partCount', 0, MAX_PARTS);
-  if (partCount !== (size === 0 ? 0 : Math.ceil(size / chunkSize))) fail(422, 'PART_COUNT_MISMATCH', 'partCount does not match size and chunkSize');
+  if (partCount !== (size === 0 ? 0 : Math.ceil(size / chunkSize)))
+    fail(422, 'PART_COUNT_MISMATCH', 'partCount does not match size and chunkSize');
   const sha256Value = hashValue(body.sha256, 'sha256');
   const idempotencyKey = stringValue(body.idempotencyKey, 'idempotencyKey', 200);
   const { workspace, folder } = await folderForUser(c, session.id, optionalString(body.folderId, 'folderId'));
@@ -2193,16 +2381,57 @@ app.post('/v1/bot/uploads', async (c) => {
   const uploadId = randomToken(18);
   const timestamp = now();
   const expires = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
-  await c.env.DB.batch([
-    c.env.DB.prepare(`INSERT INTO objects (id, workspace_id, folder_id, name, normalized_name, mime, size, sha256, part_count, status, storage_backend, created_at, updated_at)
-      SELECT ?, f.workspace_id, f.id, ?, ?, ?, ?, ?, ?, 'uploading', 'bot_api', ?, ? FROM folders f WHERE f.id = ? AND f.workspace_id = ? AND f.deleted_at IS NULL`)
-      .bind(objectId, name, normalized, mime, size, sha256Value, partCount, timestamp, timestamp, folder.id, workspace.id),
-    c.env.DB.prepare(`INSERT INTO upload_sessions (id, user_id, object_id, status, chunk_size, expected_part_count, idempotency_key, expires_at, created_at, updated_at) VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?)`)
-      .bind(uploadId, session.id, objectId, chunkSize, partCount, idempotencyKey, expires, timestamp, timestamp),
-    audit(c.env.DB, session.id, 'upload.started', 'object', objectId),
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO objects (id, workspace_id, folder_id, name, normalized_name, mime, size, sha256, part_count, status, storage_backend, created_at, updated_at)
+      SELECT ?, f.workspace_id, f.id, ?, ?, ?, ?, ?, ?, 'uploading', 'bot_api', ?, ? FROM folders f JOIN workspaces w ON w.id = f.workspace_id
+      WHERE f.id = ? AND f.workspace_id = ? AND f.deleted_at IS NULL
+        AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))`,
+    ).bind(
+      objectId,
+      name,
+      normalized,
+      mime,
+      size,
+      sha256Value,
+      partCount,
+      timestamp,
+      timestamp,
+      folder.id,
+      workspace.id,
+      session.id,
+      session.id,
+    ),
+    c.env.DB.prepare(
+      `INSERT INTO upload_sessions (id, user_id, object_id, status, chunk_size, expected_part_count, idempotency_key, expires_at, created_at, updated_at)
+      SELECT ?, ?, ?, 'created', ?, ?, ?, ?, ?, ? WHERE EXISTS (
+        SELECT 1 FROM objects o JOIN workspaces w ON w.id = o.workspace_id
+        WHERE o.id = ? AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))
+      )`,
+    ).bind(uploadId, session.id, objectId, chunkSize, partCount, idempotencyKey, expires, timestamp, timestamp, objectId, session.id, session.id),
+    c.env.DB.prepare(
+      `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
+      SELECT ?, ?, 'upload.started', 'object', ?, ? FROM objects o JOIN workspaces w ON w.id = o.workspace_id
+      WHERE o.id = ? AND (w.owner_id = ? OR EXISTS (
+        SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+      ))`,
+    ).bind(randomToken(18), session.id, objectId, timestamp, objectId, session.id, session.id),
   ]);
+  if (results.some((result) => changes(result) !== 1)) fail(409, 'WORKSPACE_ACCESS_REVOKED', 'Workspace access changed; retry');
   const createdObject = await first<{ id: string }>(c.env.DB, 'SELECT o.id FROM objects o WHERE o.id = ?', objectId);
-  return c.json({ id: uploadId, objectId: createdObject?.id ?? objectId, status: 'created', chunkSize, expectedPartCount: partCount, expiresAt: expires, parts: [] });
+  return c.json({
+    id: uploadId,
+    objectId: createdObject?.id ?? objectId,
+    status: 'created',
+    chunkSize,
+    expectedPartCount: partCount,
+    expiresAt: expires,
+    parts: [],
+  });
 });
 
 app.put('/v1/bot/uploads/:id/parts/:no', async (c) => {
@@ -2213,91 +2442,287 @@ app.put('/v1/bot/uploads/:id/parts/:no', async (c) => {
   const size = integerValue(Number(c.req.header('X-Part-Size')), 'partSize', 1, MAX_CHUNK_SIZE);
   const sha256Value = hashValue(c.req.header('X-Part-SHA256'), 'partSha256');
   const idempotencyKey = stringValue(c.req.header('X-Idempotency-Key'), 'idempotencyKey', 200);
-  const expectedSize = partNo === upload.expected_part_count - 1 ? upload.object_size - upload.chunk_size * (upload.expected_part_count - 1) : upload.chunk_size;
+  const expectedSize =
+    partNo === upload.expected_part_count - 1
+      ? upload.object_size - upload.chunk_size * (upload.expected_part_count - 1)
+      : upload.chunk_size;
   if (size !== expectedSize) fail(422, 'PART_SIZE_MISMATCH', 'Part size does not match upload manifest');
   const pool = await telegramPool(c);
   if (!pool.channelId || pool.botCount === 0) fail(409, 'TELEGRAM_POOL_NOT_READY', 'Telegram bot pool is not ready');
   const botIndex = poolBotIndex(idempotencyKey, pool.botCount);
-  const existingPart = await first<PartRow>(c.env.DB, 'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? AND part_no = ?', upload.object_id, partNo);
+  const existingPart = await first<PartRow>(
+    c.env.DB,
+    'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? AND part_no = ?',
+    upload.object_id,
+    partNo,
+  );
   if (existingPart) {
-    if (existingPart.size !== size || existingPart.sha256 !== sha256Value || existingPart.idempotency_key !== idempotencyKey) fail(409, 'PART_IDEMPOTENCY_CONFLICT', 'Part already committed with different metadata');
+    if (
+      existingPart.size !== size ||
+      existingPart.sha256 !== sha256Value ||
+      existingPart.idempotency_key !== idempotencyKey
+    )
+      fail(409, 'PART_IDEMPOTENCY_CONFLICT', 'Part already committed with different metadata');
     return c.json(partResponse(existingPart));
   }
-  const existingAttempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
+  const existingAttempt = await first<Record<string, unknown>>(
+    c.env.DB,
+    'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?',
+    upload.id,
+    partNo,
+  );
   if (existingAttempt && existingAttempt.idempotency_key !== idempotencyKey && existingAttempt.state !== 'abandoned')
     fail(409, 'PART_IDEMPOTENCY_CONFLICT', 'Part already has another attempt');
   if (existingAttempt?.state === 'abandoned') {
-    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'reserved', idempotency_key = ?, expected_size = ?, expected_sha256 = ?, reserved_at = ?, bot_index = ?, updated_at = ? WHERE id = ? AND state = 'abandoned'`)
-      .bind(idempotencyKey, size, sha256Value, now(), botIndex, now(), existingAttempt.id).run();
+    await c.env.DB.prepare(
+      `UPDATE bot_part_attempts SET state = 'reserved', idempotency_key = ?, expected_size = ?, expected_sha256 = ?, reserved_at = ?, bot_index = ?, updated_at = ?
+      WHERE id = ? AND state = 'abandoned' AND EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ?
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    )
+      .bind(idempotencyKey, size, sha256Value, now(), botIndex, now(), existingAttempt.id, session.id, session.id, session.id)
+      .run();
     existingAttempt.idempotency_key = idempotencyKey;
     existingAttempt.state = 'reserved';
   }
   if (existingAttempt && ['ambiguous', 'sending'].includes(String(existingAttempt.state))) {
-    if (existingAttempt.state === 'sending' && existingAttempt.sending_lease_until && Date.parse(String(existingAttempt.sending_lease_until)) <= Date.now()) {
-      await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until <= ?`).bind(now(), now(), existingAttempt.id, existingAttempt.send_generation, now()).run();
+    if (
+      existingAttempt.state === 'sending' &&
+      existingAttempt.sending_lease_until &&
+      Date.parse(String(existingAttempt.sending_lease_until)) <= Date.now()
+    ) {
+      await c.env.DB.prepare(
+        `UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ?
+        WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until <= ? AND EXISTS (
+          SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+          WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ?
+            AND (w.owner_id = ? OR EXISTS (
+              SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+            ))
+        )`,
+      )
+        .bind(now(), now(), existingAttempt.id, existingAttempt.send_generation, now(), session.id, session.id, session.id)
+        .run();
     } else fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt requires explicit resolution');
   }
   const attemptId = String(existingAttempt?.id ?? randomToken(18));
   const timestamp = now();
   if (!existingAttempt) {
-    const reserved = await c.env.DB.prepare(`INSERT INTO bot_part_attempts (id, upload_session_id, part_no, idempotency_key, expected_size, expected_sha256, state, reserved_at, created_at, updated_at, bot_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(attemptId, upload.id, partNo, idempotencyKey, size, sha256Value, 'reserved', timestamp, timestamp, timestamp, botIndex).run();
-    if (changes(reserved) !== 1) fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt already exists');
+    const reserved = await c.env.DB.prepare(
+      `INSERT INTO bot_part_attempts (id, upload_session_id, part_no, idempotency_key, expected_size, expected_sha256, state, reserved_at, created_at, updated_at, bot_index)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = ? AND us.user_id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    )
+      .bind(
+        attemptId,
+        upload.id,
+        partNo,
+        idempotencyKey,
+        size,
+        sha256Value,
+        'reserved',
+        timestamp,
+        timestamp,
+        timestamp,
+        botIndex,
+        upload.id,
+        session.id,
+        session.id,
+        session.id,
+      )
+      .run();
+    if (changes(reserved) !== 1) fail(409, 'WORKSPACE_ACCESS_REVOKED', 'Workspace access changed; retry');
   }
   const generation = randomToken(18);
   // Lease must cover upstream browser upload, worker forward, and part hashing.
   // Conservative floor of ~100 KB/s upstream: 16 MiB part can take minutes on a slow link.
   const lease = new Date(Date.now() + Math.max(60_000, Math.ceil(size / 100_000) * 1000 + 60_000)).toISOString();
-  const claimed = await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'sending', sending_at = ?, send_generation = ?, sending_lease_until = ?, updated_at = ? WHERE id = ? AND state = 'reserved'`).bind(timestamp, generation, lease, timestamp, attemptId).run();
+  const claimed = await c.env.DB.prepare(
+    `UPDATE bot_part_attempts SET state = 'sending', sending_at = ?, send_generation = ?, sending_lease_until = ?, updated_at = ?
+    WHERE id = ? AND state = 'reserved' AND EXISTS (
+      SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+      WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+        AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))
+    )`,
+  )
+    .bind(timestamp, generation, lease, timestamp, attemptId, session.id, session.id, session.id)
+    .run();
   if (changes(claimed) !== 1) fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt is already being sent');
   const bot = telegramBots(c.env)[botIndex];
   const boundary = `----teledrive-${randomToken(12)}`;
-  const { stream, state } = createMultipartStream(c.req.raw.body ?? new ReadableStream(), boundary, pool.channelId, upload.object_name, upload.mime, size, sha256Value, c.req.raw.signal);
+  const { stream, state } = createMultipartStream(
+    c.req.raw.body ?? new ReadableStream(),
+    boundary,
+    pool.channelId,
+    upload.object_name,
+    upload.mime,
+    size,
+    sha256Value,
+    c.req.raw.signal,
+  );
   let response: Response;
   try {
-    response = await telegramCall(bot.token, 'sendDocument', stream, { 'Content-Type': `multipart/form-data; boundary=${boundary}` });
+    response = await telegramCall(bot.token, 'sendDocument', stream, {
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+    });
     if (!state.completed) throw new StreamingBodyError('Stream did not complete');
   } catch (error) {
-    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ?`).bind(now(), now(), attemptId, generation).run();
+    await c.env.DB.prepare(
+      `UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ?
+      WHERE id = ? AND state = 'sending' AND send_generation = ? AND EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ?
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    )
+      .bind(now(), now(), attemptId, generation, session.id, session.id, session.id)
+      .run();
     if (error instanceof StreamingBodyError) fail(422, 'PART_STREAM_INVALID', error.message);
     fail(502, 'TELEGRAM_TRANSPORT_ERROR', 'Telegram transport failed');
   }
   if (response.status === 429) {
-    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ? WHERE id = ? AND send_generation = ?`).bind(now(), now(), attemptId, generation).run();
+    await c.env.DB.prepare(
+      `UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ?
+      WHERE id = ? AND send_generation = ? AND EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ?
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    )
+      .bind(now(), now(), attemptId, generation, session.id, session.id, session.id)
+      .run();
     const retryAfter = response.headers.get('Retry-After');
     if (retryAfter) c.header('Retry-After', retryAfter);
     c.header('Access-Control-Expose-Headers', 'Retry-After');
     fail(429, 'TELEGRAM_RATE_LIMITED', 'Telegram rate limit reached');
   }
   if (!response.ok) {
-    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ? WHERE id = ? AND send_generation = ?`).bind(now(), now(), attemptId, generation).run();
+    await c.env.DB.prepare(
+      `UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ?
+      WHERE id = ? AND send_generation = ? AND EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ?
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    )
+      .bind(now(), now(), attemptId, generation, session.id, session.id, session.id)
+      .run();
     fail(502, 'TELEGRAM_ERROR', 'Telegram upload failed');
   }
-  const payload = (await response.json()) as { ok?: boolean; result?: { message_id?: string | number; document?: { file_id?: string } } };
+  const payload = (await response.json()) as {
+    ok?: boolean;
+    result?: { message_id?: string | number; document?: { file_id?: string } };
+  };
   const messageId = String(payload.result?.message_id ?? '');
   const fileId = payload.result?.document?.file_id ?? '';
   if (!payload.ok || !messageId || !fileId) fail(502, 'TELEGRAM_ERROR', 'Telegram upload response invalid');
-  const sent = await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'sent', telegram_message_id = ?, telegram_file_id = ?, sent_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until > ?`).bind(messageId, fileId, now(), now(), attemptId, generation, now()).run();
+  const sent = await c.env.DB.prepare(
+    `UPDATE bot_part_attempts SET state = 'sent', telegram_message_id = ?, telegram_file_id = ?, sent_at = ?, sending_lease_until = NULL, updated_at = ?
+    WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until > ? AND EXISTS (
+      SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+      WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+        AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        ))
+    )`,
+  )
+    .bind(messageId, fileId, now(), now(), attemptId, generation, now(), session.id, session.id, session.id)
+    .run();
   if (changes(sent) !== 1) fail(409, 'PART_ATTEMPT_STALE', 'Part attempt was superseded');
   const partId = randomToken(18);
   const committed = await c.env.DB.batch([
-    c.env.DB.prepare(`INSERT INTO object_parts (id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(partId, upload.object_id, partNo, size, sha256Value, messageId, fileId, idempotencyKey, now(), botIndex),
-    c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'committed', committed_at = ?, updated_at = ? WHERE id = ? AND state = 'sent' AND send_generation = ?`).bind(now(), now(), attemptId, generation),
-    audit(c.env.DB, session.id, 'upload.part_committed', 'object', upload.object_id),
+    c.env.DB.prepare(
+      `INSERT INTO object_parts (id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = ? AND us.user_id = ? AND us.object_id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      ) AND EXISTS (
+        SELECT 1 FROM bot_part_attempts ba WHERE ba.id = ? AND ba.state = 'sent' AND ba.send_generation = ?
+      )`,
+    ).bind(partId, upload.object_id, partNo, size, sha256Value, messageId, fileId, idempotencyKey, now(), botIndex, upload.id, session.id, upload.object_id, session.id, session.id, attemptId, generation),
+    c.env.DB.prepare(
+      `UPDATE bot_part_attempts SET state = 'committed', committed_at = ?, updated_at = ? WHERE id = ? AND state = 'sent' AND send_generation = ?
+      AND EXISTS (SELECT 1 FROM object_parts WHERE id = ?)
+      AND EXISTS (
+        SELECT 1 FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+        WHERE us.id = bot_part_attempts.upload_session_id AND us.user_id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+          AND (w.owner_id = ? OR EXISTS (
+            SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+          ))
+      )`,
+    ).bind(now(), now(), attemptId, generation, partId, session.id, session.id, session.id),
+    c.env.DB.prepare(
+      `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
+      SELECT ?, ?, 'upload.part_committed', 'object', ?, ?
+      FROM upload_sessions us JOIN objects o ON o.id = us.object_id JOIN workspaces w ON w.id = o.workspace_id
+      WHERE us.id = ? AND us.user_id = ? AND us.object_id = ? AND o.status = 'uploading' AND o.deleted_at IS NULL
+        AND (w.owner_id = ? OR EXISTS (
+          SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = w.id AND wm.user_id = ?
+        )) AND EXISTS (SELECT 1 FROM object_parts WHERE id = ?)
+        AND EXISTS (SELECT 1 FROM bot_part_attempts ba WHERE ba.id = ? AND ba.state = 'committed' AND ba.send_generation = ?)`,
+    ).bind(randomToken(18), session.id, upload.object_id, now(), upload.id, session.id, upload.object_id, session.id, session.id, partId, attemptId, generation),
   ]);
-  if (changes(committed[1]) !== 1) fail(409, 'PART_ATTEMPT_STALE', 'Part attempt was superseded');
-  return c.json({ id: partId, partNo, size, sha256: sha256Value, messageId, botFileId: fileId, idempotencyKey, createdAt: now() });
+  if (committed.some((result) => changes(result) !== 1)) fail(409, 'PART_ATTEMPT_STALE', 'Part attempt was superseded');
+  return c.json({
+    id: partId,
+    partNo,
+    size,
+    sha256: sha256Value,
+    messageId,
+    botFileId: fileId,
+    idempotencyKey,
+    createdAt: now(),
+  });
 });
 
 app.get('/v1/bot/uploads/:id/parts/:no/attempt', async (c) => {
   const session = await requireSession(c);
   const upload = await uploadForUser(c, session.id, c.req.param('id'));
   const partNo = integerValue(Number(c.req.param('no')), 'partNo', 0, MAX_PARTS);
-  let attempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
-  if (attempt?.state === 'sending' && attempt.sending_lease_until && Date.parse(String(attempt.sending_lease_until)) <= Date.now()) {
-    await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until <= ?`).bind(now(), now(), attempt.id, attempt.send_generation, now()).run();
-    attempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
+  let attempt = await first<Record<string, unknown>>(
+    c.env.DB,
+    'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?',
+    upload.id,
+    partNo,
+  );
+  if (
+    attempt?.state === 'sending' &&
+    attempt.sending_lease_until &&
+    Date.parse(String(attempt.sending_lease_until)) <= Date.now()
+  ) {
+    await c.env.DB.prepare(
+      `UPDATE bot_part_attempts SET state = 'ambiguous', ambiguous_at = ?, sending_lease_until = NULL, updated_at = ? WHERE id = ? AND state = 'sending' AND send_generation = ? AND sending_lease_until <= ?`,
+    )
+      .bind(now(), now(), attempt.id, attempt.send_generation, now())
+      .run();
+    attempt = await first<Record<string, unknown>>(
+      c.env.DB,
+      'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?',
+      upload.id,
+      partNo,
+    );
   }
   if (!attempt) return c.json({ partNo, status: 'not_started' });
   return c.json(botAttemptResponse(attempt, partNo));
@@ -2307,9 +2732,18 @@ app.post('/v1/bot/uploads/:id/parts/:no/attempt/abandon', async (c) => {
   const session = await requireSession(c);
   const upload = await uploadForUser(c, session.id, c.req.param('id'));
   const partNo = integerValue(Number(c.req.param('no')), 'partNo', 0, MAX_PARTS);
-  const attempt = await first<Record<string, unknown>>(c.env.DB, 'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?', upload.id, partNo);
+  const attempt = await first<Record<string, unknown>>(
+    c.env.DB,
+    'SELECT * FROM bot_part_attempts WHERE upload_session_id = ? AND part_no = ?',
+    upload.id,
+    partNo,
+  );
   if (!attempt) fail(404, 'PART_ATTEMPT_NOT_FOUND', 'Part attempt not found');
-  const result = await c.env.DB.prepare(`UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ? WHERE id = ? AND send_generation = ? AND state IN ('ambiguous', 'reserved', 'sent')`).bind(now(), now(), attempt.id, attempt.send_generation).run();
+  const result = await c.env.DB.prepare(
+    `UPDATE bot_part_attempts SET state = 'abandoned', abandoned_at = ?, send_generation = NULL, updated_at = ? WHERE id = ? AND send_generation = ? AND state IN ('ambiguous', 'reserved', 'sent')`,
+  )
+    .bind(now(), now(), attempt.id, attempt.send_generation)
+    .run();
   if (changes(result) !== 1) fail(409, 'PART_ATTEMPT_IN_PROGRESS', 'Part attempt cannot be abandoned');
   return c.json({ partNo, status: 'abandoned' });
 });
@@ -2317,25 +2751,53 @@ app.post('/v1/bot/uploads/:id/parts/:no/attempt/abandon', async (c) => {
 app.get('/v1/bot/objects/:id/manifest', async (c) => {
   const session = await requireSession(c);
   const object = await objectForUser(c, session.id, c.req.param('id'));
-  const parts = await all<PartRow>(c.env.DB, 'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? ORDER BY part_no ASC', object.id);
-  return c.json({ object: { id: object.id, folderId: object.folder_id, name: object.name, mime: object.mime, size: object.size, sha256: object.sha256, partCount: object.part_count, status: object.status, createdAt: object.created_at, updatedAt: object.updated_at }, parts: parts.map((part) => ({ partNo: part.part_no, size: part.size, sha256: part.sha256 })) });
+  const parts = await all<PartRow>(
+    c.env.DB,
+    'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? ORDER BY part_no ASC',
+    object.id,
+  );
+  return c.json({
+    object: {
+      id: object.id,
+      folderId: object.folder_id,
+      name: object.name,
+      mime: object.mime,
+      size: object.size,
+      sha256: object.sha256,
+      partCount: object.part_count,
+      status: object.status,
+      createdAt: object.created_at,
+      updatedAt: object.updated_at,
+    },
+    parts: parts.map((part) => ({ partNo: part.part_no, size: part.size, sha256: part.sha256 })),
+  });
 });
 
 app.get('/v1/bot/objects/:id/parts/:no/content', async (c) => {
   const session = await requireSession(c);
   const object = await objectForUser(c, session.id, c.req.param('id'));
   const partNo = integerValue(Number(c.req.param('no')), 'partNo', 0, MAX_PARTS);
-  const part = await first<PartRow>(c.env.DB, 'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? AND part_no = ?', object.id, partNo);
+  const part = await first<PartRow>(
+    c.env.DB,
+    'SELECT id, object_id, part_no, size, sha256, message_id, bot_file_id, idempotency_key, created_at, bot_index FROM object_parts WHERE object_id = ? AND part_no = ?',
+    object.id,
+    partNo,
+  );
   if (!part?.bot_file_id) fail(404, 'PART_NOT_FOUND', 'Part not found');
   const bots = telegramBots(c.env);
   const bot = bots[part.bot_index ?? 0];
-  const fileResponse = await telegramCall(bot.token, 'getFile', JSON.stringify({ file_id: part.bot_file_id }), { 'Content-Type': 'application/json' });
+  const fileResponse = await telegramCall(bot.token, 'getFile', JSON.stringify({ file_id: part.bot_file_id }), {
+    'Content-Type': 'application/json',
+  });
   if (!fileResponse.ok) fail(502, 'TELEGRAM_ERROR', 'Telegram file lookup failed');
   const file = (await fileResponse.json()) as { ok?: boolean; result?: { file_path?: string } };
   if (!file.ok || !file.result?.file_path) fail(502, 'TELEGRAM_ERROR', 'Telegram file lookup failed');
   const content = await fetch(`https://api.telegram.org/file/bot${bot.token}/${file.result.file_path}`);
   if (!content.ok || !content.body) fail(502, 'TELEGRAM_ERROR', 'Telegram file download failed');
-  return new Response(content.body, { status: 200, headers: { 'Content-Type': object.mime, 'Cache-Control': 'no-store' } });
+  return new Response(content.body, {
+    status: 200,
+    headers: { 'Content-Type': object.mime, 'Cache-Control': 'no-store' },
+  });
 });
 
 /* Legacy per-user Telegram onboarding was removed; configuration belongs in Worker env. */

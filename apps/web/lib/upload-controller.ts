@@ -1,14 +1,6 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import {
-  ApiError,
-  api,
-  type ApiClient,
-  type BotAttemptStatus,
-  type BotPart,
-  type BotUploadStartInput,
-  type StoragePoolResponse,
-} from './api';
+import { ApiError, api, type ApiClient, type BotAttemptStatus, type BotPart, type BotUploadStartInput } from './api';
 
 export const MIN_CHUNK_SIZE = 8 * 1024 * 1024;
 export const DEFAULT_CHUNK_SIZE = 16 * 1024 * 1024;
@@ -59,7 +51,7 @@ type UploadApi = Pick<
   ApiClient,
   'startBotUpload' | 'getBotPartAttempt' | 'uploadBotPart' | 'completeBotUpload' | 'abortBotUpload'
 > &
-  Partial<Pick<ApiClient, 'abandonBotPartAttempt' | 'getStoragePool'>>;
+  Partial<Pick<ApiClient, 'abandonBotPartAttempt'>>;
 
 export type UploadQueueTask<T> = () => Promise<T>;
 
@@ -85,7 +77,7 @@ export type UploadControllerOptions = {
   file: Blob & { name?: string; type: string };
   folderId?: string;
   chunkSize?: number;
-  /** Override pool concurrency. 0 or unset = derive from storage pool at start. */
+  /** Maximum simultaneous part uploads. Unset = serial. */
   concurrency?: number;
   api?: UploadApi;
   idempotencyKey?: () => string;
@@ -249,7 +241,7 @@ export class UploadController {
       'attemptPollIntervalMs',
     );
     this.attemptPollMaxAttempts = validateInteger(
-      options.attemptPollMaxAttempts ?? 60,
+      options.attemptPollMaxAttempts ?? 600,
       0,
       600,
       'attemptPollMaxAttempts',
@@ -539,6 +531,13 @@ export class UploadController {
     this.emit('uploading');
   }
 
+  private updatePartProgress(plan: PartPlan, uploadedBytes: number): void {
+    if (this.committed.has(plan.partNo)) return;
+    const bytes = Number.isFinite(uploadedBytes) ? Math.min(plan.size, Math.max(0, Math.floor(uploadedBytes))) : 0;
+    this.partProgress.set(plan.partNo, bytes);
+    this.emit('uploading');
+  }
+
   private async uploadPart(plan: PartPlan): Promise<void> {
     let key = this.partKeys.get(plan.partNo) ?? this.idempotencyKey();
     this.partKeys.set(plan.partNo, key);
@@ -558,11 +557,18 @@ export class UploadController {
       const chunk = this.file.slice(plan.offset, plan.offset + plan.size);
       this.partProgress.set(plan.partNo, 0);
       try {
-        const committed = await this.api.uploadBotPart(this.sessionId as string, plan.partNo, chunk, {
-          size: plan.size,
-          sha256: plan.sha256,
-          idempotencyKey: key,
-        });
+        const committed = await this.api.uploadBotPart(
+          this.sessionId as string,
+          plan.partNo,
+          chunk,
+          {
+            size: plan.size,
+            sha256: plan.sha256,
+            idempotencyKey: key,
+          },
+          (uploadedBytes) => this.updatePartProgress(plan, uploadedBytes),
+          this.abortController.signal,
+        );
         this.markCommitted(plan, committed);
         return;
       } catch (error) {
@@ -655,15 +661,6 @@ export class UploadController {
         throw new ApiError('FILE_TOO_LARGE', 'Files larger than 5 GiB are not supported.', 413);
       this.manifest = await this.hashFile();
       await this.waitUntilRunnable();
-      // Resolve concurrency from pool if not explicitly set via options
-      if (this.resolvedConcurrency <= 1 && this.api.getStoragePool) {
-        try {
-          const pool = await this.api.getStoragePool();
-          this.resolvedConcurrency = Math.max(1, Math.min(pool.botCount || 1, 8));
-        } catch {
-          // ponytail: pool offline, fallback serial
-        }
-      }
       const startMetadata: BotUploadStartInput = {
         name: this.file.name ?? 'unnamed',
         size: this.file.size,

@@ -1,13 +1,8 @@
-import type {
-  AuthenticationResponseJSON,
-  PublicKeyCredentialCreationOptionsJSON,
-  PublicKeyCredentialRequestOptionsJSON,
-  RegistrationResponseJSON,
-} from '@simplewebauthn/browser';
-
 export type ApiUser = { id: string; username: string; displayName: string };
 export type Folder = { id: string; name: string; parentId: string | null };
-export type Workspace = { id: string; name: string };
+export type WorkspaceMember = { userId: string; role: 'owner' | 'member'; createdAt?: string };
+export type Workspace = { id: string; name: string; ownerId: string; isOwner: boolean; members: WorkspaceMember[] };
+export type WorkspaceSummary = Workspace;
 export type WorkspaceResponse = { workspace: Workspace; rootFolder: Pick<Folder, 'id' | 'name'> };
 
 export type FolderItem = {
@@ -35,7 +30,33 @@ export type ObjectListItem = {
   updatedAt?: string;
   deletedAt?: string | null;
 };
+export type TrashFolderItem = {
+  type: 'folder';
+  id: string;
+  workspaceId: string;
+  parentId: string | null;
+  name: string;
+  deletedAt: string;
+  createdAt: string;
+  updatedAt: string;
+  canPermanentlyDelete: boolean;
+};
+export type TrashObjectItem = {
+  type: 'object';
+  id: string;
+  workspaceId: string;
+  folderId: string | null;
+  name: string;
+  mime: string | null;
+  size: number | null;
+  deletedAt: string;
+  createdAt: string;
+  updatedAt: string;
+  canPermanentlyDelete: boolean;
+};
+export type TrashItem = TrashFolderItem | TrashObjectItem;
 export type PaginatedObjectResponse = { items: ObjectListItem[]; nextCursor: string | null };
+export type PaginatedTrashResponse = { items: TrashItem[]; nextCursor: string | null };
 export type ObjectUpdateInput = { name?: string; folderId?: string | null };
 export type ObjectUpdateResponse = { id: string; name: string; folderId: string };
 export type FolderUpdateInput = { name?: string; parentId?: string | null };
@@ -80,23 +101,14 @@ export type ExportPart = {
 };
 export type ExportResponse = {
   exportedAt: string;
-  workspace: Workspace;
+  workspace: Pick<Workspace, 'id' | 'name'>;
   folders: ExportFolder[];
   objects: ExportObject[];
   parts: ExportPart[];
 };
 
-export type PasskeyRegisterOptionsResponse = {
-  challengeId: string;
-  options: PublicKeyCredentialCreationOptionsJSON;
-};
-export type PasskeyAuthenticateOptionsResponse = {
-  challengeId: string;
-  options: PublicKeyCredentialRequestOptionsJSON;
-};
-export type AuthResponse = { user: ApiUser; csrfToken: string };
 export type CurrentSessionResponse = { user: ApiUser | null };
-export type GoogleAuthorizationMode = 'login' | 'link';
+export type TelegramAuthorizationMode = 'login' | 'register';
 
 export type StoragePoolReasonCode =
   | 'READY'
@@ -172,29 +184,22 @@ export class ApiError extends Error {
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 type JsonRecord = Record<string, unknown>;
+type ByteProgressCallback = (uploadedBytes: number) => void;
 
 export interface ApiClient {
   getCsrf(): Promise<string>;
-  registerPasskeyOptions(
-    userName: string,
-    displayName?: string,
-    bootstrapToken?: string,
-  ): Promise<PasskeyRegisterOptionsResponse>;
-  registerPasskeyVerify(
-    challengeId: string,
-    response: RegistrationResponseJSON,
-    bootstrapToken?: string,
-  ): Promise<AuthResponse>;
-  authenticatePasskeyOptions(userName: string): Promise<PasskeyAuthenticateOptionsResponse>;
-  authenticatePasskeyVerify(challengeId: string, response: AuthenticationResponseJSON): Promise<AuthResponse>;
-  googleAuthorizationUrl(mode: GoogleAuthorizationMode): Promise<string>;
+  telegramAuthorizationUrl(mode: TelegramAuthorizationMode, secretInfo?: string): Promise<string>;
   getCurrentSession(): Promise<ApiUser | null>;
   logout(): Promise<{ ok: true }>;
   getStoragePool(): Promise<StoragePoolResponse>;
-  getWorkspace(): Promise<WorkspaceResponse>;
+  listWorkspaces(): Promise<{ workspaces: WorkspaceSummary[] }>;
+  getWorkspace(workspaceId?: string): Promise<WorkspaceResponse>;
+  listWorkspaceMembers(workspaceId: string): Promise<{ workspaceId: string; members: WorkspaceMember[] }>;
+  addWorkspaceMember(workspaceId: string, userId: string): Promise<{ workspaceId: string; member: WorkspaceMember }>;
+  removeWorkspaceMember(workspaceId: string, userId: string): Promise<{ workspaceId: string; userId: string; removed: true }>;
   listFolderChildren(folderId: string, options?: { limit?: number; cursor?: string }): Promise<FolderChildrenResponse>;
   listRecent(options?: { limit?: number; cursor?: string }): Promise<PaginatedObjectResponse>;
-  listTrash(options?: { limit?: number; cursor?: string }): Promise<PaginatedObjectResponse>;
+  listTrash(options?: { limit?: number; cursor?: string }): Promise<PaginatedTrashResponse>;
   createFolder(name: string, parentId: string | null): Promise<Folder>;
   updateFolder(folderId: string, input: FolderUpdateInput): Promise<FolderUpdateResponse>;
   updateObject(objectId: string, input: ObjectUpdateInput): Promise<ObjectUpdateResponse>;
@@ -205,7 +210,14 @@ export interface ApiClient {
   restoreFolder(folderId: string): Promise<MutationResponse>;
   permanentDeleteFolder(folderId: string): Promise<MutationResponse>;
   startBotUpload(input: BotUploadStartInput): Promise<BotUploadSession>;
-  uploadBotPart(uploadId: string, partNo: number, body: BodyInit, input: BotPartUploadInput): Promise<BotPart>;
+  uploadBotPart(
+    uploadId: string,
+    partNo: number,
+    body: BodyInit,
+    input: BotPartUploadInput,
+    onProgress?: (uploadedBytes: number) => void,
+    signal?: AbortSignal,
+  ): Promise<BotPart>;
   getBotUpload(uploadId: string): Promise<BotUploadSession>;
   getBotPartAttempt(uploadId: string, partNo: number): Promise<BotAttemptStatus>;
   abandonBotPartAttempt(uploadId: string, partNo: number): Promise<BotAttemptStatus & { consequence?: string }>;
@@ -214,7 +226,7 @@ export interface ApiClient {
   getBotManifest(objectId: string): Promise<BotManifestResponse>;
   getBotPartContent(objectId: string, partNo: number): Promise<Response>;
   getBotPartBytes(objectId: string, partNo: number): Promise<Uint8Array>;
-  exportWorkspace(): Promise<ExportResponse>;
+  exportWorkspace(workspaceId?: string): Promise<ExportResponse>;
 }
 
 type ApiClientOptions = { baseUrl?: string; fetch?: FetchLike };
@@ -416,6 +428,7 @@ export class MetadataApiClient implements ApiClient {
     init: RequestInit = {},
     csrf = false,
     retryCsrf = true,
+    onUploadProgress?: ByteProgressCallback,
   ): Promise<Response> {
     if (!this.baseUrl) throw new ApiError('API_CONFIGURATION_ERROR', 'NEXT_PUBLIC_API_URL is required', 500);
     const headers = new Headers(init.headers);
@@ -424,8 +437,20 @@ export class MetadataApiClient implements ApiClient {
 
     let response: Response;
     try {
-      response = await this.fetcher(`${this.baseUrl}${path}`, { ...init, headers, credentials: 'include' });
-    } catch {
+      if (onUploadProgress && typeof Blob !== 'undefined' && init.body instanceof Blob) {
+        response =
+          (await this.requestWithXhr(`${this.baseUrl}${path}`, init, headers, onUploadProgress)) ??
+          (await this.fetcher(`${this.baseUrl}${path}`, { ...init, headers, credentials: 'include' }));
+      } else {
+        response = await this.fetcher(`${this.baseUrl}${path}`, { ...init, headers, credentials: 'include' });
+      }
+    } catch (error) {
+      if (error instanceof ApiError && error.code === 'REQUEST_ABORTED') throw error;
+      if (
+        init.signal?.aborted ||
+        (error && typeof error === 'object' && 'name' in error && error.name === 'AbortError')
+      )
+        throw new ApiError('REQUEST_ABORTED', 'API request was aborted', 0);
       throw new ApiError('NETWORK_ERROR', 'API request could not be sent', 0);
     }
 
@@ -440,15 +465,111 @@ export class MetadataApiClient implements ApiClient {
       ) {
         this.csrfToken = undefined;
         await this.getCsrf();
-        return this.requestResponse(path, init, true, false);
+        return this.requestResponse(path, init, true, false, onUploadProgress);
       }
       throw error;
     }
     return response;
   }
 
-  private async request<T>(path: string, init: RequestInit = {}, csrf = false): Promise<T> {
-    const response = await this.requestResponse(path, init, csrf);
+  private async requestWithXhr(
+    url: string,
+    init: RequestInit,
+    headers: Headers,
+    onProgress: ByteProgressCallback,
+  ): Promise<Response | undefined> {
+    if (typeof XMLHttpRequest === 'undefined') return undefined;
+
+    let xhr: XMLHttpRequest;
+    try {
+      xhr = new XMLHttpRequest();
+    } catch {
+      return undefined;
+    }
+    if (!xhr.upload || !('onprogress' in xhr.upload)) return undefined;
+
+    return new Promise<Response>((resolve, reject) => {
+      const signal = init.signal;
+      let settled = false;
+      let onAbort: () => void;
+      const cleanup = () => {
+        signal?.removeEventListener('abort', onAbort);
+        xhr.onload = null;
+        xhr.onerror = null;
+        xhr.onabort = null;
+        xhr.upload.onprogress = null;
+      };
+      const resolveOnce = (response: Response) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(response);
+      };
+      const rejectOnce = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      onAbort = () => {
+        try {
+          xhr.abort();
+        } catch {
+          // Abort is already represented by request error below.
+        }
+        rejectOnce(new ApiError('REQUEST_ABORTED', 'API request was aborted', 0));
+      };
+      xhr.onload = () => {
+        if (xhr.status < 200 || xhr.status > 599) {
+          rejectOnce(new Error('XHR request failed'));
+          return;
+        }
+        try {
+          const responseHeaders = new Headers();
+          for (const line of xhr.getAllResponseHeaders().trim().split(/\r?\n/u)) {
+            const separator = line.indexOf(':');
+            if (separator > 0)
+              responseHeaders.append(line.slice(0, separator).trim(), line.slice(separator + 1).trim());
+          }
+          resolveOnce(
+            new Response(xhr.responseText, {
+              status: xhr.status,
+              statusText: xhr.statusText,
+              headers: responseHeaders,
+            }),
+          );
+        } catch (error) {
+          rejectOnce(error);
+        }
+      };
+      xhr.onerror = () => rejectOnce(new Error('XHR request failed'));
+      xhr.onabort = () => rejectOnce(new ApiError('REQUEST_ABORTED', 'API request was aborted', 0));
+      xhr.upload.onprogress = (event) => {
+        if (!settled && !signal?.aborted && Number.isFinite(event.loaded)) onProgress(event.loaded);
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      try {
+        xhr.open(init.method ?? 'GET', url, true);
+        xhr.withCredentials = true;
+        headers.forEach((value, name) => xhr.setRequestHeader(name, value));
+        xhr.send(init.body as XMLHttpRequestBodyInit);
+      } catch (error) {
+        rejectOnce(error);
+      }
+    });
+  }
+
+  private async request<T>(
+    path: string,
+    init: RequestInit = {},
+    csrf = false,
+    onUploadProgress?: ByteProgressCallback,
+  ): Promise<T> {
+    const response = await this.requestResponse(path, init, csrf, true, onUploadProgress);
     const body = await response.json().catch(() => undefined);
     if (body === undefined) throw new ApiError('INVALID_RESPONSE', 'API returned invalid JSON', response.status);
     return body as T;
@@ -471,66 +592,17 @@ export class MetadataApiClient implements ApiClient {
     return this.csrfRequest;
   }
 
-  async registerPasskeyOptions(userName: string, displayName?: string, bootstrapToken?: string) {
-    const headers = bootstrapToken ? { 'X-Bootstrap-Token': bootstrapToken } : undefined;
-    return this.request<PasskeyRegisterOptionsResponse>(
-      '/v1/auth/passkey/register/options',
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ userName, ...(displayName === undefined ? {} : { displayName }) }),
-      },
-      true,
-    );
-  }
-
-  async registerPasskeyVerify(challengeId: string, response: RegistrationResponseJSON, bootstrapToken?: string) {
-    const headers = bootstrapToken ? { 'X-Bootstrap-Token': bootstrapToken } : undefined;
-    const result = await this.request<AuthResponse>(
-      '/v1/auth/passkey/register/verify',
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ challengeId, response }),
-      },
-      true,
-    );
-    this.csrfToken = result.csrfToken;
-    return result;
-  }
-
-  authenticatePasskeyOptions(userName: string) {
-    return this.request<PasskeyAuthenticateOptionsResponse>(
-      '/v1/auth/passkey/authenticate/options',
-      {
-        method: 'POST',
-        body: JSON.stringify({ userName }),
-      },
-      true,
-    );
-  }
-
-  async authenticatePasskeyVerify(challengeId: string, response: AuthenticationResponseJSON) {
-    const result = await this.request<AuthResponse>(
-      '/v1/auth/passkey/authenticate/verify',
-      {
-        method: 'POST',
-        body: JSON.stringify({ challengeId, response }),
-      },
-      true,
-    );
-    this.csrfToken = result.csrfToken;
-    return result;
-  }
-
-  async googleAuthorizationUrl(mode: GoogleAuthorizationMode): Promise<string> {
+  async telegramAuthorizationUrl(mode: TelegramAuthorizationMode, secretInfo?: string): Promise<string> {
     const result = await this.request<{ authorizationUrl: unknown }>(
-      '/v1/auth/google/start',
-      { method: 'POST', body: JSON.stringify({ mode }) },
+      '/v1/auth/telegram/start',
+      {
+        method: 'POST',
+        body: JSON.stringify({ mode, ...(secretInfo === undefined ? {} : { secretInfo }) }),
+      },
       true,
     );
     if (typeof result.authorizationUrl !== 'string' || result.authorizationUrl.length === 0)
-      throw new ApiError('INVALID_RESPONSE', 'Google authorization response is invalid', 500);
+      throw new ApiError('INVALID_RESPONSE', 'Telegram authorization response is invalid', 500);
     return result.authorizationUrl;
   }
 
@@ -565,8 +637,30 @@ export class MetadataApiClient implements ApiClient {
     };
   }
 
-  getWorkspace() {
-    return this.request<WorkspaceResponse>('/v1/workspace');
+  listWorkspaces() {
+    return this.request<{ workspaces: WorkspaceSummary[] }>('/v1/workspaces');
+  }
+
+  getWorkspace(workspaceId?: string) {
+    return this.request<WorkspaceResponse>(`/v1/workspace${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`);
+  }
+
+  listWorkspaceMembers(workspaceId: string) {
+    return this.request<{ workspaceId: string; members: WorkspaceMember[] }>(`/v1/workspaces/${encodeURIComponent(workspaceId)}/members`);
+  }
+
+  addWorkspaceMember(workspaceId: string, userId: string) {
+    return this.request<{ workspaceId: string; member: WorkspaceMember }>(
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/members`,
+      { method: 'POST', body: JSON.stringify({ userId }) }, true,
+    );
+  }
+
+  removeWorkspaceMember(workspaceId: string, userId: string) {
+    return this.request<{ workspaceId: string; userId: string; removed: true }>(
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/members/${encodeURIComponent(userId)}`,
+      { method: 'DELETE' }, true,
+    );
   }
 
   listFolderChildren(folderId: string, options: { limit?: number; cursor?: string } = {}) {
@@ -580,7 +674,7 @@ export class MetadataApiClient implements ApiClient {
   }
 
   listTrash(options: { limit?: number; cursor?: string } = {}) {
-    return this.request<PaginatedObjectResponse>(`/v1/trash${this.pageQuery(options)}`);
+    return this.request<PaginatedTrashResponse>(`/v1/trash${this.pageQuery(options)}`);
   }
 
   private pageQuery(options: { limit?: number; cursor?: string }): string {
@@ -670,7 +764,14 @@ export class MetadataApiClient implements ApiClient {
     );
   }
 
-  uploadBotPart(uploadId: string, partNo: number, body: BodyInit, input: BotPartUploadInput): Promise<BotPart> {
+  uploadBotPart(
+    uploadId: string,
+    partNo: number,
+    body: BodyInit,
+    input: BotPartUploadInput,
+    onProgress?: ByteProgressCallback,
+    signal?: AbortSignal,
+  ): Promise<BotPart> {
     if (!input.idempotencyKey || !input.sha256 || !Number.isSafeInteger(input.size))
       return Promise.reject(
         new ApiError('UPLOAD_METADATA_REQUIRED', 'Part requires size, SHA-256, and idempotencyKey', 422),
@@ -686,8 +787,10 @@ export class MetadataApiClient implements ApiClient {
           'X-Idempotency-Key': input.idempotencyKey,
         },
         body,
+        signal,
       },
       true,
+      onProgress,
     ).then(safeBotPart);
   }
 
@@ -737,8 +840,9 @@ export class MetadataApiClient implements ApiClient {
     return new Uint8Array(await (await this.getBotPartContent(objectId, partNo)).arrayBuffer());
   }
 
-  exportWorkspace() {
-    return this.request<unknown>('/v1/export').then(safeExport);
+  exportWorkspace(workspaceId?: string) {
+    const query = workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : '';
+    return this.request<unknown>(`/v1/export${query}`).then(safeExport);
   }
 }
 

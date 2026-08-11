@@ -1,15 +1,16 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { authenticatePasskey, registerPasskey } from '../lib/passkey';
 import {
   api,
   ApiError,
   type FolderChildrenResponse,
   type FolderItem,
   type ObjectListItem,
+  type TrashItem,
   type StoragePoolResponse,
   type WorkspaceResponse,
+  type WorkspaceSummary,
 } from '../lib/api';
 import {
   createUploadController,
@@ -24,6 +25,7 @@ import {
   DownloadError,
 } from '../lib/download-controller';
 import styles from './page.module.css';
+import { logoutAfterSuccess, permanentlyDeleteTrashItem, restoreTrashItem, trashActionAvailability } from '../lib/ui-actions';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
 type Upload = {
@@ -173,8 +175,10 @@ function controllerError(error: unknown) {
     return 'Bot atau channel belum siap. Buka Pengaturan untuk menyelesaikan setup.';
   if (code === 'BOT_CHALLENGE_EXPIRED') return 'Kode setup kedaluwarsa. Buka Pengaturan untuk menghubungkan ulang bot.';
   if (code === 'BOT_TOKEN_INVALID') return 'Token bot tidak valid. Periksa token BotFather lalu coba lagi.';
-  if (code === 'BOT_PART_ATTEMPT_AMBIGUOUS' || code === 'BOT_PART_ATTEMPT_IN_PROGRESS')
-    return 'Bagian file menunggu kepastian Worker. Gunakan “Abandon attempt dan coba lagi” untuk melanjutkan sesi ini.';
+  if (code === 'BOT_PART_ATTEMPT_IN_PROGRESS')
+    return 'Bagian file masih diproses Worker. Jangan abandon attempt; tunggu sebentar lalu lanjutkan attempt.';
+  if (code === 'BOT_PART_ATTEMPT_AMBIGUOUS')
+    return 'Status bagian file tidak dapat dipastikan. Abandon attempt, lalu coba lagi.';
   return text || 'Permintaan upload gagal. Coba lagi.';
 }
 function downloadError(error: unknown) {
@@ -220,17 +224,18 @@ function formatDate(...values: unknown[]) {
 }
 
 export default function Page() {
-  const [user, setUser] = useState<{ displayName: string; username: string } | null>(null);
+  const [user, setUser] = useState<{ id: string; displayName: string; username: string } | null>(null);
   const [sessionReady, setSessionReady] = useState(false);
   const [sessionRestoreError, setSessionRestoreError] = useState('');
-  const [authBusy, setAuthBusy] = useState(false);
-  const [authError, setAuthError] = useState('');
-  const [googleBusy, setGoogleBusy] = useState(false);
-  const [googleError, setGoogleError] = useState('');
+  const [telegramBusy, setTelegramBusy] = useState(false);
+  const [telegramError, setTelegramError] = useState('');
+  const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [workspace, setWorkspace] = useState<WorkspaceResponse | null>(null);
   const [folder, setFolder] = useState<FolderChildrenResponse | null>(null);
   const [recent, setRecent] = useState<ObjectListItem[]>([]);
-  const [trash, setTrash] = useState<ObjectListItem[]>([]);
+  const [trash, setTrash] = useState<TrashItem[]>([]);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const [logoutError, setLogoutError] = useState('');
   const [specialCursor, setSpecialCursor] = useState<string | null>(null);
   const [specialLoading, setSpecialLoading] = useState(false);
   const [menuId, setMenuId] = useState<string | null>(null);
@@ -308,14 +313,15 @@ export default function Page() {
       setLoading(false);
     }
   }
-  async function enterApp(authUser: { displayName: string; username: string }) {
+  async function enterApp(authUser: { id: string; displayName: string; username: string }, workspaceId?: string) {
     setUser(authUser);
     void probePool();
     setLoading(true);
     setLoadError('');
     try {
-      const result = await api.getWorkspace();
+      const result = await api.getWorkspace(workspaceId);
       setWorkspace(result);
+      setWorkspaces((current) => current.some((item) => item.id === result.workspace.id) ? current : [...current, result.workspace]);
       setCrumbs([{ id: result.rootFolder.id, name: result.rootFolder.name }]);
       setFolder(await api.listFolderChildren(result.rootFolder.id, { limit: 100 }));
     } catch (error) {
@@ -333,15 +339,21 @@ export default function Page() {
       setPoolError(message(error));
     }
   }
-  async function openGoogle(mode: 'login' | 'link') {
-    if (googleBusy) return;
-    setGoogleBusy(true);
-    setGoogleError('');
+  async function openTelegram(mode: 'login' | 'register', secretInfo?: string) {
+    if (telegramBusy) return;
+    setTelegramBusy(true);
+    setTelegramError('');
     try {
-      window.location.assign(await api.googleAuthorizationUrl(mode));
+      const telegramAuthorizationUrl = api.telegramAuthorizationUrl as (
+        mode: 'login' | 'register',
+        secret?: string,
+      ) => Promise<string>;
+      window.location.assign(
+        await (mode === 'register' ? telegramAuthorizationUrl('register', secretInfo) : telegramAuthorizationUrl(mode)),
+      );
     } catch (error) {
-      setGoogleError(message(error));
-      setGoogleBusy(false);
+      setTelegramError(message(error));
+      setTelegramBusy(false);
     }
   }
   async function restoreSession() {
@@ -349,7 +361,11 @@ export default function Page() {
     setSessionReady(false);
     try {
       const current = await api.getCurrentSession();
-      if (current) await enterApp(current);
+      if (current) {
+        const available = await api.listWorkspaces();
+        setWorkspaces(available.workspaces);
+        await enterApp(current, available.workspaces[0]?.id);
+      }
     } catch (error) {
       if (!(error instanceof ApiError && error.status === 401)) setSessionRestoreError(message(error));
     } finally {
@@ -361,13 +377,11 @@ export default function Page() {
   }, []);
   useEffect(() => {
     const knownErrors: Record<string, string> = {
-      GOOGLE_AUTH_FAILED: 'Login Google gagal. Coba lagi.',
-      google_denied: 'Login Google dibatalkan.',
-      google_failed: 'Login Google gagal. Coba lagi.',
-      google_link_failed: 'Pengaitan Google gagal. Coba lagi.',
+      telegram_denied: 'Login Telegram dibatalkan.',
+      telegram_failed: 'Login Telegram gagal. Coba lagi.',
     };
     const code = new URLSearchParams(window.location.search).get('error');
-    if (code && knownErrors[code]) setGoogleError(knownErrors[code]);
+    if (code && knownErrors[code]) setTelegramError(knownErrors[code]);
   }, []);
   async function loadSpecial(nextView: 'recent' | 'trash', append = false) {
     setView(nextView);
@@ -378,9 +392,8 @@ export default function Page() {
         nextView === 'recent'
           ? await api.listRecent({ limit: 50, ...(append && specialCursor ? { cursor: specialCursor } : {}) })
           : await api.listTrash({ limit: 50, ...(append && specialCursor ? { cursor: specialCursor } : {}) });
-      const list = append ? (nextView === 'recent' ? recent : trash) : [];
-      if (nextView === 'recent') setRecent([...list, ...result.items]);
-      else setTrash([...list, ...result.items]);
+      if (nextView === 'recent') setRecent([...(append ? recent : []), ...(result.items as ObjectListItem[])]);
+      else setTrash([...(append ? trash : []), ...(result.items as TrashItem[])]);
       setSpecialCursor(result.nextCursor);
     } catch (error) {
       setLoadError(message(error));
@@ -393,6 +406,7 @@ export default function Page() {
     action: 'rename' | 'move' | 'delete' | 'restore' | 'purge',
     id: string,
     currentName?: string,
+    trashItem?: TrashItem,
   ) {
     setMutationError('');
     setMenuId(null);
@@ -418,17 +432,17 @@ export default function Page() {
         }
       } else if (kind === 'folder') {
         if (action === 'delete') await api.softDeleteFolder(id);
-        if (action === 'restore') await api.restoreFolder(id);
+        if (action === 'restore') await (trashItem ? restoreTrashItem(api, trashItem) : api.restoreFolder(id));
         if (action === 'purge') {
           if (!window.confirm('Hapus folder permanen dari metadata? Blob channel tidak ikut dihapus.')) return;
-          await api.permanentDeleteFolder(id);
+          await (trashItem ? permanentlyDeleteTrashItem(api, trashItem) : api.permanentDeleteFolder(id));
         }
       } else {
         if (action === 'delete') await api.softDeleteObject(id);
-        if (action === 'restore') await api.restoreObject(id);
+        if (action === 'restore') await (trashItem ? restoreTrashItem(api, trashItem) : api.restoreObject(id));
         if (action === 'purge') {
           if (!window.confirm('Hapus file permanen dari metadata? Blob channel tidak ikut dihapus.')) return;
-          await api.permanentDeleteObject(id);
+          await (trashItem ? permanentlyDeleteTrashItem(api, trashItem) : api.permanentDeleteObject(id));
         }
       }
       if (view === 'drive' && workspace) await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
@@ -572,30 +586,25 @@ export default function Page() {
     }
   }
   async function logout() {
-    await api.logout().catch(() => undefined);
-    setUser(null);
-    setWorkspace(null);
-    setFolder(null);
+    if (logoutBusy) return;
+    setLogoutBusy(true);
+    setLogoutError('');
+    await logoutAfterSuccess(
+      api,
+      () => {
+        setUser(null);
+        setWorkspace(null);
+        setFolder(null);
+      },
+      () => setLogoutError(''),
+      (error) => setLogoutError(message(error)),
+    );
+    setLogoutBusy(false);
   }
 
   if (!sessionReady) return <SessionRestore />;
   if (sessionRestoreError && !user) return <SessionRestore error={sessionRestoreError} onRetry={restoreSession} />;
-  if (!user)
-    return (
-      <AuthScreen
-        busy={authBusy}
-        error={authError}
-        onBusy={setAuthBusy}
-        onError={setAuthError}
-        onSuccess={async (nextUser) => {
-          await enterApp(nextUser);
-          setSessionReady(true);
-        }}
-        googleBusy={googleBusy}
-        googleError={googleError}
-        onGoogle={() => openGoogle('login')}
-      />
-    );
+  if (!user) return <AuthScreen telegramBusy={telegramBusy} telegramError={telegramError} onTelegram={openTelegram} />;
   const items = (folder?.items ?? [])
     .filter((item) => item.name.toLowerCase().includes(query.toLowerCase()))
     .sort((a, b) =>
@@ -693,9 +702,12 @@ export default function Page() {
             poolError={poolError}
             onRefreshPool={probePool}
             onLogout={logout}
-            googleBusy={googleBusy}
-            googleError={googleError}
-            onGoogleLink={() => openGoogle('link')}
+            logoutBusy={logoutBusy}
+            logoutError={logoutError}
+            workspace={workspace}
+            userId={user.id}
+            workspaces={workspaces}
+            onWorkspaceChange={(id) => void enterApp(user, id)}
           />
         ) : view !== 'drive' ? (
           <SpecialView
@@ -1071,44 +1083,31 @@ function MoveDialog({
 }
 
 function AuthScreen({
-  busy,
-  error,
-  onBusy,
-  onError,
-  onSuccess,
-  onGoogle,
-  googleBusy,
-  googleError,
+  onTelegram,
+  telegramBusy,
+  telegramError,
 }: {
-  busy: boolean;
-  error: string;
-  onBusy: (v: boolean) => void;
-  onError: (v: string) => void;
-  onSuccess: (u: { displayName: string; username: string }) => void;
-  onGoogle: () => Promise<void>;
-  googleBusy: boolean;
-  googleError: string;
+  onTelegram: (mode: 'login' | 'register', secretInfo?: string) => Promise<void>;
+  telegramBusy: boolean;
+  telegramError: string;
 }) {
   const [register, setRegister] = useState(false);
-  const [username, setUsername] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [bootstrap, setBootstrap] = useState('');
-  async function submit() {
-    if (!username.trim() || (register && !displayName.trim())) return;
-    onBusy(true);
-    onError('');
-    const token = bootstrap;
-    setBootstrap('');
-    try {
-      const result = register
-        ? await registerPasskey(username.trim(), displayName.trim(), token || undefined)
-        : await authenticatePasskey(username.trim());
-      onSuccess(result.user);
-    } catch (e) {
-      onError(message(e));
-    } finally {
-      onBusy(false);
+  const secretInfoRef = useRef<HTMLInputElement>(null);
+  const [secretInfoValid, setSecretInfoValid] = useState(false);
+  async function submitTelegram() {
+    const input = secretInfoRef.current;
+    if (register) {
+      if (!input?.checkValidity()) {
+        input?.reportValidity();
+        return;
+      }
+      const value = input.value;
+      input.value = '';
+      setSecretInfoValid(false);
+      await onTelegram('register', value);
+      return;
     }
+    await onTelegram('login');
   }
   return (
     <main className={styles.authPage}>
@@ -1121,71 +1120,56 @@ function AuthScreen({
         </div>
         <div className={styles.eyebrow}>DRIVE PRIBADI</div>
         <h1>{register ? 'Mulai ruangmu.' : 'Selamat datang kembali.'}</h1>
-        <p className={styles.authIntro}>File rapi, sesi tetap di perangkatmu. Masuk dengan passkey tanpa password.</p>
-        {register && (
-          <label className={styles.field}>
-            Nama tampilan
-            <input
-              autoFocus
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Contoh: Andi Rahman"
-            />
-          </label>
-        )}
-        <label className={styles.field}>
-          Username
-          <input
-            autoFocus={!register}
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="andi"
-            autoComplete="username"
-          />
-        </label>
-        {register && (
-          <label className={styles.field}>
-            Bootstrap token <span className={styles.fieldHint}>sekali pakai</span>
-            <input
-              value={bootstrap}
-              onChange={(e) => setBootstrap(e.target.value)}
-              autoComplete="off"
-              placeholder="Dari administrator"
-            />
-          </label>
-        )}{' '}
-        {error && (
+        <p className={styles.authIntro}>
+          {register ? 'Buat akun baru dengan Telegram.' : 'Masuk ke ruang pribadimu dengan Telegram.'}
+        </p>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitTelegram();
+          }}
+        >
+          {register && (
+            <label className={styles.field}>
+              Secret info <span className={styles.fieldHint}>wajib</span>
+              <input
+                autoFocus
+                id="secret-info"
+                name="secret-info"
+                ref={secretInfoRef}
+                type="password"
+                autoComplete="off"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                required
+                onInput={() => setSecretInfoValid(secretInfoRef.current?.checkValidity() ?? false)}
+                placeholder="Masukkan secret info"
+              />
+            </label>
+          )}
+          <button className={styles.telegramButton} type="submit" disabled={telegramBusy || (register && !secretInfoValid)}>
+            {telegramBusy ? 'Membuka Telegram…' : register ? 'Daftar dengan Telegram' : 'Masuk dengan Telegram'}
+          </button>
+        </form>
+        {telegramError && (
           <div className={styles.formError} role="alert">
-            <Icon name="info" size={16} />
-            {error}
+            {telegramError}
           </div>
         )}
-        <button className={styles.primaryButton} disabled={busy} onClick={submit}>
-          {busy ? 'Menyiapkan passkey…' : register ? 'Daftar dengan passkey' : 'Masuk dengan passkey'}
-        </button>
-        {googleError && (
-          <div className={styles.formError} role="alert">
-            {googleError}
-          </div>
-        )}
-        <button className={styles.googleButton} disabled={busy || googleBusy} onClick={() => void onGoogle()}>
-          {googleBusy ? 'Membuka Google…' : 'Masuk dengan Google'}
-        </button>
         <p className={styles.authSwitch}>
           {register ? 'Sudah punya akun?' : 'Belum punya akun?'}{' '}
           <button
             onClick={() => {
               setRegister(!register);
-              onError('');
-              setBootstrap('');
+              if (secretInfoRef.current) secretInfoRef.current.value = '';
+              setSecretInfoValid(false);
             }}
           >
             {register ? 'Masuk' : 'Daftar'}
           </button>
         </p>
-        <small className={styles.secureNote}>
-          Google dan passkey mengautentikasi akun Ruang, bukan kredensial bot.
-        </small>
+        <small className={styles.secureNote}>Telegram mengautentikasi akun Ruang. Ruang tidak meminta nomor, OTP, atau 2FA.</small>
       </div>
     </main>
   );
@@ -1227,6 +1211,7 @@ function FileRow({
     action: 'rename' | 'move' | 'delete' | 'restore' | 'purge',
     id: string,
     name?: string,
+    trashItem?: TrashItem,
   ) => void;
   menuId: string | null;
   setMenuId: (id: string | null) => void;
@@ -1573,7 +1558,7 @@ function SpecialView({
   onMove,
 }: {
   title: string;
-  items: ObjectListItem[];
+  items: (ObjectListItem | TrashItem)[];
   loading: boolean;
   error: string;
   cursor: string | null;
@@ -1584,6 +1569,7 @@ function SpecialView({
     action: 'rename' | 'move' | 'delete' | 'restore' | 'purge',
     id: string,
     name?: string,
+    trashItem?: TrashItem,
   ) => void;
   menuId: string | null;
   setMenuId: (id: string | null) => void;
@@ -1606,7 +1592,7 @@ function SpecialView({
           <h1>{title}</h1>
           <p className={styles.subtle}>
             {trashView
-              ? 'File dihapus dari Drive. Retensi dan status berasal dari server.'
+              ? 'Item dihapus dari Drive. Retensi dan status berasal dari server.'
               : 'File yang baru diubah atau diunggah.'}
           </p>
         </div>
@@ -1666,13 +1652,14 @@ function ObjectRow({
   onToggleSelection,
   onMove,
 }: {
-  item: ObjectListItem;
+  item: ObjectListItem | TrashItem;
   trash: boolean;
   onMutate: (
     kind: 'folder' | 'object',
     action: 'rename' | 'move' | 'delete' | 'restore' | 'purge',
     id: string,
     name?: string,
+    trashItem?: TrashItem,
   ) => void;
   menuId: string | null;
   setMenuId: (id: string | null) => void;
@@ -1683,7 +1670,13 @@ function ObjectRow({
   onToggleSelection: (entry: SelectedEntry) => void;
   onMove: (entries?: SelectedEntry[]) => void;
 }) {
-  const downloadable = { id: item.id, name: item.name, mime: item.mime, size: item.size };
+  const folder = trash && 'type' in item && item.type === 'folder';
+  const trashItem = item as TrashItem;
+  const object = item as ObjectListItem | Extract<TrashItem, { type: 'object' }>;
+  const downloadable = !folder
+    ? { id: object.id, name: object.name, mime: object.mime ?? 'application/octet-stream', size: object.size }
+    : null;
+  const deletedAt = trash && 'deletedAt' in item ? item.deletedAt : undefined;
   return (
     <article className={styles.fileRow}>
       {!trash && (
@@ -1691,22 +1684,21 @@ function ObjectRow({
           className={styles.selectionCheckbox}
           type="checkbox"
           checked={Boolean(selected[item.id])}
-          onChange={() => onToggleSelection({ id: item.id, kind: 'object', name: item.name })}
+          onChange={() => onToggleSelection({ id: item.id, kind: folder ? 'folder' : 'object', name: item.name })}
           aria-label={`Pilih ${item.name}`}
         />
       )}
-      <span className={`${styles.fileIcon} ${mimeStyle(item.mime)}`}>
-        <b>{item.mime.split('/')[1]?.slice(0, 4).toUpperCase() || 'FILE'}</b>
+      <span className={`${styles.fileIcon} ${folder ? styles.folderIcon : mimeStyle(object.mime)}`}>
+        {folder ? <Icon name="folder" size={18} /> : <b>{object.mime?.split('/')[1]?.slice(0, 4).toUpperCase() || 'FILE'}</b>}
       </span>
-      <button className={styles.fileName} onClick={() => onPreview(downloadable)}>
+      <button className={styles.fileName} disabled={folder} onClick={() => downloadable && onPreview(downloadable)}>
         <b>{item.name}</b>
         <small>
-          {formatSize(item.size)} ·{' '}
-          {trash && item.deletedAt ? 'Dihapus ' + new Date(item.deletedAt).toLocaleDateString('id-ID') : 'File'}
+          {folder ? 'Folder' : formatSize(object.size)} · {deletedAt ? 'Dihapus ' + new Date(deletedAt).toLocaleDateString('id-ID') : 'File'}
         </small>
       </button>
       <span className={styles.fileDate}>
-        {formatDate(...(trash ? [item.deletedAt, item.updatedAt, item.createdAt] : [item.updatedAt, item.createdAt]))}
+        {formatDate(...(trash ? [deletedAt, item.updatedAt, item.createdAt] : [item.updatedAt, item.createdAt]))}
       </span>
       <span className={styles.rowMenuWrap} data-file-menu>
         <button
@@ -1720,54 +1712,57 @@ function ObjectRow({
         {menuId === item.id && (
           <div className={styles.rowMenuPopup} role="menu">
             {trash ? (
-                <>
-                  <button role="menuitem" onClick={() => onMutate('object', 'restore', item.id, item.name)}>
-                    Pulihkan
-                  </button>
-                  <button
-                    role="menuitem"
-                    className={styles.dangerAction}
-                    onClick={() => onMutate('object', 'purge', item.id, item.name)}
-                  >
-                    Hapus metadata permanen
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      setMenuId(null);
-                      onDownload(downloadable);
-                    }}
-                  >
-                    {download?.error
-                      ? 'Coba lagi'
-                      : download?.done
-                        ? 'Selesai'
-                        : download?.progress?.totalBytes
-                          ? `Unduh ${Math.round((download.progress.bytesDownloaded / download.progress.totalBytes) * 100)}%`
-                          : 'Unduh file'}
-                  </button>
-                  {download?.error && <small className={styles.downloadError}>{download.error}</small>}
-                  <button role="menuitem" onClick={() => onMutate('object', 'rename', item.id, item.name)}>
-                    Ganti nama
-                  </button>
-                  <button role="menuitem" onClick={() => onMove([{ id: item.id, kind: 'object', name: item.name }])}>
-                    Pindahkan ke
-                  </button>
-                  <button
-                    role="menuitem"
-                    className={styles.dangerAction}
-                    onClick={() => onMutate('object', 'delete', item.id, item.name)}
-                  >
-                    Pindahkan ke sampah
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-        </span>
+              <>
+                <button role="menuitem" onClick={() => onMutate(folder ? 'folder' : 'object', 'restore', item.id, item.name, trashItem)}>
+                  Pulihkan
+                </button>
+                {trashActionAvailability(trashItem).permanentlyDelete && <button
+                  role="menuitem"
+                  className={styles.dangerAction}
+                  onClick={() => onMutate(folder ? 'folder' : 'object', 'purge', item.id, item.name, trashItem)}
+                >
+                  Hapus metadata permanen
+                </button>}
+                {!trashActionAvailability(trashItem).permanentlyDelete && (
+                  <small className={styles.downloadError}>Penghapusan permanen tidak tersedia untuk akun ini.</small>
+                )}
+              </>
+            ) : (
+              <>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setMenuId(null);
+                    if (downloadable) onDownload(downloadable);
+                  }}
+                >
+                  {download?.error
+                    ? 'Coba lagi'
+                    : download?.done
+                      ? 'Selesai'
+                      : download?.progress?.totalBytes
+                        ? `Unduh ${Math.round((download.progress.bytesDownloaded / download.progress.totalBytes) * 100)}%`
+                        : 'Unduh file'}
+                </button>
+                {download?.error && <small className={styles.downloadError}>{download.error}</small>}
+                <button role="menuitem" onClick={() => onMutate('object', 'rename', item.id, item.name)}>
+                  Ganti nama
+                </button>
+                <button role="menuitem" onClick={() => onMove([{ id: item.id, kind: 'object', name: item.name }])}>
+                  Pindahkan ke
+                </button>
+                <button
+                  role="menuitem"
+                  className={styles.dangerAction}
+                  onClick={() => onMutate('object', 'delete', item.id, item.name)}
+                >
+                  Pindahkan ke sampah
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </span>
     </article>
   );
 }
@@ -1907,20 +1902,29 @@ function Settings({
   poolError,
   onRefreshPool,
   onLogout,
-  onGoogleLink,
-  googleBusy,
-  googleError,
+  logoutBusy,
+  logoutError,
+  workspace,
+  userId,
+  workspaces,
+  onWorkspaceChange,
 }: {
   settings: React.MutableRefObject<{ chunkSize: number }>;
   pool: StoragePoolResponse | null;
   poolError: string;
   onRefreshPool: () => Promise<void>;
   onLogout: () => Promise<void>;
-  onGoogleLink: () => Promise<void>;
-  googleBusy: boolean;
-  googleError: string;
+  logoutBusy: boolean;
+  logoutError: string;
+  workspace: WorkspaceResponse | null;
+  userId: string;
+  workspaces: WorkspaceSummary[];
+  onWorkspaceChange: (id: string) => void;
 }) {
   const [error, setError] = useState('');
+  const [memberId, setMemberId] = useState('');
+  const [memberBusy, setMemberBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [probing, setProbing] = useState(true);
   useEffect(() => {
     setProbing(true);
@@ -1929,7 +1933,7 @@ function Settings({
   async function exportData() {
     setError('');
     try {
-      const data = await api.exportWorkspace();
+      const data = await api.exportWorkspace(workspace?.workspace.id);
       const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
       const link = document.createElement('a');
       link.href = url;
@@ -1940,11 +1944,33 @@ function Settings({
       setError(message(e));
     }
   }
+  async function addMember() {
+    if (!workspace || !memberId.trim()) return;
+    setMemberBusy(true); setError('');
+    try {
+      await api.addWorkspaceMember(workspace.workspace.id, memberId.trim());
+      setMemberId('');
+      await onWorkspaceChange(workspace.workspace.id);
+    } catch (e) { setError(message(e)); } finally { setMemberBusy(false); }
+  }
+  async function removeMember(id: string) {
+    if (!workspace || !window.confirm('Hapus anggota ini dari workspace?')) return;
+    setMemberBusy(true); setError('');
+    try { await api.removeWorkspaceMember(workspace.workspace.id, id); await onWorkspaceChange(workspace.workspace.id); }
+    catch (e) { setError(message(e)); } finally { setMemberBusy(false); }
+  }
   return (
     <div className={styles.settings}>
       <div className={styles.eyebrow}>PREFERENSI</div>
       <h1>Pengaturan</h1>
       <p className={styles.subtle}>Koneksi, upload, dan data lokal perangkat ini.</p>
+      <section className={styles.settingsCard}>
+        <div className={styles.settingTitle}><div><h2>Workspace</h2><p>Pilih ruang yang dapat kamu akses.</p></div></div>
+        <select aria-label="Pilih workspace" value={workspace?.workspace.id ?? ''} onChange={(e) => onWorkspaceChange(e.target.value)}>
+          {workspaces.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.isOwner ? 'Owner' : 'Member'}</option>)}
+        </select>
+        {workspace && <p className={styles.disclaimer}>{workspace.workspace.isOwner ? 'Kamu owner dan dapat mengelola anggota.' : 'Kamu member · konten bersama dapat dibaca dan dikelola sesuai akses workspace.'}</p>}
+      </section>
       <section className={styles.settingsCard}>
         <div className={styles.settingTitle}>
           <span className={styles.telegramMark}>✦</span>
@@ -1961,7 +1987,15 @@ function Settings({
             </p>
           </div>
           <span className={styles.statusTag}>
-            {probing ? 'Memeriksa' : poolError ? 'Gagal' : pool?.ready ? 'Siap' : pool ? 'Belum siap' : 'Tidak diketahui'}
+            {probing
+              ? 'Memeriksa'
+              : poolError
+                ? 'Gagal'
+                : pool?.ready
+                  ? 'Siap'
+                  : pool
+                    ? 'Belum siap'
+                    : 'Tidak diketahui'}
           </span>
         </div>
         <div className={styles.settingLine}>
@@ -1996,12 +2030,15 @@ function Settings({
         <p className={styles.disclaimer}>
           Bot dikelola oleh administrator. Storage pool menyediakan upload dan download otomatis untuk semua pengguna.
         </p>
-        {googleError && (
-          <div className={styles.formError} role="alert">
-            {googleError}
-          </div>
-        )}
       </section>
+      {workspace && <section className={styles.settingsCard}>
+        <div className={styles.settingTitle}><div><h2>Anggota</h2><p>Workspace ID pengguna Teledrive tidak berubah.</p></div><span className={styles.statusTag}>{workspace.workspace.isOwner ? 'Owner' : 'Read-only'}</span></div>
+        <div className={styles.memberId}><code>{userId}</code><button className={styles.textButton} onClick={() => { void navigator.clipboard?.writeText(userId); setCopied(true); setTimeout(() => setCopied(false), 1600); }}>{copied ? 'Tersalin' : 'Salin ID'}</button></div>
+        {workspace.workspace.isOwner && <form className={styles.memberAdd} onSubmit={(e) => { e.preventDefault(); void addMember(); }}><input aria-label="ID pengguna anggota" value={memberId} onChange={(e) => setMemberId(e.target.value)} placeholder="Tempel ID pengguna" /><button className={styles.primaryButton} disabled={memberBusy || !memberId.trim()}>{memberBusy ? 'Menambahkan…' : 'Tambah anggota'}</button></form>}
+        <div className={styles.memberList} aria-live="polite">
+          {workspace.workspace.members.length ? workspace.workspace.members.map((member) => <div className={styles.memberRow} key={member.userId}><span><code>{member.userId}</code><small>{member.role === 'owner' ? 'Owner' : 'Member'}</small></span>{workspace.workspace.isOwner && member.role === 'member' && <button className={styles.textButton} disabled={memberBusy} onClick={() => void removeMember(member.userId)}>Hapus</button>}</div>) : <p className={styles.disclaimer}>Belum ada member.</p>}
+        </div>
+      </section>}
       <section className={styles.settingsCard}>
         <h2>Upload</h2>
         <div className={styles.settingLine}>
@@ -2026,14 +2063,12 @@ function Settings({
           sekaligus.
         </p>
         <div className={styles.flowButtons}>
-          <button className={styles.secondaryButton} disabled={googleBusy} onClick={() => void onGoogleLink()}>
-            {googleBusy ? 'Membuka Google…' : 'Hubungkan Google'}
-          </button>
           <button className={styles.textButton} onClick={exportData}>
             Ekspor metadata JSON <Icon name="download" size={16} />
           </button>
-          <button className={styles.textButton} onClick={onLogout}>
-            Keluar dari Ruang
+          {logoutError && <div className={styles.formError} role="alert"><Icon name="info" size={16} />{logoutError}</div>}
+          <button className={styles.textButton} disabled={logoutBusy} onClick={() => void onLogout()}>
+            {logoutBusy ? 'Keluar…' : 'Keluar dari Ruang'}
           </button>
         </div>
       </section>

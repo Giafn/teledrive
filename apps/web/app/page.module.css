@@ -1093,6 +1093,25 @@
   padding: 38px;
   box-shadow: 0 24px 70px #1d3a2a12;
 }
+.telegramButton {
+  width: 100%;
+  border: 0;
+  background: #229ed9;
+  color: #fff;
+  border-radius: 9px;
+  height: 45px;
+  font-weight: 800;
+  transition: transform .2s, background .2s;
+}
+.telegramButton:hover { background: #168bc3; transform: translateY(-1px); }
+.memberId, .memberAdd, .memberRow { display: flex; align-items: center; gap: 10px; }
+.memberId, .memberRow { justify-content: space-between; padding: 11px 0; border-top: 1px solid var(--line); }
+.memberId code, .memberRow code { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.memberAdd { margin: 15px 0; }
+.memberAdd input { flex: 1; min-width: 0; height: 40px; border: 1px solid var(--line); border-radius: 8px; padding: 0 11px; }
+.memberAdd .primaryButton { padding: 0 14px; white-space: nowrap; }
+.memberRow span { min-width: 0; }
+.memberRow small { display: block; color: #87948b; margin-top: 4px; font-size: 10px; }
 .authCard .brand {
   padding: 0;
   margin-bottom: 55px;
@@ -1161,17 +1180,6 @@
   text-align: center;
   color: #a1aaa3;
   font-size: 9px;
-}
-.googleButton {
-  width: 100%;
-  min-height: 44px;
-  margin-top: 10px;
-  border: 1px solid #d9e0d6;
-  border-radius: 8px;
-  background: #fff;
-  color: var(--ink);
-  font-size: 12px;
-  font-weight: 700;
 }
 .formError {
   display: flex;

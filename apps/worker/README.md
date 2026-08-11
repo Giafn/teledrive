@@ -1,6 +1,6 @@
 # Teledrive metadata Worker
 
-Cloudflare Worker API for passkey/Google authentication, D1 metadata, upload manifests, and per-user Telegram Bot API onboarding. Legacy metadata/MTProto routes never receive file bytes; Phase 2 Bot API part routes stream raw bytes through Worker to Telegram. Worker never receives Telegram MTProto auth keys, OTPs, phone numbers, or 2FA passwords.
+Cloudflare Worker API for Google and Telegram OIDC authentication, D1 metadata, upload manifests, and per-user Telegram Bot API onboarding. Legacy metadata/MTProto routes never receive file bytes; Phase 2 Bot API part routes stream raw bytes through Worker to Telegram. Worker never receives Telegram MTProto auth keys, OTPs, phone numbers, or 2FA passwords.
 
 ## Local checks
 
@@ -12,7 +12,7 @@ npm run typecheck
 npm run build
 ```
 
-Runtime dependencies are Hono, `@simplewebauthn/server@13.3.2`, and `jose`. Vitest and TypeScript are development-only.
+Runtime dependencies are Hono and `jose`. Vitest and TypeScript are development-only.
 
 ## D1 and deploy
 
@@ -29,21 +29,23 @@ Runtime dependencies are Hono, `@simplewebauthn/server@13.3.2`, and `jose`. Vite
    npx wrangler d1 migrations apply teledrive --remote
    ```
 
-   Apply migrations in order, including `0002_oracle_audit_fixes.sql`, `0003_multiuser_google_bot.sql`, `0004_bot_transfer.sql`, `0005_bot_part_attempts.sql`, `0006_bot_part_attempt_leases.sql`, and `0007_bot_part_attempt_generations.sql`, before serving traffic.
+   Apply migrations in order, including `0002_oracle_audit_fixes.sql`, `0003_multiuser_google_bot.sql`, `0004_bot_transfer.sql`, `0005_bot_part_attempts.sql`, `0006_bot_part_attempt_leases.sql`, `0007_bot_part_attempt_generations.sql`, `0010_google_oauth_register_mode.sql`, `0011_telegram_oidc_provider.sql`, and `0012_workspace_members.sql`, before serving traffic.
 
 3. Set non-secret vars in Wrangler environments:
-   `APP_ORIGIN` (exact frontend origin), `RP_ID` (WebAuthn host), `RP_NAME`, `GOOGLE_CLIENT_ID`, `GOOGLE_CALLBACK_URL`, `TELEGRAM_BOT_TOKENS`, dan `TELEGRAM_SHARED_CHANNEL`. Register exact HTTPS `GOOGLE_CALLBACK_URL` in Google Cloud.
+   `APP_ORIGIN` (exact frontend origin), `GOOGLE_CLIENT_ID`, `GOOGLE_CALLBACK_URL`, `TELEGRAM_LOGIN_CLIENT_ID`, `TELEGRAM_LOGIN_CALLBACK_URL`, dan `TELEGRAM_SHARED_CHANNEL`. Register exact HTTPS callback URIs with Google and BotFather.
 
 4. Store secrets. Never put values in source or logs:
 
    ```sh
-   npx wrangler secret put BOOTSTRAP_TOKEN
    npx wrangler secret put APP_SESSION_SECRET
    npx wrangler secret put TELEGRAM_BOT_TOKENS
    npx wrangler secret put GOOGLE_CLIENT_SECRET
+   npx wrangler secret put GOOGLE_REGISTRATION_SECRET
+   npx wrangler secret put TELEGRAM_LOGIN_CLIENT_SECRET
+   npx wrangler secret put TELEGRAM_REGISTRATION_SECRET
    ```
 
-   `TELEGRAM_BOT_TOKENS` must be comma-separated `botId:token` pairs (e.g., `123:AAAA,456:BBBB`). All bots must be administrators of the channel specified by `TELEGRAM_SHARED_CHANNEL` (`@username` or numeric id). Worker lazily resolves channel id via `getChat` and caches in D1.
+   `GOOGLE_REGISTRATION_SECRET` and `TELEGRAM_REGISTRATION_SECRET` gate provider-specific account registration. Configure them only as Worker secrets; never add them to Vercel or browser environment variables. `TELEGRAM_LOGIN_CLIENT_SECRET` is used only for server-side Telegram OIDC token exchange. Telegram discovery is `https://oauth.telegram.org/.well-known/openid-configuration`, authorization is `https://oauth.telegram.org/auth`, token exchange is `https://oauth.telegram.org/token`, and JWKS is `https://oauth.telegram.org/.well-known/jwks.json`. `TELEGRAM_BOT_TOKENS` must be comma-separated `botId:token` pairs (e.g., `123:AAAA,456:BBBB`). All bots must be administrators of the channel specified by `TELEGRAM_SHARED_CHANNEL` (`@username` or numeric id). Worker lazily resolves channel id via `getChat` and caches in D1.
 
 5. Deploy:
 
@@ -51,7 +53,7 @@ Runtime dependencies are Hono, `@simplewebauthn/server@13.3.2`, and `jose`. Vite
    npx wrangler deploy
    ```
 
-The browser first calls `GET /v1/auth/csrf`, sends its returned token as `X-CSRF-Token`, and uses credentials for the session cookie. Mutations require exact `Origin: APP_ORIGIN`; webhook requests use Telegram's configured per-bot secret header instead. Google authorization uses a short-lived host-only `__Host-` state cookie plus D1 transaction. If API uses custom domain separate from frontend, keep it same-site (same registrable site) so `SameSite=Lax` cookie behavior remains predictable; CORS still requires exact `APP_ORIGIN`.
+The browser first calls `GET /v1/auth/csrf`, sends its returned token as `X-CSRF-Token`, and uses credentials for the session cookie. Mutations require exact `Origin: APP_ORIGIN`; webhook requests use Telegram's configured per-bot secret header instead. Google and Telegram authorization use short-lived host-only `__Host-` state cookies plus D1 transactions; Telegram uses authorization-code PKCE S256, nonce, and server-side Basic-auth token exchange. If API uses custom domain separate from frontend, keep it same-site (same registrable site) so `SameSite=Lax` cookie behavior remains predictable; CORS still requires exact `APP_ORIGIN`.
 
 ## API boundaries
 
@@ -65,6 +67,6 @@ Phase 2 transfer routes use `POST /v1/bot/uploads` for metadata and `PUT /v1/bot
 
 Object permanent deletion is metadata-only: it is allowed only after soft delete and removes D1 object/part rows. Worker does not call Telegram to delete media, so Telegram messages can remain orphaned. Folder permanent deletion also requires soft delete and no child metadata.
 
-Sessions contain only HMAC hashes of opaque random cookies. Passkey challenges are short-lived and single-use. Passkey public keys and counters are stored in D1.
+Sessions contain only HMAC hashes of opaque random cookies.
 
 Authentication rate control uses D1 windows keyed by HMAC(`CF-Connecting-IP`, `APP_SESSION_SECRET`), not raw IP storage. OAuth transactions, stale rate rows, and Telegram replay IDs are opportunistically purged by Worker requests; replay retention is 48 hours.

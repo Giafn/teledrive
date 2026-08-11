@@ -12,6 +12,7 @@ __mocks__
 *.d.ts
 *.tsbuildinfo
 apps/web/out/
+apps/mtproto-spike/out/
 apps/worker/.wrangler/
 apps/worker/package-lock.json
 

@@ -59,6 +59,7 @@ function environment(overrides: { cachedPool?: Record<string, unknown> | null } 
     APP_SESSION_SECRET: secret,
     TELEGRAM_BOT_TOKENS: BOTS,
     TELEGRAM_SHARED_CHANNEL: '@pool',
+    GOOGLE_REGISTRATION_SECRET: 'registration-secret',
   };
   return { env, state };
 }
@@ -138,7 +139,12 @@ describe('shared bot pool', () => {
 
   it('reports network failures as transport failures', async () => {
     const { env } = await environment();
-    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('network details'); }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('network details');
+      }),
+    );
     const response = await app.fetch(new Request('http://worker.test/v1/telegram/pool'), env);
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({
@@ -216,10 +222,20 @@ describe('shared bot pool', () => {
       new Request('http://worker.test/v1/telegram/bot', { method: 'POST', headers, body: '{}' }),
       new Request('http://worker.test/v1/telegram/bot/revoke', { method: 'POST', headers, body: '{}' }),
       new Request('http://worker.test/v1/telegram/bot/reset', { method: 'POST', headers, body: '{}' }),
-      new Request('http://worker.test/v1/telegram/link', { headers: { Cookie: '__Host-td_session=opaque-session-token' } }),
+      new Request('http://worker.test/v1/telegram/link', {
+        headers: { Cookie: '__Host-td_session=opaque-session-token' },
+      }),
       new Request('http://worker.test/v1/telegram/link', { method: 'POST', headers, body: '{}' }),
-      new Request('http://worker.test/v1/webhooks/telegram', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }),
-      new Request('http://worker.test/v1/webhooks/telegram/bot', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }),
+      new Request('http://worker.test/v1/webhooks/telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      }),
+      new Request('http://worker.test/v1/webhooks/telegram/bot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      }),
     ];
     for (const request of legacy) {
       const response = await app.fetch(request, env);

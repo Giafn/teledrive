@@ -40,6 +40,7 @@ describe('DELETE /v1/objects/:id/permanent', () => {
           async first<T>() {
             if (query.includes('FROM sessions')) return session as T;
             if (query.includes('FROM objects')) return object as T;
+            if (query.includes('FROM workspaces')) return { id: 'workspace-1', name: 'My Drive', owner_id: 'user-1', is_owner: 1 } as T;
             throw new Error(`Unexpected first query: ${query}`);
           },
           async all<T>() {
@@ -69,6 +70,7 @@ describe('DELETE /v1/objects/:id/permanent', () => {
       APP_SESSION_SECRET: secret,
       TELEGRAM_BOT_TOKENS: '111:token-one',
       TELEGRAM_SHARED_CHANNEL: '@pool',
+      GOOGLE_REGISTRATION_SECRET: 'registration-secret',
     };
 
     const response = await app.fetch(

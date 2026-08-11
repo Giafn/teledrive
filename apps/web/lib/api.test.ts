@@ -1,5 +1,4 @@
-import type { RegistrationResponseJSON } from '@simplewebauthn/browser';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ApiError, MetadataApiClient } from './api';
 
 function json(body: unknown, status = 200): Response {
@@ -174,35 +173,160 @@ describe('MetadataApiClient object and listing methods', () => {
     expect(JSON.parse(String(calls[1].init.body))).toEqual({ name: 'Renamed', parentId: null });
   });
 
-  it('forwards bootstrap token to both registration requests, but omits it for active sessions', async () => {
-    const calls: Array<{ path: string; headers: Headers }> = [];
-    const makeClient = () =>
-      new MetadataApiClient({
+  it('sends Telegram mode and optional registration secret in POST JSON with cookies and CSRF', async () => {
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const client = new MetadataApiClient({
+      baseUrl: 'https://api.example.test',
+      fetch: async (input, init = {}) => {
+        calls.push({ path: new URL(String(input)).pathname, init });
+        if (new URL(String(input)).pathname === '/v1/auth/csrf') return json({ csrfToken: 'csrf-token' });
+        return json({ authorizationUrl: 'https://oauth.telegram.org/auth' });
+      },
+    });
+
+    await expect(client.telegramAuthorizationUrl('register', 'secret-info')).resolves.toBe(
+      'https://oauth.telegram.org/auth',
+    );
+
+    expect(calls.map(({ path }) => path)).toEqual(['/v1/auth/csrf', '/v1/auth/telegram/start']);
+    const request = calls[1].init;
+    expect(request.method).toBe('POST');
+    expect(request.credentials).toBe('include');
+    expect(new Headers(request.headers).get('X-CSRF-Token')).toBe('csrf-token');
+    expect(new Headers(request.headers).get('Content-Type')).toBe('application/json');
+    expect(JSON.parse(String(request.body))).toEqual({ mode: 'register', secretInfo: 'secret-info' });
+  });
+
+  it('selects workspaces and uses owner membership routes', async () => {
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const client = new MetadataApiClient({
+      baseUrl: 'https://api.example.test',
+      fetch: async (input, init = {}) => {
+        const path = new URL(String(input)).pathname;
+        calls.push({ path, init });
+        if (path === '/v1/auth/csrf') return json({ csrfToken: 'csrf-token' });
+        if (path === '/v1/workspaces') return json({ workspaces: [] });
+        if (init.method === 'POST') return json({ workspaceId: 'w-1', member: { userId: 'u-1', role: 'member' } });
+        if (init.method === 'DELETE') return json({ workspaceId: 'w-1', userId: 'u-1', removed: true });
+        return json({ workspaceId: 'w-1', members: [] });
+      },
+    });
+    await expect(client.listWorkspaces()).resolves.toEqual({ workspaces: [] });
+    await client.listWorkspaceMembers('w-1');
+    await client.addWorkspaceMember('w-1', 'u-1');
+    await client.removeWorkspaceMember('w-1', 'u-1');
+    expect(calls.map(({ path }) => path)).toEqual([
+      '/v1/workspaces', '/v1/workspaces/w-1/members', '/v1/auth/csrf',
+      '/v1/workspaces/w-1/members', '/v1/workspaces/w-1/members/u-1',
+    ]);
+  });
+
+  it('routes workspace export through workspaceId query', async () => {
+    let requested = '';
+    const client = new MetadataApiClient({
+      baseUrl: 'https://api.example.test',
+      fetch: async (input) => {
+        requested = String(input);
+        return json({ exportedAt: '2099-01-01', workspace: { id: 'w-2', name: 'Shared' }, folders: [], objects: [], parts: [] });
+      },
+    });
+    await expect(client.exportWorkspace('w/2')).resolves.toMatchObject({ workspace: { id: 'w-2' } });
+    expect(new URL(requested).pathname).toBe('/v1/export');
+    expect(new URL(requested).search).toBe('?workspaceId=w%2F2');
+  });
+
+  it('forwards upload AbortSignal to fetch fallback', async () => {
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const signal = new AbortController().signal;
+    const client = new MetadataApiClient({
+      baseUrl: 'https://api.example.test',
+      fetch: async (input, init = {}) => {
+        calls.push({ path: new URL(String(input)).pathname, init });
+        if (new URL(String(input)).pathname === '/v1/auth/csrf') return json({ csrfToken: 'csrf-token' });
+        return json({ partNo: 0, size: 1, sha256: 'a'.repeat(64) });
+      },
+    });
+
+    await expect(
+      client.uploadBotPart(
+        'upload-1',
+        0,
+        new Blob([new Uint8Array([1])]),
+        { size: 1, sha256: 'a'.repeat(64), idempotencyKey: 'key-1' },
+        undefined,
+        signal,
+      ),
+    ).resolves.toEqual({ partNo: 0, size: 1, sha256: 'a'.repeat(64) });
+    expect(calls[1].init.signal).toBe(signal);
+  });
+
+  it('aborts active XHR upload and reports request cancellation', async () => {
+    let resolveCreated: (xhr: PendingUploadXhr) => void = () => undefined;
+    const created = new Promise<PendingUploadXhr>((resolve) => {
+      resolveCreated = resolve;
+    });
+    class PendingUploadXhr {
+      readonly upload = { onprogress: null as ((event: { loaded: number }) => void) | null };
+      readonly status = 200;
+      readonly statusText = 'OK';
+      readonly responseText = '';
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      abortCalls = 0;
+
+      constructor() {
+        resolveCreated(this);
+      }
+
+      open(): void {}
+      setRequestHeader(): void {}
+      send(): void {}
+      abort(): void {
+        this.abortCalls += 1;
+        this.onabort?.();
+      }
+      getAllResponseHeaders(): string {
+        return '';
+      }
+    }
+
+    vi.stubGlobal('XMLHttpRequest', PendingUploadXhr);
+    try {
+      const controller = new AbortController();
+      const removeAbortListener = vi.spyOn(controller.signal, 'removeEventListener');
+      let progressCalls = 0;
+      const client = new MetadataApiClient({
         baseUrl: 'https://api.example.test',
-        fetch: async (input, init = {}) => {
-          const url = new URL(String(input));
-          calls.push({ path: url.pathname, headers: new Headers(init.headers) });
-          if (url.pathname === '/v1/auth/csrf') return json({ csrfToken: 'csrf-token' });
-          if (url.pathname.endsWith('/register/options')) return json({ challengeId: 'challenge-1', options: {} });
-          return json({ user: { id: 'user-1', username: 'user', displayName: 'User' }, csrfToken: 'session-csrf' });
-        },
+        fetch: async (input) =>
+          new URL(String(input)).pathname === '/v1/auth/csrf'
+            ? json({ csrfToken: 'csrf-token' })
+            : json({ partNo: 0, size: 1, sha256: 'a'.repeat(64) }),
       });
-    const response = {} as RegistrationResponseJSON;
-
-    const bootstrapClient = makeClient();
-    await bootstrapClient.registerPasskeyOptions('user', 'User', 'bootstrap-token');
-    await bootstrapClient.registerPasskeyVerify('challenge-1', response, 'bootstrap-token');
-    expect(
-      calls.filter(({ path }) => path.includes('/register/')).map(({ headers }) => headers.get('X-Bootstrap-Token')),
-    ).toEqual(['bootstrap-token', 'bootstrap-token']);
-
-    calls.length = 0;
-    const activeClient = makeClient();
-    await activeClient.registerPasskeyOptions('user', 'User');
-    await activeClient.registerPasskeyVerify('challenge-1', response);
-    expect(
-      calls.filter(({ path }) => path.includes('/register/')).every(({ headers }) => !headers.has('X-Bootstrap-Token')),
-    ).toBe(true);
+      const request = client.uploadBotPart(
+        'upload-1',
+        0,
+        new Blob([new Uint8Array([1])]),
+        { size: 1, sha256: 'a'.repeat(64), idempotencyKey: 'key-1' },
+        () => {
+          progressCalls += 1;
+        },
+        controller.signal,
+      );
+      const xhr = await created;
+      controller.abort();
+      await expect(request).rejects.toMatchObject({ code: 'REQUEST_ABORTED', status: 0 });
+      expect(xhr.abortCalls).toBe(1);
+      expect(removeAbortListener).toHaveBeenCalledWith('abort', expect.any(Function));
+      expect(xhr.onload).toBeNull();
+      expect(xhr.onerror).toBeNull();
+      expect(xhr.onabort).toBeNull();
+      expect(xhr.upload.onprogress).toBeNull();
+      xhr.upload.onprogress?.({ loaded: 1 });
+      expect(progressCalls).toBe(0);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('gets current session with cookies and without CSRF', async () => {

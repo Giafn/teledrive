@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import app, { poolBotIndex } from '../src/index';
 import { secretHash } from '../src/security';
 import type { Bindings, D1Database, D1PreparedStatement } from '../src/types';
@@ -8,6 +8,61 @@ const BOTS = '111:token-one,222:token-two';
 const CHANNEL = '@pool';
 const CHANNEL_ID = '-1001';
 const PART_HASH = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
+
+type DigestStreamConstructor = new (algorithm: string) => WritableStream<Uint8Array> & {
+  digest: Promise<ArrayBuffer>;
+};
+
+class TestDigestStream extends WritableStream<Uint8Array> {
+  readonly digest: Promise<ArrayBuffer>;
+
+  constructor(algorithm: string) {
+    if (algorithm !== 'SHA-256') throw new Error(`Unsupported digest algorithm: ${algorithm}`);
+
+    const chunks: Uint8Array[] = [];
+    let resolveDigest!: (digest: ArrayBuffer) => void;
+    let rejectDigest!: (reason?: unknown) => void;
+    const digest = new Promise<ArrayBuffer>((resolve, reject) => {
+      resolveDigest = resolve;
+      rejectDigest = reject;
+    });
+    super({
+      write(chunk) {
+        chunks.push(new Uint8Array(chunk));
+      },
+      async close() {
+        try {
+          const bytes = new Uint8Array(chunks.reduce((size, chunk) => size + chunk.byteLength, 0));
+          let offset = 0;
+          for (const chunk of chunks) {
+            bytes.set(chunk, offset);
+            offset += chunk.byteLength;
+          }
+          resolveDigest(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+        } catch (error) {
+          rejectDigest(error);
+          throw error;
+        }
+      },
+      abort: rejectDigest,
+    });
+    this.digest = digest;
+  }
+}
+
+const cryptoWithDigestStream = globalThis.crypto as typeof globalThis.crypto & {
+  DigestStream?: DigestStreamConstructor;
+};
+const originalDigestStream = cryptoWithDigestStream.DigestStream;
+
+beforeAll(() => {
+  cryptoWithDigestStream.DigestStream = TestDigestStream;
+});
+
+afterAll(() => {
+  if (originalDigestStream) cryptoWithDigestStream.DigestStream = originalDigestStream;
+  else delete cryptoWithDigestStream.DigestStream;
+});
 
 interface State {
   sessionUser: string;
@@ -91,12 +146,15 @@ async function environment(overrides: Partial<State> = {}): Promise<{ env: Bindi
           if (query.includes('FROM bot_part_attempts'))
             return (state.reservationRace && !state.raceReadWinner ? null : state.attempt) as T | null;
           if (query.includes('FROM upload_sessions us')) return state.upload as T | null;
+          if (query.includes('SELECT o.id FROM objects o')) return { id: 'object-1' } as T;
           if (query.includes('FROM objects o')) {
-            const requestedUser = String(values[1] ?? '');
-            if (state.object && state.object.owner_id === requestedUser) return state.object as T;
+            if (state.object && String(values[0]) === state.object.id) return state.object as T;
             return null as T | null;
           }
-          if (query.includes('FROM workspaces')) return { id: 'workspace-1', name: 'My Drive' } as T;
+          if (query.includes('FROM workspaces')) {
+            if (state.object?.owner_id !== state.sessionUser) return null as T | null;
+            return { id: 'workspace-1', name: 'My Drive', owner_id: 'owner-1', is_owner: 1 } as T;
+          }
           if (query.includes('FROM folders'))
             return { id: 'folder-1', parent_id: null, name: 'My Drive', deleted_at: null } as T;
           return null as T | null;
@@ -178,7 +236,7 @@ async function environment(overrides: Partial<State> = {}): Promise<{ env: Bindi
             if (
               state.attempt?.state !== 'sending' ||
               String(state.attempt.send_generation) !== String(values[3]) ||
-              (typeof lease === 'string' && Date.parse(lease) > Date.parse(String(values[4])))
+              (typeof lease === 'string' && /^\d{4}-/u.test(String(values[4])) && Date.parse(lease) > Date.parse(String(values[4])))
             )
               return { success: true, meta: { changes: 0 } };
             state.attempt = {
@@ -264,6 +322,7 @@ async function environment(overrides: Partial<State> = {}): Promise<{ env: Bindi
     APP_SESSION_SECRET: APP_SECRET,
     TELEGRAM_BOT_TOKENS: BOTS,
     TELEGRAM_SHARED_CHANNEL: CHANNEL,
+    GOOGLE_REGISTRATION_SECRET: 'registration-secret',
   };
   return { env, state };
 }
@@ -637,7 +696,11 @@ describe('Bot API data plane (shared pool)', () => {
     expect(status.status).toBe(200);
     expect(await status.json()).toMatchObject({ partNo: 0, status: 'ambiguous' });
 
-    state.attempt = { ...state.attempt!, state: 'sending', sending_lease_until: new Date(Date.now() + 60_000).toISOString() };
+    state.attempt = {
+      ...state.attempt!,
+      state: 'sending',
+      sending_lease_until: new Date(Date.now() + 60_000).toISOString(),
+    };
     const inProgress = await app.fetch(partRequest(0, 'ambiguous-key'), env);
     expect(inProgress.status).toBe(409);
     expect(send).not.toHaveBeenCalled();

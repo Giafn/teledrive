@@ -60,6 +60,33 @@ export interface UploadSessionManifest {
   committedParts: readonly ObjectPartManifest[];
 }
 
+export type WorkspaceMemberRole = 'owner' | 'member';
+
+export interface WorkspaceMember {
+  userId: string;
+  username: string | null;
+  displayName: string | null;
+  status?: 'pending' | 'active' | 'disabled';
+  role: WorkspaceMemberRole;
+  createdAt: string | null;
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  ownerId: string;
+  isOwner: boolean;
+  members: readonly WorkspaceMember[];
+}
+
+export interface WorkspaceListResponse {
+  workspaces: readonly WorkspaceSummary[];
+}
+
+export interface AddWorkspaceMemberRequest {
+  userId: string;
+}
+
 export interface StartUploadRequest {
   name: string;
   size: number;

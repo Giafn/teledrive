@@ -5,7 +5,7 @@ Panduan operasional singkat untuk project saat ini.
 ## Arsitektur dan batasan
 
 - Browser calls authenticated Worker Bot API routes for metadata and streamed file parts.
-- Cloudflare Worker menangani passkey, Google OIDC, opaque session, D1, folder, private/shared authorization, per-user Bot API onboarding, dan Bot API streaming. Worker menerima file bytes only on direct API routes; Vercel never proxies them.
+- Cloudflare Worker menangani Google dan Telegram OIDC, opaque session, D1, folder, private/shared authorization, per-user Bot API onboarding, dan Bot API streaming. Worker menerima file bytes only on direct API routes; Vercel never proxies them.
 - Vercel/Next.js hanya menyajikan frontend. Vercel tidak pernah menjadi proxy byte file.
 - Worker verifies each configured bot token, webhook secret, one-time channel challenge, and bot administrator/post permission before binding.
 - Permanent delete Worker hanya menghapus metadata D1. Media fisik Telegram tidak dihapus; pesan Telegram dapat menjadi orphan.
@@ -16,7 +16,7 @@ Panduan operasional singkat untuk project saat ini.
 - Corepack dan pnpm.
 - Akun Cloudflare dengan Workers dan D1.
 - Project Vercel.
-- Google OAuth client, private channel, dan BotFather bot.
+- Google OAuth client, Telegram OIDC client configured through BotFather, private channel, dan BotFather bot.
 - Domain HTTPS untuk deployment produksi. Frontend dan API sebaiknya same-site, misalnya `drive.example.com` dan `api.example.com`.
 
 ## Local development
@@ -38,13 +38,13 @@ cp .env.example .env.local
 corepack pnpm env:sync
 ```
 
-`env:sync` memakai Node 20 `process.loadEnvFile`, memvalidasi semua variable, lalu membuat file ignored `apps/web/.env.local` dan `apps/worker/.dev.vars`. File generated memiliki header jangan-edit. Rerun `corepack pnpm env:sync` setiap kali root `.env.local` berubah. Jangan membuat symlink.
+`env:sync` memakai Node 20 `process.loadEnvFile`, memvalidasi semua variable, lalu membuat file ignored `apps/web/.env.local` dan `apps/worker/.dev.vars`. File generated memiliki header jangan-edit. Rerun `corepack pnpm env:sync` setiap kali root `.env.local` berubah. Jangan membuat symlink. Telegram OIDC config is additive and optional for local sync; leave all four Telegram OIDC values blank to keep existing Google-only local setup working, or configure all four to enable Telegram registration/login.
 
-`NEXT_PUBLIC_API_URL` adalah nama yang benar; bukan `API_BASE_URL`. `BOOTSTRAP_TOKEN` dalam root `.env.local` tetap tersedia untuk legacy first-passkey bootstrap; ordinary passkey registration tidak membutuhkan token. Local Worker sync juga membutuhkan `TELEGRAM_BOT_TOKENS`, `TELEGRAM_SHARED_CHANNEL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, dan `GOOGLE_CALLBACK_URL`; gunakan placeholder/local secret, jangan pakai production value.
+`NEXT_PUBLIC_API_URL` adalah nama yang benar; bukan `API_BASE_URL`. Local Worker sync juga membutuhkan `TELEGRAM_BOT_TOKENS`, `TELEGRAM_SHARED_CHANNEL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_CALLBACK_URL`, dan `GOOGLE_REGISTRATION_SECRET`; gunakan placeholder/local secret, jangan pakai production value. `TELEGRAM_LOGIN_CLIENT_ID`, `TELEGRAM_LOGIN_CLIENT_SECRET`, `TELEGRAM_LOGIN_CALLBACK_URL`, dan `TELEGRAM_REGISTRATION_SECRET` hanya ditulis ke `apps/worker/.dev.vars`, never generated into `apps/web/.env.local`. Keep client secret and registration secret Worker-only.
 
 ### Worker dan web local
 
-Generated `.dev.vars` memasok `APP_ORIGIN=http://localhost:3000` dan `RP_ID=localhost`; jangan edit `wrangler.toml` untuk local environment. Jalankan migration dan Worker:
+Generated `.dev.vars` memasok `APP_ORIGIN=http://localhost:3000`; jangan edit `wrangler.toml` untuk local environment. Jalankan migration dan Worker:
 
 ```sh
 cd apps/worker
@@ -99,9 +99,9 @@ cd apps/worker
 npx wrangler d1 create teledrive
 ```
 
-Edit `apps/worker/wrangler.toml`: ganti `database_id = "REPLACE_WITH_D1_DATABASE_ID"` dengan ID hasil command. Jika memakai nama database lain, ganti juga `database_name`. Set plaintext Worker variables `APP_ORIGIN`, `RP_ID`, `RP_NAME`, `GOOGLE_CLIENT_ID`, `GOOGLE_CALLBACK_URL`, `TELEGRAM_BOT_TOKENS`, dan `TELEGRAM_SHARED_CHANNEL` di Cloudflare Dashboard atau CI/deployment system, di luar repository. `GOOGLE_CALLBACK_URL` harus sama persis dengan redirect URI Google dan menunjuk ke `/v1/auth/google/callback`. `apps/worker/wrangler.toml` sengaja tidak memiliki `[vars]`, sehingga tidak ada nilai local atau production yang bersaing. Set Worker secrets secara terpisah; secrets tidak boleh dikirim ke Vercel/browser. Root `.env.local` dan `env:sync` hanya untuk local; production tidak boleh memakai satu file bersama karena Worker secrets tidak boleh mencapai Vercel atau browser.
+Edit `apps/worker/wrangler.toml`: ganti `database_id = "REPLACE_WITH_D1_DATABASE_ID"` dengan ID hasil command. Jika memakai nama database lain, ganti juga `database_name`. Set non-secret Worker variables `APP_ORIGIN`, `GOOGLE_CLIENT_ID`, `GOOGLE_CALLBACK_URL`, `TELEGRAM_LOGIN_CLIENT_ID`, `TELEGRAM_LOGIN_CALLBACK_URL`, dan `TELEGRAM_SHARED_CHANNEL` di Cloudflare Dashboard atau CI/deployment system, di luar repository. `GOOGLE_CALLBACK_URL` harus sama persis dengan redirect URI Google dan menunjuk ke `/v1/auth/google/callback`; `TELEGRAM_LOGIN_CALLBACK_URL` harus sama persis dengan HTTPS redirect URI registered in BotFather and point to `/v1/auth/telegram/callback`. `apps/worker/wrangler.toml` sengaja tidak memiliki `[vars]`, sehingga tidak ada nilai local atau production yang bersaing. Set Worker secrets secara terpisah; secrets tidak boleh dikirim ke Vercel/browser. Root `.env.local` and `env:sync` only for local; production must not use one shared file because Worker secrets must never reach Vercel or browser.
 
-Apply eight migrations in order:
+Apply ten migrations in order:
 
 ```sh
 npx wrangler d1 migrations apply teledrive --remote
@@ -110,13 +110,15 @@ npx wrangler d1 migrations apply teledrive --remote
 Set Worker secrets through Wrangler prompts; never commit values:
 
 ```sh
-npx wrangler secret put BOOTSTRAP_TOKEN
 npx wrangler secret put APP_SESSION_SECRET
 npx wrangler secret put TELEGRAM_BOT_TOKENS
 npx wrangler secret put GOOGLE_CLIENT_SECRET
+npx wrangler secret put GOOGLE_REGISTRATION_SECRET
+npx wrangler secret put TELEGRAM_LOGIN_CLIENT_SECRET
+npx wrangler secret put TELEGRAM_REGISTRATION_SECRET
 ```
 
-Google production requires OAuth Client ID, Client Secret, and exact HTTPS callback URL registered in Google Cloud. Worker validates Google ID tokens with RS256 against Google remote JWKS, exact issuer, audience, expiry, nonce, and subject; email is not identity key.
+Google production requires OAuth Client ID, Client Secret, and exact HTTPS callback URL registered in Google Cloud. Telegram production requires BotFather Telegram Login/OIDC Client ID, Worker-only Client Secret, Worker-only registration secret, and exact HTTPS callback URL registered in BotFather. Worker validates provider ID tokens with permitted signatures, pinned issuer, audience, expiry/iat, nonce, and subject; email, username, phone, and display claims are not identity keys. Google and Telegram identities remain provider-separated.
 
 Deploy Worker:
 
@@ -136,19 +138,21 @@ Shared bot pool: admin configures `TELEGRAM_BOT_TOKENS` (comma-separated `botId:
 
 Buat project Vercel dengan **Root Directory** `apps/web`. Gunakan framework Next.js dan build command default/automatic; package script saat ini adalah `next build`. `apps/web/next.config.mjs` menetapkan `output: 'export'`, sehingga hasilnya static export.
 
-Set environment variables Vercel berikut untuk environment deployment:
+Set environment variables Vercel berikut untuk environment deployment. Telegram OIDC variables are Worker-only and must not be copied here:
 
 ```dotenv
 NEXT_PUBLIC_API_URL=https://api.example.com
 ```
 
-Deploy dari Vercel Dashboard atau CLI setelah variable tersimpan. Jangan memasukkan `BOOTSTRAP_TOKEN`, `APP_SESSION_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, bot token, atau secret Worker lain ke variable frontend.
+Deploy dari Vercel Dashboard atau CLI setelah variable tersimpan. Jangan memasukkan `APP_SESSION_SECRET`, `GOOGLE_REGISTRATION_SECRET`, `TELEGRAM_LOGIN_CLIENT_ID`, `TELEGRAM_LOGIN_CLIENT_SECRET`, `TELEGRAM_LOGIN_CALLBACK_URL`, `TELEGRAM_REGISTRATION_SECRET`, `TELEGRAM_WEBHOOK_SECRET`, bot token, atau secret Worker lain ke variable frontend.
 
 ## Troubleshooting
 
 - **Login gagal karena Origin/SameSite:** `APP_ORIGIN` harus sama persis dengan origin frontend, termasuk scheme, host, dan port. Local harus `http://localhost:3000`; production harus `https://drive.example.com`. API custom domain harus same-site agar cookie `SameSite=Lax` dapat bekerja; request frontend tetap harus memakai credentials.
 - **Migration gagal:** jalankan `npx wrangler d1 migrations apply teledrive --local` untuk database lokal atau `--remote` untuk database produksi dari `apps/worker`. Pastikan `database_name` dan `database_id` pada `wrangler.toml` benar.
-- **Google login gagal:** pastikan `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, dan exact `GOOGLE_CALLBACK_URL` production values are configured on Worker; callback URL must match Google Cloud registration.
+- **Google login gagal:** pastikan `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, dan exact `GOOGLE_CALLBACK_URL` production values are configured on Worker; callback URL must match Google Cloud registration. Google registration additionally requires `GOOGLE_REGISTRATION_SECRET` configured as a Worker secret.
+- **Telegram OIDC login gagal:** pastikan `TELEGRAM_LOGIN_CLIENT_ID` dan exact `TELEGRAM_LOGIN_CALLBACK_URL` configured as Worker variables, `TELEGRAM_LOGIN_CLIENT_SECRET` and `TELEGRAM_REGISTRATION_SECRET` configured as Worker secrets, and callback exactly matches BotFather. Telegram registration requires the configured registration secret; existing Telegram login requires a previously registered Telegram identity and never maps Google, username, phone, or display claims.
+- **Telegram OIDC state/token gagal:** use fresh `/v1/auth/telegram/start` flow after callback failure; state is short-lived and single-use. Check Worker clock, exact `APP_ORIGIN`, same-site cookies, PKCE callback URI, and server-side token/JWKS connectivity. Never troubleshoot by moving OIDC secrets into Vercel or browser variables.
 - **Telegram bot onboarding gagal:** pastikan `TELEGRAM_BOT_TOKENS` diisi (comma-separated `botId:token`), `TELEGRAM_SHARED_CHANNEL` benar (`@username` atau numeric id), dan semua bot sudah admin channel. Worker resolve channel otomatis via `getChat`; cek log Worker kalau gagal.
 - **Upload mobile berhenti:** browser mobile dapat menangguhkan JavaScript ketika tab/PWA berada di background. Buka kembali aplikasi untuk resume; ini batas runtime browser, bukan jalur proxy Worker.
 
