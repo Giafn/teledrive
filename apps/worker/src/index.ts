@@ -851,6 +851,40 @@ function validTelegramTokenTimes(payload: Awaited<ReturnType<typeof jwtVerify>>[
   return iat >= current - OIDC_MAX_TOKEN_AGE_SECONDS - OIDC_CLOCK_TOLERANCE_SECONDS && iat <= current + OIDC_CLOCK_TOLERANCE_SECONDS;
 }
 
+function telegramOidcDiagnostic(
+  stage: string,
+  result: string,
+  metadata: Record<string, string | boolean> = {},
+): void {
+  console.info('telegram_oidc', { stage, result, ...metadata });
+}
+
+function telegramStatusClass(status: number): string {
+  const family = Math.floor(status / 100);
+  return family >= 1 && family <= 5 ? `${family}xx` : 'other';
+}
+
+function telegramErrorClass(error: unknown): string {
+  const name = error instanceof Error ? error.name : '';
+  return /^[A-Za-z][A-Za-z0-9_$]*$/u.test(name) ? name : 'UnknownError';
+}
+
+function telegramJwtHeader(token: string): { alg: string; kid: string } {
+  try {
+    const encoded = token.split('.', 1)[0] ?? '';
+    const normalized = encoded.replaceAll('-', '+').replaceAll('_', '/').padEnd(Math.ceil(encoded.length / 4) * 4, '=');
+    const decoded = JSON.parse(atob(normalized)) as unknown;
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) throw new Error('invalid header');
+    const header = decoded as Record<string, unknown>;
+    return {
+      alg: typeof header.alg === 'string' && header.alg.length <= 32 ? header.alg : 'missing',
+      kid: typeof header.kid === 'string' && header.kid.length <= 256 ? header.kid : 'missing',
+    };
+  } catch {
+    return { alg: 'invalid', kid: 'missing' };
+  }
+}
+
 app.post('/v1/auth/telegram/start', async (c) => {
   requireConfig(c.env, 'APP_ORIGIN', 'APP_SESSION_SECRET', 'TELEGRAM_LOGIN_CLIENT_ID', 'TELEGRAM_LOGIN_CALLBACK_URL');
   const body = record(await readJson<unknown>(c));
@@ -923,8 +957,13 @@ app.get('/v1/auth/telegram/callback', async (c) => {
   const code = c.req.query('code');
   const telegramError = c.req.query('error');
   const stateCookie = requestCookie(c, TELEGRAM_OAUTH_STATE_COOKIE);
-  if (!stateParam || !stateCookie || !constantTimeEqual(stateCookie, stateParam))
+  if (!stateParam || !stateCookie || !constantTimeEqual(stateCookie, stateParam)) {
+    telegramOidcDiagnostic(
+      'callback_state',
+      !stateParam ? 'missing_state' : !stateCookie ? 'missing_cookie' : 'state_mismatch',
+    );
     return telegramRedirect(c, 'telegram_failed');
+  }
 
   const stateHash = await secretHash(stateParam, c.env.APP_SESSION_SECRET);
   const claimed = await c.env.DB.prepare(
@@ -935,9 +974,23 @@ app.get('/v1/auth/telegram/callback', async (c) => {
   )
     .bind(now(), stateHash, now())
     .run();
-  if (changes(claimed) !== 1) return telegramRedirect(c, 'telegram_failed');
-  if (telegramError === 'access_denied') return telegramRedirect(c, 'telegram_denied');
-  if (telegramError || !code) return telegramRedirect(c, 'telegram_failed');
+  if (changes(claimed) !== 1) {
+    telegramOidcDiagnostic('callback_state', 'replay_or_expired');
+    return telegramRedirect(c, 'telegram_failed');
+  }
+  telegramOidcDiagnostic('callback_state', 'accepted');
+  if (telegramError === 'access_denied') {
+    telegramOidcDiagnostic('callback_params', 'provider_denied');
+    return telegramRedirect(c, 'telegram_denied');
+  }
+  if (telegramError) {
+    telegramOidcDiagnostic('callback_params', 'provider_error');
+    return telegramRedirect(c, 'telegram_failed');
+  }
+  if (!code) {
+    telegramOidcDiagnostic('callback_params', 'missing_code');
+    return telegramRedirect(c, 'telegram_failed');
+  }
 
   const tx = await first<{
     id: string;
@@ -949,7 +1002,10 @@ app.get('/v1/auth/telegram/callback', async (c) => {
     "SELECT id, nonce_hash, code_verifier, mode FROM oauth_transactions WHERE provider = 'telegram' AND state_hash = ?",
     stateHash,
   );
-  if (!tx) return telegramRedirect(c, 'telegram_failed');
+  if (!tx) {
+    telegramOidcDiagnostic('callback_state', 'transaction_missing');
+    return telegramRedirect(c, 'telegram_failed');
+  }
 
   let tokenResponse: Response;
   try {
@@ -966,13 +1022,34 @@ app.get('/v1/auth/telegram/callback', async (c) => {
         code_verifier: tx.code_verifier,
       }),
     });
-  } catch {
+  } catch (error) {
+    telegramOidcDiagnostic('token_exchange', 'transport_failure', {
+      statusClass: 'network_error',
+      errorClass: telegramErrorClass(error),
+    });
     return telegramRedirect(c, 'telegram_failed');
   }
-  const tokenJson = (await tokenResponse.json().catch(() => ({}))) as Record<string, unknown>;
-  const idToken = tokenJson.id_token;
-  if (!tokenResponse.ok || typeof idToken !== 'string' || idToken.length > 16_384)
+  const statusClass = telegramStatusClass(tokenResponse.status);
+  let tokenJson: Record<string, unknown>;
+  try {
+    const parsed = await tokenResponse.json();
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid token response');
+    tokenJson = parsed as Record<string, unknown>;
+  } catch {
+    telegramOidcDiagnostic('token_exchange', 'invalid_json', { statusClass });
     return telegramRedirect(c, 'telegram_failed');
+  }
+  const idToken = tokenJson.id_token;
+  if (!tokenResponse.ok) {
+    telegramOidcDiagnostic('token_exchange', 'http_failure', { statusClass });
+    return telegramRedirect(c, 'telegram_failed');
+  }
+  if (typeof idToken !== 'string' || idToken.length > 16_384) {
+    telegramOidcDiagnostic('token_exchange', 'invalid_id_token', { statusClass });
+    return telegramRedirect(c, 'telegram_failed');
+  }
+  telegramOidcDiagnostic('token_exchange', 'success', { statusClass });
+  telegramOidcDiagnostic('jwt_header', 'observed', telegramJwtHeader(idToken));
 
   let verification: Awaited<ReturnType<typeof jwtVerify>>;
   try {
@@ -985,24 +1062,42 @@ app.get('/v1/auth/telegram/callback', async (c) => {
       maxTokenAge: OIDC_MAX_TOKEN_AGE_SECONDS,
       requiredClaims: ['iss', 'sub', 'aud', 'exp', 'iat'],
     });
-  } catch {
+  } catch (error) {
+    telegramOidcDiagnostic('verification', 'failed', { errorClass: telegramErrorClass(error) });
     return telegramRedirect(c, 'telegram_failed');
   }
-  if (verification.protectedHeader?.alg !== 'RS256') return telegramRedirect(c, 'telegram_failed');
+  telegramOidcDiagnostic('verification', 'success');
+  if (verification.protectedHeader?.alg !== 'RS256') {
+    telegramOidcDiagnostic('jwt_header', 'unsupported_alg');
+    return telegramRedirect(c, 'telegram_failed');
+  }
   const payload = verification.payload;
-  if (
-    payload.iss !== TELEGRAM_ISSUER ||
-    !hasAudience(payload.aud, c.env.TELEGRAM_LOGIN_CLIENT_ID!) ||
-    !validTelegramTokenTimes(payload)
-  )
+  if (payload.iss !== TELEGRAM_ISSUER) {
+    telegramOidcDiagnostic('claims', 'mismatch', { category: 'issuer' });
     return telegramRedirect(c, 'telegram_failed');
+  }
+  if (!hasAudience(payload.aud, c.env.TELEGRAM_LOGIN_CLIENT_ID!)) {
+    telegramOidcDiagnostic('claims', 'mismatch', { category: 'audience' });
+    return telegramRedirect(c, 'telegram_failed');
+  }
+  if (!validTelegramTokenTimes(payload)) {
+    telegramOidcDiagnostic('claims', 'mismatch', { category: 'time' });
+    return telegramRedirect(c, 'telegram_failed');
+  }
   const nonce = payload.nonce;
-  if (typeof nonce !== 'string' || !constantTimeEqual(await secretHash(nonce, c.env.APP_SESSION_SECRET), tx.nonce_hash))
+  if (typeof nonce !== 'string' || !constantTimeEqual(await secretHash(nonce, c.env.APP_SESSION_SECRET), tx.nonce_hash)) {
+    telegramOidcDiagnostic('claims', 'mismatch', { category: 'nonce' });
     return telegramRedirect(c, 'telegram_failed');
+  }
   const subject = payload.sub;
-  if (typeof subject !== 'string' || subject.length === 0 || subject.length > 512)
+  if (typeof subject !== 'string' || subject.length === 0 || subject.length > 512) {
+    telegramOidcDiagnostic('claims', 'mismatch', { category: 'subject' });
     return telegramRedirect(c, 'telegram_failed');
-  if (tx.mode !== 'login' && tx.mode !== 'register') return telegramRedirect(c, 'telegram_failed');
+  }
+  if (tx.mode !== 'login' && tx.mode !== 'register') {
+    telegramOidcDiagnostic('claims', 'mismatch', { category: 'mode' });
+    return telegramRedirect(c, 'telegram_failed');
+  }
 
   const identity = await first<{ user_id: string }>(
     c.env.DB,
@@ -1010,23 +1105,40 @@ app.get('/v1/auth/telegram/callback', async (c) => {
     TELEGRAM_ISSUER,
     subject,
   );
+  telegramOidcDiagnostic('identity_persistence', identity ? 'found' : 'missing');
   if (tx.mode === 'login') {
-    if (!identity) return telegramRedirect(c, 'telegram_failed');
+    if (!identity) {
+      telegramOidcDiagnostic('identity_persistence', 'login_identity_missing');
+      return telegramRedirect(c, 'telegram_failed');
+    }
     const user = await first<UserRow>(
       c.env.DB,
       "SELECT id, username, display_name, status FROM users WHERE id = ? AND status = 'active'",
       identity.user_id,
     );
-    if (!user) return telegramRedirect(c, 'telegram_failed');
-    await c.env.DB.prepare(
-      'UPDATE auth_identities SET last_used_at = ? WHERE provider = ? AND issuer = ? AND subject = ?',
-    )
-      .bind(now(), 'telegram', TELEGRAM_ISSUER, subject)
-      .run();
-    await setSession(c, user.id);
+    if (!user) {
+      telegramOidcDiagnostic('identity_persistence', 'user_missing');
+      return telegramRedirect(c, 'telegram_failed');
+    }
+    try {
+      await c.env.DB.prepare(
+        'UPDATE auth_identities SET last_used_at = ? WHERE provider = ? AND issuer = ? AND subject = ?',
+      )
+        .bind(now(), 'telegram', TELEGRAM_ISSUER, subject)
+        .run();
+      telegramOidcDiagnostic('identity_persistence', 'last_used_updated');
+      await setSession(c, user.id);
+      telegramOidcDiagnostic('session_persistence', 'created');
+    } catch (error) {
+      telegramOidcDiagnostic('session_persistence', 'failed', { errorClass: telegramErrorClass(error) });
+      throw error;
+    }
     return telegramRedirect(c);
   }
-  if (identity) return telegramRedirect(c, 'telegram_failed');
+  if (identity) {
+    telegramOidcDiagnostic('identity_persistence', 'already_exists');
+    return telegramRedirect(c, 'telegram_failed');
+  }
 
   const username = await uniqueUsername(c.env.DB, `telegram-${randomToken(9).toLowerCase()}`);
   const userId = randomToken(18);
@@ -1052,11 +1164,22 @@ app.get('/v1/auth/telegram/callback', async (c) => {
         "INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at) VALUES (?, ?, 'telegram.registered', 'user', ?, ?)",
       ).bind(randomToken(18), userId, userId, created),
     ]);
+    telegramOidcDiagnostic('identity_persistence', 'created');
   } catch (error) {
-    if (isConstraintError(error)) fail(409, 'TELEGRAM_IDENTITY_EXISTS', 'Telegram account is already registered');
+    if (isConstraintError(error)) {
+      telegramOidcDiagnostic('identity_persistence', 'conflict');
+      fail(409, 'TELEGRAM_IDENTITY_EXISTS', 'Telegram account is already registered');
+    }
+    telegramOidcDiagnostic('identity_persistence', 'failed', { errorClass: telegramErrorClass(error) });
     throw error;
   }
-  await setSession(c, userId);
+  try {
+    await setSession(c, userId);
+    telegramOidcDiagnostic('session_persistence', 'created');
+  } catch (error) {
+    telegramOidcDiagnostic('session_persistence', 'failed', { errorClass: telegramErrorClass(error) });
+    throw error;
+  }
   return telegramRedirect(c);
 });
 

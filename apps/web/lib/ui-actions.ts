@@ -19,6 +19,16 @@ export async function logoutAfterSuccess(
   }
 }
 
+export function requestTelegramAuthorization(
+  client: Pick<ApiClient, 'telegramAuthorizationUrl'>,
+  mode: 'login' | 'register',
+  secretInfo?: string,
+) {
+  return mode === 'register'
+    ? client.telegramAuthorizationUrl('register', secretInfo)
+    : client.telegramAuthorizationUrl(mode);
+}
+
 export function trashActionAvailability(item: TrashItem) {
   return {
     restore: true,

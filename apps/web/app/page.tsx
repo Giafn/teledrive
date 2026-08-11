@@ -25,7 +25,13 @@ import {
   DownloadError,
 } from '../lib/download-controller';
 import styles from './page.module.css';
-import { logoutAfterSuccess, permanentlyDeleteTrashItem, restoreTrashItem, trashActionAvailability } from '../lib/ui-actions';
+import {
+  logoutAfterSuccess,
+  permanentlyDeleteTrashItem,
+  requestTelegramAuthorization,
+  restoreTrashItem,
+  trashActionAvailability,
+} from '../lib/ui-actions';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
 type Upload = {
@@ -344,12 +350,8 @@ export default function Page() {
     setTelegramBusy(true);
     setTelegramError('');
     try {
-      const telegramAuthorizationUrl = api.telegramAuthorizationUrl as (
-        mode: 'login' | 'register',
-        secret?: string,
-      ) => Promise<string>;
       window.location.assign(
-        await (mode === 'register' ? telegramAuthorizationUrl('register', secretInfo) : telegramAuthorizationUrl(mode)),
+        await requestTelegramAuthorization(api, mode, secretInfo),
       );
     } catch (error) {
       setTelegramError(message(error));
