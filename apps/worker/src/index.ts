@@ -217,20 +217,22 @@ async function setSession(c: Context<AppEnv>, userId: string): Promise<string> {
 }
 
 async function validateMutationCsrf(c: Context<AppEnv>): Promise<void> {
-  const csrf = c.req.header('X-CSRF-Token');
-  if (!csrf || csrf.length > 256) fail(403, 'CSRF_REQUIRED', 'CSRF token required');
   const session = await getSession(c);
   if (session) {
+    const csrf = c.req.header('X-CSRF-Token');
+    if (!csrf || csrf.length > 256) fail(403, 'CSRF_REQUIRED', 'CSRF token required');
     const expected = await secretHash(csrf, c.env.APP_SESSION_SECRET);
     if (!constantTimeEqual(expected, session.csrf_hash)) fail(403, 'CSRF_INVALID', 'CSRF token invalid');
     return;
   }
 
   if (c.req.path.startsWith('/v1/auth/passkey/')) {
-    const cookieToken = requestCookie(c, CSRF_COOKIE);
-    if (cookieToken && constantTimeEqual(cookieToken, csrf)) return;
+    return;
   }
-  fail(401, 'AUTH_REQUIRED', 'Authentication required');
+
+  const csrf = c.req.header('X-CSRF-Token');
+  if (!csrf || csrf.length > 256) fail(403, 'CSRF_REQUIRED', 'CSRF token required');
+  fail(403, 'CSRF_REQUIRED', 'CSRF token required');
 }
 
 function cursorEncode(createdAt: string, id: string): string {
@@ -532,9 +534,13 @@ app.post('/v1/auth/passkey/register/options', async (c) => {
   );
   const session = await getSession(c);
   let user: UserRow | null = null;
-  let mode: 'bootstrap_registration' | 'add_passkey';
+  let mode: 'bootstrap_registration' | 'new_user_registration' | 'add_passkey';
   let issuedSessionId: string | null = null;
-  if ((active?.count ?? 0) === 0) {
+  if (session) {
+    user = session;
+    mode = 'add_passkey';
+    issuedSessionId = session.session_id;
+  } else if ((active?.count ?? 0) === 0) {
     const bootstrap = c.req.header('X-Bootstrap-Token');
     if (!bootstrap || !constantTimeEqual(bootstrap, c.env.BOOTSTRAP_TOKEN))
       fail(403, 'BOOTSTRAP_REQUIRED', 'Bootstrap token required');
@@ -553,10 +559,22 @@ app.post('/v1/auth/passkey/register/options', async (c) => {
     }
     mode = 'bootstrap_registration';
   } else {
-    if (!session) fail(401, 'AUTH_REQUIRED', 'Authenticated session required to add passkey');
-    user = session;
-    mode = 'add_passkey';
-    issuedSessionId = session.session_id;
+    const username = stringValue(body.userName, 'userName', 128).trim().toLocaleLowerCase('en-US');
+    if (!username) fail(422, 'INVALID_FIELD', 'userName is invalid');
+    const displayName = stringValue(body.displayName ?? username, 'displayName', 128).trim();
+    if (!displayName) fail(422, 'INVALID_FIELD', 'displayName is invalid');
+    const existing = await first<UserRow>(
+      c.env.DB,
+      'SELECT id, username, display_name, status FROM users WHERE username = ?',
+      username,
+    );
+    if (existing) {
+      if (existing.status === 'active') fail(409, 'USER_EXISTS', 'Username is already registered');
+      user = existing;
+    } else {
+      user = { id: randomToken(18), username, display_name: displayName, status: 'pending' };
+    }
+    mode = 'new_user_registration';
   }
 
   const options = await generateRegistrationOptions({
@@ -612,7 +630,7 @@ app.post('/v1/auth/passkey/register/verify', async (c) => {
   const claimed = await c.env.DB.prepare(
     `
     UPDATE webauthn_challenges SET used_at = ?
-    WHERE id = ? AND kind = 'registration' AND mode IN ('bootstrap_registration', 'add_passkey')
+    WHERE id = ? AND kind = 'registration' AND mode IN ('bootstrap_registration', 'new_user_registration', 'add_passkey')
       AND used_at IS NULL AND expires_at > ?
   `,
   )
@@ -624,7 +642,7 @@ app.post('/v1/auth/passkey/register/verify', async (c) => {
     'SELECT user_id, challenge, mode, issued_session_id FROM webauthn_challenges WHERE id = ?',
     challengeId,
   );
-  if (!challenge?.user_id || !['bootstrap_registration', 'add_passkey'].includes(challenge.mode))
+  if (!challenge?.user_id || !['bootstrap_registration', 'new_user_registration', 'add_passkey'].includes(challenge.mode))
     fail(422, 'CHALLENGE_INVALID', 'Passkey challenge invalid');
   if (challenge.mode === 'bootstrap_registration') {
     requireConfig(c.env, 'BOOTSTRAP_TOKEN');
@@ -637,6 +655,13 @@ app.post('/v1/auth/passkey/register/verify', async (c) => {
       challenge.user_id,
     );
     if (!pending || pending.status !== 'pending') fail(403, 'BOOTSTRAP_CLOSED', 'Bootstrap registration is closed');
+  } else if (challenge.mode === 'new_user_registration') {
+    const pending = await first<{ status: string }>(
+      c.env.DB,
+      'SELECT status FROM users WHERE id = ?',
+      challenge.user_id,
+    );
+    if (!pending || pending.status !== 'pending') fail(403, 'REGISTRATION_CLOSED', 'Registration is closed');
   } else {
     const session = await getSession(c);
     if (!session || session.session_id !== challenge.issued_session_id || session.id !== challenge.user_id) {
@@ -672,10 +697,10 @@ app.post('/v1/auth/passkey/register/verify', async (c) => {
     const workspaceId = randomToken(18);
     const rootId = randomToken(18);
     const statements =
-      challenge.mode === 'bootstrap_registration'
+      challenge.mode === 'bootstrap_registration' || challenge.mode === 'new_user_registration'
         ? [
             c.env.DB.prepare(
-              "UPDATE users SET status = 'active', updated_at = ? WHERE id = ? AND status = 'pending' AND NOT EXISTS (SELECT 1 FROM users WHERE status = 'active')",
+              "UPDATE users SET status = 'active', updated_at = ? WHERE id = ? AND status = 'pending'",
             ).bind(created, user.id),
             prepareBootstrapPasskeyStatement(
               c.env.DB,
@@ -722,11 +747,11 @@ app.post('/v1/auth/passkey/register/verify', async (c) => {
             ).bind(randomToken(18), user.id, user.id, created, credentialId, user.id),
           ];
     const results = await c.env.DB.batch(statements);
-    const passkeyResult = challenge.mode === 'bootstrap_registration' ? results[1] : results[0];
+    const passkeyResult = (challenge.mode === 'bootstrap_registration' || challenge.mode === 'new_user_registration') ? results[1] : results[0];
     if (changes(passkeyResult) !== 1) {
       fail(
-        challenge.mode === 'bootstrap_registration' ? 409 : 401,
-        challenge.mode === 'bootstrap_registration' ? 'BOOTSTRAP_CLOSED' : 'AUTH_REQUIRED',
+        challenge.mode === 'bootstrap_registration' || challenge.mode === 'new_user_registration' ? 409 : 401,
+        challenge.mode === 'bootstrap_registration' || challenge.mode === 'new_user_registration' ? 'REGISTRATION_FAILED' : 'AUTH_REQUIRED',
         'Issuing authorization is no longer valid',
       );
     }
