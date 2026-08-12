@@ -63,12 +63,12 @@ same(build.generators, Object.fromEntries(generatorFiles.map((x) => [x, bytes(x)
 same(build.generatedFiles, Object.fromEntries(Object.entries(dirs).flatMap(([, dir]) => [`${dir.split('/').pop()}/MANIFEST.json`, ...Object.keys(json(`${dir}/MANIFEST.json`).files).map((file) => `${dir.split('/').pop()}/${file}`)].map((file) => [file, bytes(`tl/generated/${file}`)]))), 'build generated files');
 if (build.layer !== 223 || JSON.stringify(build.generated) !== JSON.stringify(['api-layer-223', 'mtproto-9088824ec1f1']) || !build.claims?.includes('schema-only; no runtime')) throw new Error('invalid build manifest claims');
 const repoRoot = git(['rev-parse', '--show-toplevel'], 'B1 trust root unavailable');
-const tag = 'tl-supply-chain-b1-v3';
+const tag = 'tl-supply-chain-b1-v4';
 const tagResult = spawnSync('git', ['verify-tag', tag], {cwd: repoRoot, encoding: 'utf8'});
 if (tagResult.status !== 0) throw new Error(`B1 trust tag is not a valid signed tag: ${tagResult.stderr.trim()}`);
 const tagCommit = spawnSync('git', ['rev-parse', `${tag}^{commit}`], {cwd: repoRoot, encoding: 'utf8'});
 if (tagCommit.status !== 0) throw new Error(`B1 trust tag commit resolution failed: ${tag}`);
-const packagePath = path.relative(repoRoot, root);
+const packagePath = git(['rev-parse', '--show-prefix'], 'B1 package path unavailable').replace(/\/$/u, '');
 const protectedPaths = [
   `${packagePath}/tl`, `${packagePath}/tools/tlgen`,
   `${packagePath}/scripts/verify-tl-supply-chain.mjs`, `${packagePath}/scripts/regenerate-tl-layer.mjs`, `${packagePath}/scripts/assert-tl-generated-graph.mjs`,
