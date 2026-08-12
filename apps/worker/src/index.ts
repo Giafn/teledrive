@@ -260,6 +260,19 @@ function changes(result: { meta?: { changes?: number } }): number {
   return result.meta?.changes ?? 0;
 }
 
+export function prepareBootstrapPasskeyStatement(
+  db: D1Database,
+  credentialId: string,
+  publicKey: unknown,
+  counter: number,
+  transport: string,
+  created: string,
+  userId: string,
+): D1PreparedStatement {
+  return db.prepare('SELECT ? AS credential_id, ? AS public_key, ? AS counter, ? AS transports, ? AS created_at, ? AS user_id')
+    .bind(credentialId, publicKey, counter, transport, created, userId);
+}
+
 function rateLimitAuth(c: Context<AppEnv>): void {
   const key = c.req.header('CF-Connecting-IP') ?? 'unknown';
   const timestamp = Date.now();
@@ -900,6 +913,28 @@ app.post('/v1/folders/:id/restore', async (c) => {
     throw error;
   }
   return c.json({ ok: true, restored: true });
+});
+
+app.delete('/v1/trash/purge-all', async (c) => {
+  const session = await requireSession(c);
+  const objects = await c.env.DB.prepare(
+    `DELETE FROM objects WHERE status = 'deleted' AND deleted_at IS NOT NULL
+      AND workspace_id IN (SELECT id FROM workspaces WHERE owner_id = ?)`
+  ).bind(session.id).run();
+  let folders = 0;
+  for (let pass = 0; pass < 100; pass += 1) {
+    const result = await c.env.DB.prepare(
+      `DELETE FROM folders WHERE deleted_at IS NOT NULL
+        AND workspace_id IN (SELECT id FROM workspaces WHERE owner_id = ?)
+        AND NOT EXISTS (SELECT 1 FROM folders child WHERE child.parent_id = folders.id)
+        AND NOT EXISTS (SELECT 1 FROM objects object WHERE object.folder_id = folders.id)`
+    ).bind(session.id).run();
+    const removed = changes(result);
+    folders += removed;
+    if (!removed) break;
+  }
+  await audit(c.env.DB, session.id, 'trash.purged', 'workspace', session.id).run();
+  return c.json({ ok: true, objects: changes(objects), folders });
 });
 
 app.delete('/v1/folders/:id/permanent', async (c) => {

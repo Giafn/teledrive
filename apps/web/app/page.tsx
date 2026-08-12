@@ -325,6 +325,16 @@ export default function Page() {
   useEffect(() => {
     void restoreSession();
   }, []);
+  async function purgeTrash() {
+    if (!window.confirm('Hapus permanen semua isi Sampah? Tindakan ini tidak dapat dibatalkan.')) return;
+    setLoadError('');
+    try {
+      await api.purgeTrash();
+      await loadSpecial('trash');
+    } catch (error) {
+      setLoadError(message(error));
+    }
+  }
   async function loadSpecial(nextView: 'recent' | 'trash', append = false) {
     setView(nextView);
     setSpecialLoading(true);
@@ -360,10 +370,10 @@ export default function Page() {
             setMoveDialog(true);
             return;
           }
-          setMutationError('Folder belum memiliki endpoint rename atau move.');
-          return;
-        }
-        if (action === 'rename') {
+            const name = window.prompt('Nama folder baru', currentName ?? '');
+            if (!name?.trim()) return;
+            await api.updateFolder(id, { name: name.trim() });
+         } else if (action === 'rename') {
           const name = window.prompt('Nama baru', currentName ?? '');
           if (!name?.trim()) return;
           await api.updateObject(id, { name: name.trim() });
@@ -387,11 +397,15 @@ export default function Page() {
           await api.permanentDeleteObject(id);
         }
       }
-      if (view === 'drive' && workspace) await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
-      else await loadSpecial(view === 'trash' ? 'trash' : 'recent');
-    } catch (error) {
-      setMutationError(message(error));
-    }
+       if (view === 'drive' && workspace) await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
+       else if (view === 'recent' || view === 'trash') await loadSpecial(view);
+     } catch (error) {
+       setMutationError(
+         error instanceof ApiError && error.code === 'FOLDER_NOT_EMPTY'
+           ? 'Folder tidak dapat dipindahkan ke sampah karena masih berisi file atau subfolder.'
+           : message(error),
+       );
+     }
   }
   function toggleSelection(entry: SelectedEntry) {
     setSelected((current) => {
@@ -503,6 +517,7 @@ export default function Page() {
     }
   }
   async function logout() {
+    await telegramGateway.logout().catch(() => undefined);
     await api.logout().catch(() => undefined);
     setUser(null);
     setWorkspace(null);
@@ -562,10 +577,7 @@ export default function Page() {
         <div className={styles.sideBottom}>
           <div className={styles.storageLabel}>
             <span>Penyimpanan</span>
-            <b>Telegram</b>
-          </div>
-          <div className={styles.storageBar}>
-            <i />
+            <b>Unlimited dengan Telegram</b>
           </div>
           <button className={styles.settingsLink} onClick={() => setView('settings')}>
             <Icon name="settings" /> Pengaturan
@@ -623,8 +635,9 @@ export default function Page() {
             loading={specialLoading}
             error={loadError}
             cursor={specialCursor}
-            onLoadMore={() => loadSpecial(view as 'recent' | 'trash', true)}
-            onRetry={() => loadSpecial(view as 'recent' | 'trash')}
+             onLoadMore={() => loadSpecial(view as 'recent' | 'trash', true)}
+             onRetry={() => loadSpecial(view as 'recent' | 'trash')}
+             onPurgeAll={purgeTrash}
             onMutate={mutate}
             menuId={menuId}
             setMenuId={setMenuId}
@@ -1396,6 +1409,7 @@ function SpecialView({
   cursor,
   onLoadMore,
   onRetry,
+  onPurgeAll,
   onMutate,
   menuId,
   setMenuId,
@@ -1414,6 +1428,7 @@ function SpecialView({
   cursor: string | null;
   onLoadMore: () => void;
   onRetry: () => void;
+  onPurgeAll: () => Promise<void>;
   onMutate: (
     kind: 'folder' | 'object',
     action: 'rename' | 'move' | 'delete' | 'restore' | 'purge',
@@ -1439,11 +1454,16 @@ function SpecialView({
             RUANG PRIBADI <span>•</span> SERVER METADATA
           </div>
           <h1>{title}</h1>
-          <p className={styles.subtle}>
-            {trashView
-              ? 'File dihapus dari Drive. Retensi dan status berasal dari server.'
-              : 'File yang baru diubah atau diunggah.'}
-          </p>
+           <p className={styles.subtle}>
+             {trashView
+               ? 'File dan folder dihapus dari Drive. Retensi dan status berasal dari server.'
+               : 'File yang baru diubah atau diunggah.'}
+           </p>
+           {trashView && (
+             <button className={styles.secondaryButton} onClick={onPurgeAll} disabled={loading || !items.length}>
+               Hapus semua
+             </button>
+           )}
         </div>
       </div>
       {mutationError && (
@@ -1518,7 +1538,9 @@ function ObjectRow({
   onToggleSelection: (entry: SelectedEntry) => void;
   onMove: (entries?: SelectedEntry[]) => void;
 }) {
-  const downloadable = { id: item.id, name: item.name, mime: item.mime, size: item.size };
+  const folder = item.type === 'folder';
+  const mime = item.mime ?? 'application/octet-stream';
+  const downloadable = { id: item.id, name: item.name, mime, size: item.size };
   return (
     <article className={styles.fileRow}>
       {!trash && (
@@ -1526,14 +1548,14 @@ function ObjectRow({
           className={styles.selectionCheckbox}
           type="checkbox"
           checked={Boolean(selected[item.id])}
-          onChange={() => onToggleSelection({ id: item.id, kind: 'object', name: item.name })}
+          onChange={() => onToggleSelection({ id: item.id, kind: folder ? 'folder' : 'object', name: item.name })}
           aria-label={`Pilih ${item.name}`}
         />
       )}
-      <span className={`${styles.fileIcon} ${mimeStyle(item.mime)}`}>
-        <b>{item.mime.split('/')[1]?.slice(0, 4).toUpperCase() || 'FILE'}</b>
+      <span className={`${styles.fileIcon} ${folder ? styles.folderIcon : mimeStyle(mime)}`}>
+        {folder ? <Icon name="folder" size={20} /> : <b>{mime.split('/')[1]?.slice(0, 4).toUpperCase() || 'FILE'}</b>}
       </span>
-      <button className={styles.fileName} onClick={() => onPreview(downloadable)}>
+      <button className={styles.fileName} onClick={() => !folder && onPreview(downloadable)}>
         <b>{item.name}</b>
         <small>
           {formatSize(item.size)} ·{' '}
@@ -1556,13 +1578,13 @@ function ObjectRow({
           <div className={styles.rowMenuPopup} role="menu">
             {trash ? (
               <>
-                <button role="menuitem" onClick={() => onMutate('object', 'restore', item.id, item.name)}>
+                <button role="menuitem" onClick={() => onMutate(folder ? 'folder' : 'object', 'restore', item.id, item.name)}>
                   Pulihkan
                 </button>
                 <button
                   role="menuitem"
                   className={styles.dangerAction}
-                  onClick={() => onMutate('object', 'purge', item.id, item.name)}
+                  onClick={() => onMutate(folder ? 'folder' : 'object', 'purge', item.id, item.name)}
                 >
                   Hapus metadata permanen
                 </button>
@@ -1739,180 +1761,20 @@ function Settings({
   settings: React.MutableRefObject<{ chunkSize: number; concurrency: number }>;
   onLogout: () => Promise<void>;
 }) {
-  const [auth, setAuth] = useState<TelegramAuthState>({ state: 'logged_out' });
-  const [session, setSession] = useState<{ connected: boolean; authorized: boolean } | null>(null);
-  const [phone, setPhone] = useState('');
-  const [code, setCode] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [probing, setProbing] = useState(true);
-  async function probe() {
-    setProbing(true);
-    setError('');
-    try {
-      const result = await telegramGateway.checkSession();
-      setSession(result);
-      setAuth(result.authorized ? { state: 'authorized' } : { state: 'logged_out' });
-    } catch (e) {
-      setSession(null);
-      setError(telegramError(e));
-    } finally {
-      setProbing(false);
-    }
-  }
-  useEffect(() => {
-    void probe();
-  }, []);
-  async function run(action: () => Promise<TelegramAuthState>, probeAfter = false) {
-    setBusy(true);
-    setError('');
-    try {
-      const state = await action();
-      setAuth(state);
-      if (probeAfter) await probe();
-    } catch (e) {
-      setError(telegramError(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function send() {
-    const value = phone;
-    setPhone('');
-    if (value) await run(() => telegramGateway.sendCode(value));
-  }
-  async function signIn() {
-    const value = code;
-    setCode('');
-    if (value) await run(() => telegramGateway.signIn(value), true);
-  }
-  async function checkPassword() {
-    const value = password;
-    setPassword('');
-    if (value) await run(() => telegramGateway.checkPassword(value), true);
-  }
-  async function resend() {
-    await run(() => telegramGateway.resendCode());
-  }
-  async function logoutTelegram() {
-    await run(() => telegramGateway.logout(), true);
-  }
   async function exportData() {
-    setError('');
-    try {
-      const data = await api.exportWorkspace();
-      const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `ruang-export-${new Date().toISOString().slice(0, 10)}.json`;
-      link.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setError(message(e));
-    }
+    const data = await api.exportWorkspace();
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ruang-export-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
-  const authorized = session?.authorized === true;
   return (
     <div className={styles.settings}>
       <div className={styles.eyebrow}>PREFERENSI</div>
       <h1>Pengaturan</h1>
-      <p className={styles.subtle}>Koneksi, upload, dan data lokal perangkat ini.</p>
-      <section className={styles.settingsCard}>
-        <div className={styles.settingTitle}>
-          <span className={styles.telegramMark}>✦</span>
-          <div>
-            <h2>Koneksi Telegram</h2>
-            <p>{probing ? 'Memeriksa otorisasi…' : authorized ? 'Sesi terotorisasi' : 'Belum terotorisasi'}</p>
-          </div>
-          <span className={styles.statusTag}>
-            {probing ? 'Memeriksa' : authorized ? 'Terotorisasi' : 'Perlu sambung ulang'}
-          </span>
-        </div>
-        {!probing && !authorized && (
-          <p className={styles.reconnectGuide}>
-            Sesi Telegram belum terotorisasi di browser ini. Hubungkan kembali untuk upload; kredensial tetap diproses
-            lokal.
-          </p>
-        )}
-        {auth.state === 'logged_out' && !authorized && (
-          <div className={styles.telegramFlow}>
-            <label className={styles.field}>
-              Nomor telepon
-              <input
-                inputMode="tel"
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                placeholder="+62…"
-                autoComplete="off"
-              />
-            </label>
-            <button className={styles.primaryButton} disabled={busy || !phone} onClick={send}>
-              Kirim kode
-            </button>
-          </div>
-        )}
-        {auth.state === 'code_sent' && (
-          <div className={styles.telegramFlow}>
-            <p className={styles.flowHint}>Kode dikirim lewat Telegram. Kode hanya digunakan di browser.</p>
-            <label className={styles.field}>
-              Kode OTP
-              <input
-                inputMode="numeric"
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                autoComplete="one-time-code"
-              />
-            </label>
-            <div className={styles.flowButtons}>
-              <button className={styles.primaryButton} disabled={busy || !code} onClick={signIn}>
-                Verifikasi
-              </button>
-              <button className={styles.textButton} disabled={busy} onClick={resend}>
-                Kirim ulang
-              </button>
-            </div>
-          </div>
-        )}
-        {auth.state === 'password_required' && (
-          <div className={styles.telegramFlow}>
-            <p className={styles.flowHint}>Telegram meminta password 2FA. Tidak disimpan atau dikirim ke API.</p>
-            <label className={styles.field}>
-              Password 2FA
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete="off"
-              />
-            </label>
-            <button className={styles.primaryButton} disabled={busy || !password} onClick={checkPassword}>
-              Lanjutkan
-            </button>
-          </div>
-        )}
-        {authorized && (
-          <div className={styles.flowButtons}>
-            <button className={styles.secondaryButton} disabled={probing} onClick={probe}>
-              Buktikan otorisasi Telegram
-            </button>
-            <button className={styles.textButton} onClick={logoutTelegram}>
-              Keluar dari Telegram
-            </button>
-          </div>
-        )}
-        {error && (
-          <div className={styles.formError} role="alert">
-            <Icon name="info" size={16} />
-            {error}
-          </div>
-        )}
-        <p className={styles.disclaimer}>
-          API ID/hash dan channel harus dikonfigurasi deployment. Pemeriksaan di atas membuktikan sesi Telegram
-          terotorisasi, bukan sekadar koneksi socket. Private channel bukan storage dengan SLA. Upload mobile dapat
-          berhenti saat browser berada di latar.
-        </p>
-      </section>
+      <p className={styles.subtle}>Upload dan data lokal perangkat ini.</p>
       <section className={styles.settingsCard}>
         <h2>Upload</h2>
         <div className={styles.settingLine}>

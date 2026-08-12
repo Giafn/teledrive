@@ -181,6 +181,8 @@
 }
 .mobileBrand {
   display: none;
+  border: 0;
+  background: transparent;
 }
 .search {
   height: 39px;
@@ -856,9 +858,12 @@
     display: none;
   }
   .header {
-    height: 65px;
-    padding: 0 18px;
-    gap: 12px;
+    height: auto;
+    min-height: 65px;
+    padding: 12px 18px;
+    gap: 10px 12px;
+    flex-wrap: wrap;
+    position: relative;
   }
   .mobileBrand {
     display: flex;
@@ -871,10 +876,9 @@
   }
   .header .search {
     order: 3;
-    position: absolute;
-    top: 65px;
-    left: 18px;
-    right: 18px;
+    position: static;
+    flex-basis: 100%;
+    width: 100%;
     max-width: none;
   }
   .headerActions {
@@ -884,7 +888,7 @@
     display: none;
   }
   .content {
-    padding-top: 58px;
+    padding-top: 0;
     padding-bottom: 76px;
   }
   .pageTop {
@@ -918,6 +922,14 @@
   }
   .fileArea {
     margin: 0 18px;
+  }
+  .empty {
+    width: 100%;
+    box-sizing: border-box;
+    text-align: center;
+    display: flex;
+    align-items: center;
+    flex-direction: column;
   }
   .fileRow {
     grid-template-columns: 20px 32px minmax(0, 1fr) 0 32px;

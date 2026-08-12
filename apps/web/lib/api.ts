@@ -19,10 +19,11 @@ export type FolderChildrenResponse = {
 };
 
 export type ObjectListItem = {
+  type?: 'object' | 'folder';
   id: string;
   name: string;
-  mime: string;
-  size: number;
+  mime: string | null;
+  size: number | null;
   status: string;
   createdAt: string;
   updatedAt?: string;
@@ -185,6 +186,7 @@ export interface ApiClient {
   listFolderChildren(folderId: string, options?: { limit?: number; cursor?: string }): Promise<FolderChildrenResponse>;
   listRecent(options?: { limit?: number; cursor?: string }): Promise<PaginatedObjectResponse>;
   listTrash(options?: { limit?: number; cursor?: string }): Promise<PaginatedObjectResponse>;
+  purgeTrash(): Promise<{ ok: true; objects: number; folders: number }>;
   createFolder(name: string, parentId: string | null): Promise<Folder>;
   updateFolder(folderId: string, input: FolderUpdateInput): Promise<FolderUpdateResponse>;
   updateObject(objectId: string, input: ObjectUpdateInput): Promise<ObjectUpdateResponse>;
@@ -388,6 +390,10 @@ export class MetadataApiClient implements ApiClient {
 
   softDeleteFolder(folderId: string) {
     return this.request<MutationResponse>(`/v1/folders/${encodeURIComponent(folderId)}`, { method: 'DELETE' }, true);
+  }
+
+  purgeTrash() {
+    return this.request<{ ok: true; objects: number; folders: number }>('/v1/trash/purge-all', { method: 'DELETE' }, true);
   }
 
   restoreFolder(folderId: string) {
