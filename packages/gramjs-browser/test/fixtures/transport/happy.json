@@ -1,0 +1,1 @@
+{"kind":"synthetic-transport-state-v1","synthetic":true,"notLive":true,"source":"project-authored","outboundHex":"0102","inboundHex":"a0b1","events":["start","markOpen","enqueueOutbound","receiveInbound","takeOutbound","commitOutbound","takeInbound","beginClose","markClosed"]}

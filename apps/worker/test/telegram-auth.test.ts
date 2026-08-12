@@ -167,12 +167,18 @@ async function callback(
   stateCookie: string,
   claims: TokenClaims = validClaims(),
   algorithm = 'RS256',
+  tokenResponse: Response = Response.json({ id_token: 'telegram-id-token' }),
+  verificationError?: unknown,
 ): Promise<Response> {
-  vi.mocked(jwtVerify).mockResolvedValue({
-    payload: claims,
-    protectedHeader: { alg: algorithm },
-  } as never);
-  vi.stubGlobal('fetch', vi.fn(async () => Response.json({ id_token: 'telegram-id-token' })));
+  if (verificationError === undefined) {
+    vi.mocked(jwtVerify).mockResolvedValue({
+      payload: claims,
+      protectedHeader: { alg: algorithm },
+    } as never);
+  } else {
+    vi.mocked(jwtVerify).mockRejectedValue(verificationError);
+  }
+  vi.stubGlobal('fetch', vi.fn(async () => tokenResponse));
   return app.fetch(
     new Request('http://worker.test/v1/auth/telegram/callback?state=' + encodeURIComponent(stateCookie.split('=', 2)[1] ?? '') + '&code=telegram-code', {
       headers: { Cookie: stateCookie },
@@ -182,9 +188,45 @@ async function callback(
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
 });
+
+function diagnosticEvents(info: { mock: { calls: unknown[][] } }): Record<string, unknown>[] {
+  return info.mock.calls.flatMap(([label, payload]) =>
+    label === 'telegram_oidc' && payload && typeof payload === 'object' ? [payload as Record<string, unknown>] : [],
+  );
+}
+
+function expectSafeDiagnostics(info: { mock: { calls: unknown[][] } }, sensitiveValues: string[]): void {
+  const serialized = JSON.stringify(info.mock.calls);
+  for (const value of sensitiveValues) expect(serialized).not.toContain(value);
+  for (const event of diagnosticEvents(info)) {
+    expect(event).toEqual(expect.objectContaining({ stage: expect.any(String), result: expect.any(String) }));
+    expect(Object.keys(event)).not.toEqual(
+      expect.arrayContaining([
+        'authorizationCode',
+        'code',
+        'state',
+        'nonce',
+        'verifier',
+        'token',
+        'secret',
+        'userId',
+        'idToken',
+        'accessToken',
+        'clientSecret',
+        'registrationSecret',
+        'payload',
+        'message',
+        'username',
+        'phone',
+        'otp',
+      ]),
+    );
+  }
+}
 
 describe('Telegram OIDC authentication', () => {
   it('registers new identity with secret, PKCE, opaque names, workspace, and session', async () => {
@@ -263,6 +305,61 @@ describe('Telegram OIDC authentication', () => {
     expect(state.oauthClaimed).toBe(true);
   });
 
+  it('diagnoses callback state failures without logging callback secrets', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { env } = await begin('login');
+    const response = await app.fetch(
+      new Request('http://worker.test/v1/auth/telegram/callback?state=wrong-state&code=telegram-code', {
+        headers: { Cookie: '__Host-td_telegram_oauth_state=actual-state' },
+      }),
+      env,
+    );
+
+    expect(response.headers.get('Location')).toBe('http://localhost:3000/?error=telegram_failed');
+    expect(diagnosticEvents(info)).toContainEqual({ stage: 'callback_state', result: 'state_mismatch' });
+    expectSafeDiagnostics(info, ['wrong-state', 'actual-state', 'telegram-code', REGISTRATION_SECRET]);
+  });
+
+  it('diagnoses token exchange invalid JSON with status class and safe fields', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { env, state, stateCookie } = await begin('login');
+    state.tx!.nonce_hash = await secretHash('test-nonce', SESSION_SECRET);
+    const response = await callback(env, stateCookie, validClaims(), 'RS256', new Response('sensitive-payload', { status: 502 }));
+
+    expect(response.headers.get('Location')).toBe('http://localhost:3000/?error=telegram_failed');
+    expect(diagnosticEvents(info)).toContainEqual({ stage: 'token_exchange', result: 'invalid_json', statusClass: '5xx' });
+    expectSafeDiagnostics(info, ['sensitive-payload', 'telegram-code', 'test-nonce', 'telegram-id-token']);
+  });
+
+  it('diagnoses JWT header and verification class without serializing token or error', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const header = btoa(JSON.stringify({ alg: 'RS256', kid: 'telegram-key-1' }))
+      .replaceAll('+', '-')
+      .replaceAll('/', '_')
+      .replaceAll('=', '');
+    const idToken = `${header}.payload.signature`;
+    const { env, state, stateCookie } = await begin('login');
+    state.tx!.nonce_hash = await secretHash('test-nonce', SESSION_SECRET);
+    const response = await callback(
+      env,
+      stateCookie,
+      validClaims(),
+      'RS256',
+      Response.json({ id_token: idToken }),
+      new Error('sensitive-verification-error'),
+    );
+
+    expect(response.headers.get('Location')).toBe('http://localhost:3000/?error=telegram_failed');
+    expect(diagnosticEvents(info)).toContainEqual({
+      stage: 'jwt_header',
+      result: 'observed',
+      alg: 'RS256',
+      kid: 'telegram-key-1',
+    });
+    expect(diagnosticEvents(info)).toContainEqual({ stage: 'verification', result: 'failed', errorClass: 'Error' });
+    expectSafeDiagnostics(info, [idToken, 'sensitive-verification-error', 'telegram-code', 'test-nonce']);
+  });
+
   it('rejects expired callback transaction', async () => {
     const { env, state, stateCookie } = await begin('login', {
       identity: { user_id: 'existing-user' },
@@ -294,6 +391,20 @@ describe('Telegram OIDC authentication', () => {
     expect(state.sessionCreated).toBe(false);
   });
 
+  it('categorizes claim mismatch without logging claim values', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { env, state, stateCookie } = await begin('login', {
+      identity: { user_id: 'existing-user' },
+      user: { id: 'existing-user', username: 'existing', display_name: 'Existing', status: 'active' },
+    });
+    state.tx!.nonce_hash = await secretHash('test-nonce', SESSION_SECRET);
+    const response = await callback(env, stateCookie, validClaims({ nonce: 'wrong-nonce' }));
+
+    expect(response.headers.get('Location')).toBe('http://localhost:3000/?error=telegram_failed');
+    expect(diagnosticEvents(info)).toContainEqual({ stage: 'claims', result: 'mismatch', category: 'nonce' });
+    expectSafeDiagnostics(info, ['wrong-nonce', 'test-nonce', 'existing-user', 'existing', 'telegram-subject']);
+  });
+
   it('rejects unsupported JWT algorithm', async () => {
     const { env, state, stateCookie } = await begin('login', {
       identity: { user_id: 'existing-user' },
@@ -314,5 +425,17 @@ describe('Telegram OIDC authentication', () => {
     expect(response.headers.get('Location')).toBe('http://localhost:3000/?error=telegram_failed');
     expect(state.sessionCreated).toBe(false);
     expect(state.batchQueries).toHaveLength(0);
+  });
+
+  it('diagnoses missing identity and preserves generic redirect', async () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+    const { env, state, stateCookie } = await begin('login');
+    state.tx!.nonce_hash = await secretHash('test-nonce', SESSION_SECRET);
+    const response = await callback(env, stateCookie);
+
+    expect(response.headers.get('Location')).toBe('http://localhost:3000/?error=telegram_failed');
+    expect(diagnosticEvents(info)).toContainEqual({ stage: 'identity_persistence', result: 'missing' });
+    expect(diagnosticEvents(info)).toContainEqual({ stage: 'identity_persistence', result: 'login_identity_missing' });
+    expectSafeDiagnostics(info, ['telegram-subject', 'telegram-id-token', 'test-nonce', 'telegram-code']);
   });
 });

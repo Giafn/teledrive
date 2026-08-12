@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -179,8 +182,96 @@ test('final descriptors require whole-file MD5 only for small files', () => {
 test('browser graph is pure planner source, not a live browser proof', async () => {
   const result = await assertBrowserGraph();
   assert.equal(result.liveBrowserProof, false);
-  assert.equal(result.files, 5);
+  assert.equal(result.auditedFiles, result.files);
+  assert.equal(result.rootReachableFiles, 5);
 });
+
+test('browser graph audits unreachable source files', async () => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'gramjs-browser-graph-'));
+  try {
+    await writeFile(path.join(sourceRoot, 'index.ts'), 'export const ok = true;\n');
+    await writeFile(path.join(sourceRoot, 'hidden.ts'), 'eval("blocked");\n');
+    await assert.rejects(assertBrowserGraph(sourceRoot), /forbidden browser\/runtime token/);
+  } finally {
+    await rm(sourceRoot, { recursive: true, force: true });
+  }
+});
+
+test('browser graph rejects unreachable generated-TL import', async () => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'gramjs-browser-graph-'));
+  try {
+    await writeFile(path.join(sourceRoot, 'index.ts'), 'export const ok = true;\n');
+    await writeFile(path.join(sourceRoot, 'hidden.ts'), "import x from './tl/generated.ts';\n");
+    await assert.rejects(assertBrowserGraph(sourceRoot), /forbidden import/);
+  } finally {
+    await rm(sourceRoot, { recursive: true, force: true });
+  }
+});
+
+test('browser graph rejects unreachable WebSocket source', async () => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'gramjs-browser-graph-'));
+  try {
+    await writeFile(path.join(sourceRoot, 'index.ts'), 'export const ok = true;\n');
+    await writeFile(path.join(sourceRoot, 'hidden.ts'), 'WebSocket;\n');
+    await assert.rejects(assertBrowserGraph(sourceRoot), /forbidden browser\/runtime token/);
+  } finally {
+    await rm(sourceRoot, { recursive: true, force: true });
+  }
+});
+
+test('browser graph rejects unreachable crypto source', async () => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'gramjs-browser-graph-'));
+  try {
+    await writeFile(path.join(sourceRoot, 'index.ts'), 'export const ok = true;\n');
+    await writeFile(path.join(sourceRoot, 'hidden.ts'), 'crypto;\n');
+    await assert.rejects(assertBrowserGraph(sourceRoot), /forbidden browser\/runtime token/);
+  } finally {
+    await rm(sourceRoot, { recursive: true, force: true });
+  }
+});
+
+test('browser graph rejects unreachable fetch source', async () => {
+  const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'gramjs-browser-graph-'));
+  try {
+    await writeFile(path.join(sourceRoot, 'index.ts'), 'export const ok = true;\n');
+    await writeFile(path.join(sourceRoot, 'hidden.ts'), 'fetch(x);\n');
+    await assert.rejects(assertBrowserGraph(sourceRoot), /forbidden browser\/runtime token/);
+  } finally {
+    await rm(sourceRoot, { recursive: true, force: true });
+  }
+});
+
+for (const [label, source, pattern] of [
+  ['vendor import', "import x from './vendor.ts';", /forbidden import/],
+  ['storage', 'localStorage.getItem("x");', /forbidden browser\/runtime token/],
+  ['endpoint literal', 'const endpoint = "x";', /forbidden browser\/runtime token/],
+  ['raw-core session import', "import x from './raw-core/session.ts';", /forbidden import/],
+  ['raw-core auth import', "import x from './raw-core/auth.ts';", /forbidden import/],
+  ['raw-core auth-sim import', "import x from './raw-core/auth-sim.ts';", /forbidden import/],
+  ['raw-core salt import', "import x from './raw-core/salt.ts';", /forbidden import/],
+  ['raw-core message-id import', "import x from './raw-core/message-id.ts';", /forbidden import/],
+  ['dynamic import', "import('./raw-core/auth.ts');", /forbidden browser\/runtime token/],
+  ['timer', 'setTimeout(() => {}, 0);', /forbidden browser\/runtime token/],
+  ['socket', 'Socket;', /forbidden browser\/runtime token/],
+  ['abridged framing', 'abridged;', /forbidden browser\/runtime token/],
+  ['obfuscation', 'obfuscation;', /forbidden browser\/runtime token/],
+  ['crc32', 'crc32;', /forbidden browser\/runtime token/],
+  ['quickAck', 'quickAck;', /forbidden browser\/runtime token/],
+  ['reconnect', 'reconnect;', /forbidden browser\/runtime token/],
+  ['resend', 'resend;', /forbidden browser\/runtime token/],
+  ['replay', 'replay;', /forbidden browser\/runtime token/],
+  ['proxy', 'proxy;', /forbidden browser\/runtime token/],
+  ['multiplexer', 'multiplexer;', /forbidden browser\/runtime token/],
+]) {
+  test(`browser graph rejects unreachable ${label}`, async () => {
+    const sourceRoot = await mkdtemp(path.join(os.tmpdir(), 'gramjs-browser-graph-'));
+    try {
+      await writeFile(path.join(sourceRoot, 'index.ts'), 'export const ok = true;\n');
+      await writeFile(path.join(sourceRoot, 'hidden.ts'), source);
+      await assert.rejects(assertBrowserGraph(sourceRoot), pattern);
+    } finally { await rm(sourceRoot, { recursive: true, force: true }); }
+  });
+}
 
 test('production apps do not reference the private planner package', async () => {
   const result = await assertNonProductionScope();

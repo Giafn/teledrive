@@ -1,0 +1,3 @@
+export const RAW_CORE_ERROR_CODES = ['cancelled','invalid-input','random-unavailable','unsupported-capability','malformed-frame','integrity-failure','replay-or-sequence-failure','clock-invalid','rsa-key-untrusted','pq-or-dh-invalid','auth-rejected','salt-invalid','resource-limit','transport-closed'] as const;
+export type RawCoreErrorCode = typeof RAW_CORE_ERROR_CODES[number];
+export class RawCoreError extends Error { readonly code: RawCoreErrorCode; constructor(code: RawCoreErrorCode, message = code) { if (!(RAW_CORE_ERROR_CODES as readonly string[]).includes(code)) throw new Error('invalid raw-core error code'); super(message); this.name='RawCoreError'; this.code=code; } }

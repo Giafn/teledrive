@@ -9,6 +9,19 @@ contracts, retry, and file-reference policy only. It deliberately does not impor
 execute, transpile, bundle, or re-export vendored runtime code. No production path
 may depend on this private package.
 
+B2.2b adds synthetic auth state-shape simulation only: opaque project-authored
+fixtures, with no crypto, auth key, TL codec, transport, or live-runtime claim.
+
+B2.2c adds a synthetic, pure opaque-frame queue/lifecycle reducer; no browser API,
+socket, endpoint, framing, traffic, or runtime proof.
+
+B2.2e adds a zero-network, test-only opaque-lane simulation; it is not browser API, endpoint, traffic, framing, or runtime evidence.
+
+Raw-core wipe ceiling: `Session.clear()` zeroes session key/keyId in memory on a
+best-effort basis, but JavaScript cannot guarantee hardware or memory wipe across
+GC and uncontrolled copies. Mitigate with ephemeral sessions per cloud file; never
+persist key material.
+
 `vendor/telegram-2.26.22.tgz` is immutable artifact source of truth. `UPSTREAM.json`
 records its npm URL, SHA-512/SHA-1 hashes, registry-advertised `gitHead`, publish
 timestamp, and audit timestamp. The registry `gitHead` is metadata only: the public
@@ -76,6 +89,7 @@ network access and never imports or executes vendor code.
   runtime proof. Phase 2B must audit a project-owned browser core before direct transfer.
 - Scope check searches web/Worker source and package manifests for references to this
   private package. It is an import-boundary check, not a production bundle proof.
+- `Session.clear()` uses in-memory zero-fill (`fill(0)`); this cannot guarantee removal from JS heap memory after GC/compaction, with upgrade path of one-shot session buffers without chained copies or one Worker isolate per session.
 
 ## Browser audit checklist
 

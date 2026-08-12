@@ -13,7 +13,7 @@
   },
   "scripts": {
     "verify:provenance": "node scripts/verify-provenance.mjs",
-    "test": "node --test test/provenance.test.mjs test/phase2.test.mjs test/tl-supply-chain.test.mjs",
+    "test": "node --test test/provenance.test.mjs test/phase2.test.mjs test/tl-supply-chain.test.mjs test/raw-core.test.mjs test/auth-sim.test.mjs test/transport-state.test.mjs test/opaque-lane-sim.test.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "browser:graph": "node scripts/assert-browser-graph.mjs",
     "scope:check": "node scripts/assert-nonproduction-scope.mjs",

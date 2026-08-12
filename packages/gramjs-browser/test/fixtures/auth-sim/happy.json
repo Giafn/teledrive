@@ -1,0 +1,9 @@
+{
+  "kind": "synthetic-mtproto-auth-sim-v1",
+  "notLive": true,
+  "source": "project-authored",
+  "nonce": "00112233445566778899aabbccddeeff",
+  "serverNonce": "ffeeddccbbaa99887766554433221100",
+  "fingerprints": ["synthetic-fp-alpha"],
+  "events": ["start", "receiveResPq", "submitDhParams", "receiveDhParamsOk", "submitClientDh", "receiveDhGen"]
+}

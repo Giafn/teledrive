@@ -25,3 +25,7 @@ apps/worker/.dev.vars.tmp
 
 # Local deepwork state
 .slim/deepwork/
+
+# BEGIN oh-my-opencode-slim clonedeps
+.slim/clonedeps/repos/
+# END oh-my-opencode-slim clonedeps
