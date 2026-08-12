@@ -1,0 +1,17 @@
+{
+  "kind": "project-owned-tl-generator",
+  "version": "b1.0.1",
+  "runtime": "v24.15.0",
+  "command": "node scripts/regenerate-tl-layer.mjs",
+  "dependencies": [],
+  "network": false,
+  "origin": "All generator code in tools/tlgen is project-owned; no copied code, canonical generator, or GramJS equivalence claimed",
+  "patchLedger": [],
+  "grammar": "TL declaration lines with signed/hex IDs, ordered name:type fields, optional generics; unsupported syntax fails closed",
+  "sourceDeclaration": "All generator code is project-owned and written here; no copied source, canonical generator, or GramJS equivalence claimed",
+  "sourceFiles": {
+    "tools/tlgen/index.mjs": {"bytes": 58, "sha256": "ce6d6b3aab96b4f1f1081f613c78c527653b8c8d1e6dba0c37866c41bb19f01c"},
+    "tools/tlgen/parser.mjs": {"bytes": 6775, "sha256": "f1428046e02f6eb4bf23401dd9d14bfd0c6143aa5c5651aaa9a189373cddd51d"},
+    "tools/tlgen/emit.mjs": {"bytes": 9028, "sha256": "02c2124c103bf7f9f30ce9fd3f7267d107ed405d47dc918bed41555fe5f04041"}
+  }
+}

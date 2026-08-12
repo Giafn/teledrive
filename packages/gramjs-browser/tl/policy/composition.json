@@ -1,0 +1,6 @@
+{
+  "layer": 223,
+  "apiPolicy": "api-layer-223.json",
+  "mtprotoPolicy": "mtproto-9088824ec1f1.json",
+  "deferred": ["login","password","messages","upload","download","document","file-reference"]
+}

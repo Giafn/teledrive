@@ -1,0 +1,430 @@
+{
+  "source": "mtproto-9088824ec1f1",
+  "mode": "static-selected-codecs",
+  "declarations": [
+    {
+      "name": "vector",
+      "id": 481674261,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [],
+      "result": "Vector t",
+      "generic": []
+    },
+    {
+      "name": "resPQ",
+      "id": 85337187,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "pq",
+          "type": "bytes"
+        },
+        {
+          "name": "server_public_key_fingerprints",
+          "type": "Vector<long>"
+        }
+      ],
+      "result": "ResPQ",
+      "generic": []
+    },
+    {
+      "name": "p_q_inner_data_dc",
+      "id": -1443537003,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "pq",
+          "type": "bytes"
+        },
+        {
+          "name": "p",
+          "type": "bytes"
+        },
+        {
+          "name": "q",
+          "type": "bytes"
+        },
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "new_nonce",
+          "type": "int256"
+        },
+        {
+          "name": "dc",
+          "type": "int"
+        }
+      ],
+      "result": "P_Q_inner_data",
+      "generic": []
+    },
+    {
+      "name": "p_q_inner_data_temp_dc",
+      "id": 1459478408,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "pq",
+          "type": "bytes"
+        },
+        {
+          "name": "p",
+          "type": "bytes"
+        },
+        {
+          "name": "q",
+          "type": "bytes"
+        },
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "new_nonce",
+          "type": "int256"
+        },
+        {
+          "name": "dc",
+          "type": "int"
+        },
+        {
+          "name": "expires_in",
+          "type": "int"
+        }
+      ],
+      "result": "P_Q_inner_data",
+      "generic": []
+    },
+    {
+      "name": "server_DH_params_ok",
+      "id": -790100132,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "encrypted_answer",
+          "type": "bytes"
+        }
+      ],
+      "result": "Server_DH_Params",
+      "generic": []
+    },
+    {
+      "name": "server_DH_inner_data",
+      "id": -1249309254,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "g",
+          "type": "int"
+        },
+        {
+          "name": "dh_prime",
+          "type": "bytes"
+        },
+        {
+          "name": "g_a",
+          "type": "bytes"
+        },
+        {
+          "name": "server_time",
+          "type": "int"
+        }
+      ],
+      "result": "Server_DH_inner_data",
+      "generic": []
+    },
+    {
+      "name": "client_DH_inner_data",
+      "id": 1715713620,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "retry_id",
+          "type": "long"
+        },
+        {
+          "name": "g_b",
+          "type": "bytes"
+        }
+      ],
+      "result": "Client_DH_Inner_Data",
+      "generic": []
+    },
+    {
+      "name": "dh_gen_ok",
+      "id": 1003222836,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "new_nonce_hash1",
+          "type": "int128"
+        }
+      ],
+      "result": "Set_client_DH_params_answer",
+      "generic": []
+    },
+    {
+      "name": "dh_gen_retry",
+      "id": 1188831161,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "new_nonce_hash2",
+          "type": "int128"
+        }
+      ],
+      "result": "Set_client_DH_params_answer",
+      "generic": []
+    },
+    {
+      "name": "dh_gen_fail",
+      "id": -1499615742,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "new_nonce_hash3",
+          "type": "int128"
+        }
+      ],
+      "result": "Set_client_DH_params_answer",
+      "generic": []
+    },
+    {
+      "name": "rpc_result",
+      "id": -212046591,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "req_msg_id",
+          "type": "long"
+        },
+        {
+          "name": "result",
+          "type": "Object"
+        }
+      ],
+      "result": "RpcResult",
+      "generic": []
+    },
+    {
+      "name": "msg_container",
+      "id": 1945237724,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "messages",
+          "type": "vector<%Message>"
+        }
+      ],
+      "result": "MessageContainer",
+      "generic": []
+    },
+    {
+      "name": "message",
+      "id": 1538843921,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "msg_id",
+          "type": "long"
+        },
+        {
+          "name": "seqno",
+          "type": "int"
+        },
+        {
+          "name": "bytes",
+          "type": "int"
+        },
+        {
+          "name": "body",
+          "type": "Object"
+        }
+      ],
+      "result": "Message",
+      "generic": []
+    },
+    {
+      "name": "gzip_packed",
+      "id": 812830625,
+      "kind": "constructor",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "value",
+      "fields": [
+        {
+          "name": "packed_data",
+          "type": "bytes"
+        }
+      ],
+      "result": "Object",
+      "generic": []
+    }
+  ],
+  "methods": [
+    {
+      "name": "req_pq_multi",
+      "id": -1099002127,
+      "kind": "method",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "request",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        }
+      ],
+      "result": "ResPQ",
+      "generic": []
+    },
+    {
+      "name": "req_DH_params",
+      "id": -686627650,
+      "kind": "method",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "request",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "p",
+          "type": "bytes"
+        },
+        {
+          "name": "q",
+          "type": "bytes"
+        },
+        {
+          "name": "public_key_fingerprint",
+          "type": "long"
+        },
+        {
+          "name": "encrypted_data",
+          "type": "bytes"
+        }
+      ],
+      "result": "Server_DH_Params",
+      "generic": []
+    },
+    {
+      "name": "set_client_DH_params",
+      "id": -184262881,
+      "kind": "method",
+      "purpose": "selected MTProto envelope declaration",
+      "direction": "request",
+      "fields": [
+        {
+          "name": "nonce",
+          "type": "int128"
+        },
+        {
+          "name": "server_nonce",
+          "type": "int128"
+        },
+        {
+          "name": "encrypted_data",
+          "type": "bytes"
+        }
+      ],
+      "result": "Set_client_DH_params_answer",
+      "generic": []
+    }
+  ]
+}

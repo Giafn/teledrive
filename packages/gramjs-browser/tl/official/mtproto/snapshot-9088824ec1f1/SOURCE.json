@@ -1,0 +1,45 @@
+{
+  "kind": "captured-mtproto-snapshot",
+  "snapshot": "9088824ec1f1",
+  "layer": null,
+  "rawFiles": [
+    {
+      "file": "schema.html",
+      "bytes": 9206,
+      "sha256": "9088824ec1f1cdeb58926e215c14f4e8c363671f731297ffacd1ca1d8ab5ef45",
+      "sha512": "4fb07ccdb1049bb5fa8a2acd4d386d94927cff57de24a9544067bad28f62d9471473c50ec4642e3c0931e2eaa08164b4221d2f0a9142f55aa56a72e8048d5c7c"
+    },
+    {
+      "file": "schema.json",
+      "bytes": 8063,
+      "sha256": "0d01d96b7df87fe76ea6d034380644ce138e8ba092d4ad2a00e041ff89509b59",
+      "sha512": "8ef6ed63833a765b765761d1cd460e3a2f937ab7e514aa87344a5a304e62a544660126bf1176e55934c1cc5df1e9734fffec39a338eceee94dc868dd4d6705bc"
+    }
+  ],
+  "urls": [
+    "https://core.telegram.org/schema/mtproto",
+    "https://core.telegram.org/schema/mtproto-json"
+  ],
+  "requestedUrl": "https://core.telegram.org/schema/mtproto",
+  "finalUrl": "https://core.telegram.org/schema/mtproto",
+  "retrievedAt": "2026-08-11T17:16:16Z",
+  "capture": "project-captured frozen unlayered snapshot; HTTP 200 headers stored adjacent",
+  "authority": "schema.json structural authority; schema.html cross-check",
+  "authentication": "none",
+  "signature": "none; no independent official signature claimed",
+  "generator": "no canonical generator claimed",
+  "equivalence": "Not layer 223 or version-coupled; no GramJS equivalence claimed",
+  "termsUrl": "https://core.telegram.org/api/terms",
+  "headerFiles": {
+    "schema.html.headers": {
+      "bytes": 253,
+      "sha256": "67266a5f2b8d62ddb4ec1e9d2a09aef51a09112a42717b7e8ca3ac67b8723a4f",
+      "sha512": "693f39ddba41ea5aedf9e1ea8ed4d0f1df42cd259e73e18f839e260d9db2c11c6a3f61077e0bd1a9233270c40fdfb9b6c20610bca5443adc6e22bce21492b7fe"
+    },
+    "schema.json.headers": {
+      "bytes": 231,
+      "sha256": "5dcfa3d6d1ba58e591d47d5e1a67ba64cf91d6038dcab4e016ff3a5e8676b2fc",
+      "sha512": "32150f23b4b6ac354be04304f8cd295809a769841d4e6aadd47e03bcaab5dfb5fa6c1a888814e46b25e214f16434b98026f27e3ef4264b4f0e8281877e1acdca"
+    }
+  }
+}

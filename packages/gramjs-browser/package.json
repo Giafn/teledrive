@@ -1,0 +1,24 @@
+{
+  "name": "@teledrive/gramjs-browser",
+  "version": "0.0.0-phase2",
+  "private": true,
+  "type": "module",
+  "description": "Audited direct-transfer planner; browser runtime unavailable.",
+  "license": "UNLICENSED",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "verify:provenance": "node scripts/verify-provenance.mjs",
+    "test": "node --test test/provenance.test.mjs test/phase2.test.mjs test/tl-supply-chain.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "browser:graph": "node scripts/assert-browser-graph.mjs",
+    "scope:check": "node scripts/assert-nonproduction-scope.mjs",
+    "tl:verify": "node scripts/verify-tl-supply-chain.mjs",
+    "tl:check": "node scripts/regenerate-tl-layer.mjs --check",
+    "tl:graph": "node scripts/assert-tl-generated-graph.mjs"
+  }
+}

@@ -1,0 +1,9 @@
+@teledrive/gramjs-browser Phase 1
+
+This package records and audits a vendored snapshot of npm package telegram@2.26.22.
+The upstream MIT license and GramJS copyright notice remain in
+vendor/telegram-2.26.22/LICENSE and must travel with that snapshot.
+
+This project package currently exposes no upstream runtime. Runtime implementation,
+browser compatibility changes, and any redistribution of derived code require a
+separate streaming audit and maintainer review.

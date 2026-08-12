@@ -1,0 +1,99 @@
+{
+  "source": "api-layer-223",
+  "mode": "metadata-only",
+  "declarations": [
+    {
+      "name": "initConnection",
+      "id": -1043505495,
+      "kind": "method",
+      "purpose": "selected API layer-223 declaration",
+      "fields": [
+        {
+          "name": "flags",
+          "type": "#"
+        },
+        {
+          "name": "api_id",
+          "type": "int"
+        },
+        {
+          "name": "device_model",
+          "type": "string"
+        },
+        {
+          "name": "system_version",
+          "type": "string"
+        },
+        {
+          "name": "app_version",
+          "type": "string"
+        },
+        {
+          "name": "system_lang_code",
+          "type": "string"
+        },
+        {
+          "name": "lang_pack",
+          "type": "string"
+        },
+        {
+          "name": "lang_code",
+          "type": "string"
+        },
+        {
+          "name": "proxy",
+          "type": "flags.0?InputClientProxy"
+        },
+        {
+          "name": "params",
+          "type": "flags.1?JSONValue"
+        },
+        {
+          "name": "query",
+          "type": "!X"
+        }
+      ],
+      "result": "X",
+      "generic": [
+        "X:Type"
+      ]
+    },
+    {
+      "name": "invokeWithLayer",
+      "id": -627372787,
+      "kind": "method",
+      "purpose": "selected API layer-223 declaration",
+      "fields": [
+        {
+          "name": "layer",
+          "type": "int"
+        },
+        {
+          "name": "query",
+          "type": "!X"
+        }
+      ],
+      "result": "X",
+      "generic": [
+        "X:Type"
+      ]
+    },
+    {
+      "name": "help.getConfig",
+      "id": -990308245,
+      "kind": "method",
+      "purpose": "selected API layer-223 declaration",
+      "fields": [],
+      "result": "Config",
+      "generic": []
+    }
+  ],
+  "unresolved": [
+    "Config",
+    "DcOption",
+    "Reaction",
+    "InputClientProxy",
+    "JSONValue",
+    "X"
+  ]
+}

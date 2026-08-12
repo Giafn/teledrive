@@ -1,0 +1,31 @@
+{
+  "kind": "captured-api-layer",
+  "layer": 223,
+  "requestedUrl": "https://core.telegram.org/schema?layer=223",
+  "finalUrl": "https://core.telegram.org/schema",
+  "rawFile": "schema-layer-223.html",
+  "rawBytes": 691823,
+  "rawSha256": "ef4347a348e6a72eb52fc3de05ecdfdb0f895116c2d13e326ff8b8e35ced71e4",
+  "rawSha512": "d118ba1a60685a7a9a04854883fd71309506c111ce14ba463fe35e50798ed71cb3382b696c9c20cbbaa85ac00636321476fd41f05599fce9af2809d5914214db",
+  "retrievedAt": "2026-08-11T17:06:03Z",
+  "capture": "project-captured-rendered HTML; requested layer URL redirected to current schema URL",
+  "extraction": "pre.page_scheme > code, strict anchor/entity normalization, LF and one trailing newline",
+  "layerEvidence": "Rendered page visibly states Layer 223",
+  "authentication": "none",
+  "signature": "none; no independent official signature claimed",
+  "generator": "no canonical generator claimed",
+  "equivalence": "No GramJS or official source-tree equivalence claimed",
+  "termsUrl": "https://core.telegram.org/api/terms",
+  "rawHeaderFile": "schema-layer-223.html.headers",
+  "rawHeader": {
+    "bytes": 255,
+    "sha256": "29636db0bd6f418377c7f0428c7500e609a7300cd6003edbda3263b25e7c5253",
+    "sha512": "4e5d04ff4c83e5d1c753652d541db5870e1e03efefa4cfb043866cbc641cf45650b4db7227d9843c47dff1c1523ed1d4a1ba907124a7afa2ee6e08738faacbf6"
+  },
+  "extracted": {
+    "file": "schema-layer-223.tl",
+    "bytes": 261233,
+    "sha256": "e91d38be1709d0af9ae28bfd41ffa0c04e5092bc62dba0ad560f1660ca098ef5",
+    "sha512": "075b059bdeb6d6a8511221c7a3b3662451accf983605b8f6f5a062f891f5a48d58a3e5b4c6e4cf7a92661e36c461870ab97f30469d0f96fdb948583663f52cd6"
+  }
+}

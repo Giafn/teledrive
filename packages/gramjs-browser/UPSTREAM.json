@@ -1,0 +1,12 @@
+{
+  "npmPackage": "telegram",
+  "version": "2.26.22",
+  "tarballUrl": "https://registry.npmjs.org/telegram/-/telegram-2.26.22.tgz",
+  "integrity": "sha512-EIj7Yrjiu0Yosa3FZ/7EyPg9s6UiTi/zDQrFmR/2Mg7pIUU+XjAit1n1u9OU9h2oRnRM5M+67/fxzQluZpaJJg==",
+  "sha1": "16beb73e52403b5d5bcc4602226e39dc24217333",
+  "registryGitHead": "3aedb2e6ef216d307607f3d0f3f5b0ace6701378",
+  "gitHeadCaveat": "Registry-advertised metadata only; the public commit is unreachable and this tarball is not claimed equivalent to any GitHub commit or source tree.",
+  "sourceTimestamp": "2025-02-12T14:46:56.291Z",
+  "auditTimestamp": "2026-08-11T08:10:31.289Z",
+  "sourceOfTruth": "The immutable vendored npm tarball bytes and their independently verified hashes are source of truth for this Phase 1 baseline. The extracted vendor tree is verified file-by-file against that tarball; no generic source equivalence or GitHub commit equivalence is claimed."
+}
