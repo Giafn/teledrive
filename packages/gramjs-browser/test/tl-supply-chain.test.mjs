@@ -36,6 +36,11 @@ test('B1 copied graph rejects Node, bare import, and extra TS',()=>{
   for (const mutate of [s=>s+'\nimport "node:fs";\n',s=>s+'\nimport "external";\n']) { const dir=worktree();try { const f=path.join(dir,'tl/generated/api-layer-223/registry.ts');fs.writeFileSync(f,mutate(fs.readFileSync(f,'utf8')));assert.notEqual(spawnSync(process.execPath,[path.join(root,'scripts/assert-tl-generated-graph.mjs'),`--root=${dir}`]).status,0); } finally { cleanup(dir); } }
   const dir=worktree();try { fs.writeFileSync(path.join(dir,'tl/generated/api-layer-223/extra.ts'),'export const extra=1;');assert.notEqual(spawnSync(process.execPath,[path.join(root,'scripts/assert-tl-generated-graph.mjs'),`--root=${dir}`]).status,0); } finally { cleanup(dir); }
 });
+test('B1 v2 anchor scopes trust to protected paths',()=>{
+  const protectedFiles=spawnSync('git',['ls-files','packages/gramjs-browser/tl','packages/gramjs-browser/tools/tlgen','packages/gramjs-browser/scripts/verify-tl-supply-chain.mjs','packages/gramjs-browser/scripts/regenerate-tl-layer.mjs','packages/gramjs-browser/scripts/assert-tl-generated-graph.mjs','packages/gramjs-browser/test/tl-supply-chain.test.mjs'],{cwd:repoRoot,encoding:'utf8'}).stdout.trim().split('\n').filter(Boolean);
+  for (const file of protectedFiles) { const dir=worktree();try { const target=path.join(dir,file.slice('packages/gramjs-browser/'.length));fs.writeFileSync(target,Buffer.concat([fs.readFileSync(target),Buffer.from('x')]));assert.notEqual(run('verify-tl-supply-chain.mjs',dir).status,0,file); } finally { cleanup(dir); } }
+  const dir=worktree();try { const probe=path.join(dir,'src/raw-core/probe.ts');fs.mkdirSync(path.dirname(probe),{recursive:true});fs.writeFileSync(probe,'export const probe = true;\n');assert.equal(run('verify-tl-supply-chain.mjs',dir).status,0); } finally { cleanup(dir); }
+});
 test('generated MTProto codec uses literal constructor IDs and fails closed', async()=>{
   const encode=await import('../tl/generated/mtproto-9088824ec1f1/encode.ts');
   const decode=await import('../tl/generated/mtproto-9088824ec1f1/decode.ts');

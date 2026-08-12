@@ -63,16 +63,21 @@ same(build.generators, Object.fromEntries(generatorFiles.map((x) => [x, bytes(x)
 same(build.generatedFiles, Object.fromEntries(Object.entries(dirs).flatMap(([, dir]) => [`${dir.split('/').pop()}/MANIFEST.json`, ...Object.keys(json(`${dir}/MANIFEST.json`).files).map((file) => `${dir.split('/').pop()}/${file}`)].map((file) => [file, bytes(`tl/generated/${file}`)]))), 'build generated files');
 if (build.layer !== 223 || JSON.stringify(build.generated) !== JSON.stringify(['api-layer-223', 'mtproto-9088824ec1f1']) || !build.claims?.includes('schema-only; no runtime')) throw new Error('invalid build manifest claims');
 const repoRoot = git(['rev-parse', '--show-toplevel'], 'B1 trust root unavailable');
-const tag = 'tl-supply-chain-b1-v1';
+const tag = 'tl-supply-chain-b1-v2';
 const tagResult = spawnSync('git', ['verify-tag', tag], {cwd: repoRoot, encoding: 'utf8'});
 if (tagResult.status !== 0) throw new Error(`B1 trust tag is not a valid signed tag: ${tagResult.stderr.trim()}`);
 const tagCommit = spawnSync('git', ['rev-parse', `${tag}^{commit}`], {cwd: repoRoot, encoding: 'utf8'});
 if (tagCommit.status !== 0) throw new Error(`B1 trust tag commit resolution failed: ${tag}`);
 const packagePath = path.relative(repoRoot, root);
-const trackedDiff = spawnSync('git', ['diff', '--name-status', `${tag}^{commit}`, '--', packagePath], {cwd: repoRoot, encoding: 'utf8'});
+const protectedPaths = [
+  `${packagePath}/tl`, `${packagePath}/tools/tlgen`,
+  `${packagePath}/scripts/verify-tl-supply-chain.mjs`, `${packagePath}/scripts/regenerate-tl-layer.mjs`, `${packagePath}/scripts/assert-tl-generated-graph.mjs`,
+  `${packagePath}/test/tl-supply-chain.test.mjs`
+];
+const trackedDiff = spawnSync('git', ['diff', '--name-status', `${tag}^{commit}`, '--', ...protectedPaths], {cwd: repoRoot, encoding: 'utf8'});
 if (trackedDiff.status !== 0) throw new Error('B1 trust tag diff inspection failed');
 if (trackedDiff.stdout.trim()) throw new Error(`B1 trust tag/worktree tracked diff: ${trackedDiff.stdout.trim()}`);
-const untracked = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=all', '--', packagePath], {cwd: repoRoot, encoding: 'utf8'});
+const untracked = spawnSync('git', ['status', '--porcelain=v1', '--untracked-files=all', '--', ...protectedPaths], {cwd: repoRoot, encoding: 'utf8'});
 if (untracked.status !== 0) throw new Error('B1 trust tag untracked inspection failed');
 if (untracked.stdout.split('\n').some((line) => line.startsWith('?? '))) throw new Error(`B1 trust tag untracked package files: ${untracked.stdout.trim()}`);
 console.log(JSON.stringify({tlSupplyChain: 'verified', offline: true, outputs: 2, apiDeclarations: apiSelected.length, mtprotoDeclarations: mtSelected.length}));
