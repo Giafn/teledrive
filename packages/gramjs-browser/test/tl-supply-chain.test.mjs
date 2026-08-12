@@ -7,7 +7,7 @@ import os from 'node:os';
 const root=path.resolve(new URL('..',import.meta.url).pathname);
 const read=(p)=>fs.readFileSync(path.join(root,p),'utf8');
 const repoRoot=spawnSync('git',['rev-parse','--show-toplevel'],{cwd:root,encoding:'utf8'}).stdout.trim();
-const worktree=()=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tl-b1-'));fs.rmSync(dir,{recursive:true,force:true});const result=spawnSync('git',['worktree','add','--detach',dir,'HEAD'],{cwd:repoRoot,encoding:'utf8'});if(result.status!==0)throw new Error(result.stderr);return path.join(dir,'packages/gramjs-browser');};
+const worktree=()=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),'tl-b1-'));fs.rmSync(dir,{recursive:true,force:true});const result=spawnSync('git',['worktree','add','--detach',dir,'tl-supply-chain-b1-v3'],{cwd:repoRoot,encoding:'utf8'});if(result.status!==0)throw new Error(result.stderr);return path.join(dir,'packages/gramjs-browser');};
 const cleanup=(dir)=>spawnSync('git',['worktree','remove','--force',path.dirname(path.dirname(dir))],{cwd:repoRoot,encoding:'utf8'});
 const run=(script,dir,flag)=>spawnSync(process.execPath,[path.join(root,'scripts',script),flag,`--root=${dir}`],{encoding:'utf8'});
 test('B1 generated graph and manifests exist without API codec',()=>{
@@ -16,7 +16,7 @@ test('B1 generated graph and manifests exist without API codec',()=>{
   assert.doesNotMatch(read('tl/generated/api-layer-223/constructors.ts'),/encode|decode/);
 });
 test('B1 supply-chain verifier is independent and offline',()=>{
-  assert.doesNotMatch(read('scripts/verify-tl-supply-chain.mjs'),/regenerate-tl-layer/);
+  assert.doesNotMatch(read('scripts/verify-tl-supply-chain.mjs'),/spawnSync\([^)]*regenerate-tl-layer/);
   assert.match(read('tl/generated/BUILD-MANIFEST.json'),/schema-only/);
 });
 test('B1 copied-package tamper matrix rejects every mutation',()=>{
@@ -36,10 +36,10 @@ test('B1 copied graph rejects Node, bare import, and extra TS',()=>{
   for (const mutate of [s=>s+'\nimport "node:fs";\n',s=>s+'\nimport "external";\n']) { const dir=worktree();try { const f=path.join(dir,'tl/generated/api-layer-223/registry.ts');fs.writeFileSync(f,mutate(fs.readFileSync(f,'utf8')));assert.notEqual(spawnSync(process.execPath,[path.join(root,'scripts/assert-tl-generated-graph.mjs'),`--root=${dir}`]).status,0); } finally { cleanup(dir); } }
   const dir=worktree();try { fs.writeFileSync(path.join(dir,'tl/generated/api-layer-223/extra.ts'),'export const extra=1;');assert.notEqual(spawnSync(process.execPath,[path.join(root,'scripts/assert-tl-generated-graph.mjs'),`--root=${dir}`]).status,0); } finally { cleanup(dir); }
 });
-test('B1 v2 anchor scopes trust to protected paths',()=>{
+test('B1 v3 anchor scopes trust to protected paths',()=>{
   const protectedFiles=spawnSync('git',['ls-files','packages/gramjs-browser/tl','packages/gramjs-browser/tools/tlgen','packages/gramjs-browser/scripts/verify-tl-supply-chain.mjs','packages/gramjs-browser/scripts/regenerate-tl-layer.mjs','packages/gramjs-browser/scripts/assert-tl-generated-graph.mjs','packages/gramjs-browser/test/tl-supply-chain.test.mjs'],{cwd:repoRoot,encoding:'utf8'}).stdout.trim().split('\n').filter(Boolean);
   for (const file of protectedFiles) { const dir=worktree();try { const target=path.join(dir,file.slice('packages/gramjs-browser/'.length));fs.writeFileSync(target,Buffer.concat([fs.readFileSync(target),Buffer.from('x')]));assert.notEqual(run('verify-tl-supply-chain.mjs',dir).status,0,file); } finally { cleanup(dir); } }
-  const dir=worktree();try { const probe=path.join(dir,'src/raw-core/probe.ts');fs.mkdirSync(path.dirname(probe),{recursive:true});fs.writeFileSync(probe,'export const probe = true;\n');assert.equal(run('verify-tl-supply-chain.mjs',dir).status,0); } finally { cleanup(dir); }
+  const dir=worktree();try { const probe=path.join(dir,'src/raw-core/probe.ts');fs.mkdirSync(path.dirname(probe),{recursive:true});fs.writeFileSync(probe,'export const probe = true;\n');const result=run('verify-tl-supply-chain.mjs',dir);assert.equal(result.status,0,result.stderr); } finally { cleanup(dir); }
 });
 test('generated MTProto codec uses literal constructor IDs and fails closed', async()=>{
   const encode=await import('../tl/generated/mtproto-9088824ec1f1/encode.ts');

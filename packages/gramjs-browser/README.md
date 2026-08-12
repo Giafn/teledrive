@@ -38,7 +38,7 @@ pnpm --dir packages/gramjs-browser tl:graph
 
 ## Phase 2B.1 TL evidence
 
-Signed Git tag `tl-supply-chain-b1-v2` anchors B1 supply-chain paths only:
+Signed Git tag `tl-supply-chain-b1-v3` anchors B1 supply-chain paths only:
 `tl/**`, `tools/tlgen/**`, exact B1 scripts, and TL supply-chain test.
 Verification requires exact signed tag and matching protected worktree. Raw-core
 work gets separate review/release anchor; this tag makes no raw-core approval
