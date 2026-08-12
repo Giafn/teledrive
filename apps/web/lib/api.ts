@@ -1,10 +1,3 @@
-import type {
-  AuthenticationResponseJSON,
-  PublicKeyCredentialCreationOptionsJSON,
-  PublicKeyCredentialRequestOptionsJSON,
-  RegistrationResponseJSON,
-} from '@simplewebauthn/browser';
-
 export type ApiUser = { id: string; username: string; displayName: string };
 export type Folder = { id: string; name: string; parentId: string | null };
 export type Workspace = { id: string; name: string };
@@ -164,14 +157,6 @@ export type ExportResponse = {
   parts: ExportPart[];
 };
 
-export type PasskeyRegisterOptionsResponse = {
-  challengeId: string;
-  options: PublicKeyCredentialCreationOptionsJSON;
-};
-export type PasskeyAuthenticateOptionsResponse = {
-  challengeId: string;
-  options: PublicKeyCredentialRequestOptionsJSON;
-};
 export type AuthResponse = { user: ApiUser; csrfToken: string };
 export type CurrentSessionResponse = { user: ApiUser | null };
 
@@ -193,18 +178,7 @@ type JsonRecord = Record<string, unknown>;
 
 export interface ApiClient {
   getCsrf(): Promise<string>;
-  registerPasskeyOptions(
-    userName: string,
-    displayName?: string,
-    bootstrapToken?: string,
-  ): Promise<PasskeyRegisterOptionsResponse>;
-  registerPasskeyVerify(
-    challengeId: string,
-    response: RegistrationResponseJSON,
-    bootstrapToken?: string,
-  ): Promise<AuthResponse>;
-  authenticatePasskeyOptions(userName: string): Promise<PasskeyAuthenticateOptionsResponse>;
-  authenticatePasskeyVerify(challengeId: string, response: AuthenticationResponseJSON): Promise<AuthResponse>;
+  authenticateTelegram(params: { telegramId: number | string; displayName?: string; username?: string; phone?: string }): Promise<AuthResponse>;
   getCurrentSession(): Promise<ApiUser | null>;
   logout(): Promise<{ ok: true }>;
   getWorkspace(): Promise<WorkspaceResponse>;
@@ -309,51 +283,12 @@ export class MetadataApiClient implements ApiClient {
     return this.csrfRequest;
   }
 
-  async registerPasskeyOptions(userName: string, displayName?: string, bootstrapToken?: string) {
-    const headers = bootstrapToken ? { 'X-Bootstrap-Token': bootstrapToken } : undefined;
-    return this.request<PasskeyRegisterOptionsResponse>(
-      '/v1/auth/passkey/register/options',
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ userName, ...(displayName === undefined ? {} : { displayName }) }),
-      },
-      true,
-    );
-  }
-
-  async registerPasskeyVerify(challengeId: string, response: RegistrationResponseJSON, bootstrapToken?: string) {
-    const headers = bootstrapToken ? { 'X-Bootstrap-Token': bootstrapToken } : undefined;
+  async authenticateTelegram(params: { telegramId: number | string; displayName?: string; username?: string; phone?: string }) {
     const result = await this.request<AuthResponse>(
-      '/v1/auth/passkey/register/verify',
+      '/v1/auth/telegram',
       {
         method: 'POST',
-        headers,
-        body: JSON.stringify({ challengeId, response }),
-      },
-      true,
-    );
-    this.csrfToken = result.csrfToken;
-    return result;
-  }
-
-  authenticatePasskeyOptions(userName: string) {
-    return this.request<PasskeyAuthenticateOptionsResponse>(
-      '/v1/auth/passkey/authenticate/options',
-      {
-        method: 'POST',
-        body: JSON.stringify({ userName }),
-      },
-      true,
-    );
-  }
-
-  async authenticatePasskeyVerify(challengeId: string, response: AuthenticationResponseJSON) {
-    const result = await this.request<AuthResponse>(
-      '/v1/auth/passkey/authenticate/verify',
-      {
-        method: 'POST',
-        body: JSON.stringify({ challengeId, response }),
+        body: JSON.stringify(params),
       },
       true,
     );

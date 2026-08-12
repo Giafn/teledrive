@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { authenticatePasskey, registerPasskey } from '../lib/passkey';
 import {
   api,
   ApiError,
@@ -779,6 +778,39 @@ export default function Page() {
           onConfirm={completeMove}
         />
       )}
+      <nav className={styles.mobileNav} aria-label="Navigasi bawah mobile">
+        <button
+          className={`${styles.mobileNavItem} ${view === 'drive' ? styles.mobileNavActive : ''}`}
+          onClick={() => {
+            setView('drive');
+            if (workspace) loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
+          }}
+        >
+          <Icon name="drive" size={20} />
+          <span>Drive</span>
+        </button>
+        <button
+          className={`${styles.mobileNavItem} ${view === 'recent' ? styles.mobileNavActive : ''}`}
+          onClick={() => loadSpecial('recent')}
+        >
+          <Icon name="clock" size={20} />
+          <span>Terbaru</span>
+        </button>
+        <button
+          className={`${styles.mobileNavItem} ${view === 'trash' ? styles.mobileNavActive : ''}`}
+          onClick={() => loadSpecial('trash')}
+        >
+          <Icon name="trash" size={20} />
+          <span>Sampah</span>
+        </button>
+        <button
+          className={`${styles.mobileNavItem} ${view === 'settings' ? styles.mobileNavActive : ''}`}
+          onClick={() => setView('settings')}
+        >
+          <Icon name="settings" size={20} />
+          <span>Pengaturan</span>
+        </button>
+      </nav>
     </main>
   );
 }
@@ -970,21 +1002,33 @@ function AuthScreen({
   onError: (v: string) => void;
   onSuccess: (u: { displayName: string; username: string }) => void;
 }) {
-  const [register, setRegister] = useState(false);
-  const [username, setUsername] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [bootstrap, setBootstrap] = useState('');
+  const [step, setStep] = useState<'phone' | 'code' | 'password'>('phone');
+  const [phone, setPhone] = useState('');
+  const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
   async function submit() {
-    if (!username.trim() || (register && !displayName.trim())) return;
+    if (!phone.trim() || (step === 'code' && !code.trim()) || (step === 'password' && !password)) return;
     onBusy(true);
     onError('');
-    const token = bootstrap;
-    setBootstrap('');
     try {
-      const result = register
-        ? await registerPasskey(username.trim(), displayName.trim(), token || undefined)
-        : await authenticatePasskey(username.trim());
-      onSuccess(result.user);
+      const authState =
+        step === 'phone'
+          ? await telegramGateway.sendCode(phone.trim())
+          : step === 'code'
+            ? await telegramGateway.signIn(code.trim())
+            : await telegramGateway.checkPassword(password);
+      if (authState.state === 'code_sent') setStep('code');
+      else if (authState.state === 'password_required') setStep('password');
+      else if (authState.state === 'authorized') {
+        const session = await telegramGateway.checkSession();
+        if (!session.user) throw new Error('Sesi Telegram tidak ditemukan.');
+        const result = await api.authenticateTelegram({
+          telegramId: session.user.id,
+          displayName: session.user.displayName,
+          phone: phone.trim(),
+        });
+        onSuccess(result.user);
+      }
     } catch (e) {
       onError(message(e));
     } finally {
@@ -1001,62 +1045,28 @@ function AuthScreen({
           ruang<span className={styles.dot}>.</span>
         </div>
         <div className={styles.eyebrow}>DRIVE PRIBADI</div>
-        <h1>{register ? 'Mulai ruangmu.' : 'Selamat datang kembali.'}</h1>
-        <p className={styles.authIntro}>File rapi, sesi tetap di perangkatmu. Masuk dengan passkey tanpa password.</p>
-        {register && (
-          <label className={styles.field}>
-            Nama tampilan
-            <input
-              autoFocus
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Contoh: Andi Rahman"
-            />
-          </label>
-        )}
+        <h1>Masuk dengan Telegram.</h1>
+        <p className={styles.authIntro}>Nomor telepon Telegram menjadi login sekaligus menghubungkan akun MTProto.</p>
         <label className={styles.field}>
-          Username
+          {step === 'phone' ? 'Nomor telepon Telegram' : step === 'code' ? 'Kode Telegram' : 'Password 2FA Telegram'}
           <input
-            autoFocus={!register}
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="andi"
-            autoComplete="username"
+            autoFocus
+            type={step === 'password' ? 'password' : 'text'}
+            value={step === 'phone' ? phone : step === 'code' ? code : password}
+            onChange={(e) => {
+              if (step === 'phone') setPhone(e.target.value);
+              else if (step === 'code') setCode(e.target.value);
+              else setPassword(e.target.value);
+            }}
+            placeholder={step === 'phone' ? '+628123456789' : step === 'code' ? '12345' : 'Password 2FA'}
+            autoComplete={step === 'password' ? 'current-password' : 'one-time-code'}
           />
         </label>
-        {register && (
-          <label className={styles.field}>
-            Bootstrap token <span className={styles.fieldHint}>sekali pakai</span>
-            <input
-              value={bootstrap}
-              onChange={(e) => setBootstrap(e.target.value)}
-              autoComplete="off"
-              placeholder="Dari administrator"
-            />
-          </label>
-        )}{' '}
-        {error && (
-          <div className={styles.formError} role="alert">
-            <Icon name="info" size={16} />
-            {error}
-          </div>
-        )}
+        {error && <div className={styles.formError} role="alert"><Icon name="info" size={16} />{error}</div>}
         <button className={styles.primaryButton} disabled={busy} onClick={submit}>
-          {busy ? 'Menyiapkan passkey…' : register ? 'Daftar dengan passkey' : 'Masuk dengan passkey'}
+          {busy ? 'Menghubungkan…' : step === 'phone' ? 'Kirim kode Telegram' : step === 'code' ? 'Verifikasi kode' : 'Verifikasi 2FA'}
         </button>
-        <p className={styles.authSwitch}>
-          {register ? 'Sudah punya akun?' : 'Belum punya akun?'}{' '}
-          <button
-            onClick={() => {
-              setRegister(!register);
-              onError('');
-              setBootstrap('');
-            }}
-          >
-            {register ? 'Masuk' : 'Daftar'}
-          </button>
-        </p>
-        <small className={styles.secureNote}>Butuh browser modern dan secure origin (HTTPS atau localhost).</small>
+        <small className={styles.secureNote}>Telegram tidak mengirim password atau session ke server Teledrive.</small>
       </div>
     </main>
   );
