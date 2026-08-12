@@ -1,5 +1,8 @@
 node_modules
 .next
+.slim
+.vercel
+out
 
 # Ignore files
 .DS_Store
