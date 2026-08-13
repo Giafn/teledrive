@@ -212,6 +212,38 @@ function formatDate(...values: unknown[]) {
   return '—';
 }
 
+async function createThumbnail(file: File): Promise<string | undefined> {
+  if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) return undefined;
+  const url = URL.createObjectURL(file);
+  try {
+    if (file.type.startsWith('video/')) {
+      const video = document.createElement('video');
+      video.src = url;
+      video.muted = true;
+      await new Promise<void>((resolve, reject) => {
+        video.addEventListener('loadeddata', () => resolve(), { once: true });
+        video.addEventListener('error', () => reject(new Error('Video thumbnail failed')), { once: true });
+      });
+      const canvas = document.createElement('canvas');
+      const scale = Math.min(1, 480 / video.videoWidth);
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL('image/jpeg', 0.78);
+    }
+    const image = await createImageBitmap(file);
+    const scale = Math.min(1, 480 / image.width);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(image.width * scale));
+    canvas.height = Math.max(1, Math.round(image.height * scale));
+    canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
+    image.close();
+    return canvas.toDataURL('image/jpeg', 0.78);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 export default function Page() {
   const [user, setUser] = useState<{ displayName: string; username: string } | null>(null);
   const [sessionReady, setSessionReady] = useState(false);
@@ -234,7 +266,8 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [query, setQuery] = useState('');
-  const [layout, setLayout] = useState<'list' | 'grid'>('list');
+  const [layout, setLayout] = useState<'list' | 'grid'>('grid');
+  const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
   const [sort, setSort] = useState('Terakhir diubah');
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [downloads, setDownloads] = useState<Record<string, DownloadAction>>({});
@@ -484,6 +517,9 @@ export default function Page() {
       });
       const item = { id, file, controller };
       setUploads((items) => [item, ...items]);
+      void createThumbnail(file).then((thumbnail) => {
+        if (thumbnail) setThumbnails((current) => ({ ...current, [id]: thumbnail }));
+      });
       setDrawer(true);
       controller
         .start()
@@ -711,9 +747,20 @@ export default function Page() {
               />
             )}{' '}
             {!loading && !loadError && (
-              <div className={`${styles.fileArea} ${layout === 'grid' ? styles.grid : ''}`}>
-                {items.map((item) => (
-                  <FileRow
+               <div className={`${styles.fileArea} ${layout === 'grid' ? styles.grid : ''}`}>
+                 {layout === 'grid' && (
+                   <GalleryView
+                     items={items}
+                     thumbnails={thumbnails}
+                     onOpen={(item) =>
+                       item.kind === 'folder'
+                         ? loadFolder(item.id, [...crumbs, { id: item.id, name: item.name }])
+                         : setPreview({ id: item.id, name: item.name, mime: item.mime ?? 'application/octet-stream', size: item.size })
+                     }
+                   />
+                 )}
+                 {layout === 'list' && items.map((item) => (
+                   <FileRow
                     key={item.id}
                     item={item}
                     onOpen={() =>
@@ -1105,6 +1152,45 @@ function NavItem({
     </button>
   );
 }
+function GalleryView({ items, thumbnails, onOpen }: { items: FolderItem[]; thumbnails: Record<string, string>; onOpen: (item: FolderItem) => void }) {
+  return (
+    <div className={styles.galleryGrid}>
+      {items.map((item) => (
+        <button className={styles.galleryCard} key={item.id} onClick={() => onOpen(item)}>
+          <div className={styles.galleryThumb}>
+            <GalleryThumbnail item={item} src={thumbnails[item.id]} />
+          </div>
+          <b>{item.name}</b>
+          <small>{item.kind === 'folder' ? 'Folder' : formatSize(item.size)}</small>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
+  const [preview, setPreview] = useState(src);
+  useEffect(() => {
+    if (src || item.kind === 'folder' || !item.mime?.startsWith('image/') && !item.mime?.startsWith('video/')) return;
+    const controller = createDownloadController();
+    let active = true;
+    void controller.loadPreview(item.id).then(async (result) => {
+      if (item.mime?.startsWith('video/')) {
+        if (active) setPreview(result.url);
+        else result.revoke();
+      } else if (active) setPreview(result.url);
+      else result.revoke();
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [item.id, item.kind, item.mime, src]);
+  if (item.kind === 'folder') return <span className={styles.galleryPlaceholder}><Icon name="folder" size={28} /></span>;
+  return preview ? (
+    item.mime?.startsWith('video/') ? <video src={preview} muted preload="metadata" /> : <img src={preview} alt="" />
+  ) : <span className={`${styles.galleryPlaceholder} ${mimeStyle(item.mime)}`}><Icon name="info" size={28} /></span>;
+}
+
 function FileRow({
   item,
   onOpen,
