@@ -244,6 +244,9 @@ export default function Page() {
   const fileInput = useRef<HTMLInputElement>(null);
   const settings = useRef({ chunkSize: 16 * 1024 * 1024, concurrency: 3 });
   useEffect(() => {
+    if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
+  }, []);
+  useEffect(() => {
     setMenuId(null);
     setSelected({});
   }, [view]);
