@@ -1,15 +1,8 @@
 import { Hono, type Context } from 'hono';
-import {
-  generateAuthenticationOptions,
-  generateRegistrationOptions,
-  verifyAuthenticationResponse,
-  verifyRegistrationResponse,
-} from '@simplewebauthn/server';
 import { validateManifest } from './manifest';
 import {
   base64url,
   constantTimeEqual,
-  coerceD1PublicKey,
   cookieValue,
   isExactOrigin,
   randomToken,
@@ -217,20 +210,22 @@ async function setSession(c: Context<AppEnv>, userId: string): Promise<string> {
 }
 
 async function validateMutationCsrf(c: Context<AppEnv>): Promise<void> {
-  const csrf = c.req.header('X-CSRF-Token');
-  if (!csrf || csrf.length > 256) fail(403, 'CSRF_REQUIRED', 'CSRF token required');
   const session = await getSession(c);
   if (session) {
+    const csrf = c.req.header('X-CSRF-Token');
+    if (!csrf || csrf.length > 256) fail(403, 'CSRF_REQUIRED', 'CSRF token required');
     const expected = await secretHash(csrf, c.env.APP_SESSION_SECRET);
     if (!constantTimeEqual(expected, session.csrf_hash)) fail(403, 'CSRF_INVALID', 'CSRF token invalid');
     return;
   }
 
-  if (c.req.path.startsWith('/v1/auth/passkey/')) {
-    const cookieToken = requestCookie(c, CSRF_COOKIE);
-    if (cookieToken && constantTimeEqual(cookieToken, csrf)) return;
+  if (c.req.path === '/v1/auth/telegram') {
+    return;
   }
-  fail(401, 'AUTH_REQUIRED', 'Authentication required');
+
+  const csrf = c.req.header('X-CSRF-Token');
+  if (!csrf || csrf.length > 256) fail(403, 'CSRF_REQUIRED', 'CSRF token required');
+  fail(403, 'CSRF_REQUIRED', 'CSRF token required');
 }
 
 function cursorEncode(createdAt: string, id: string): string {
@@ -261,44 +256,21 @@ function metadataCursor(c: Context<AppEnv>) {
   return cursor;
 }
 
-function isWebAuthnResponse(value: unknown, authentication: boolean): boolean {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const response = (value as Record<string, unknown>).response;
-  if (!response || typeof response !== 'object' || Array.isArray(response)) return false;
-  const body = response as Record<string, unknown>;
-  const common =
-    typeof (value as Record<string, unknown>).id === 'string' &&
-    typeof (value as Record<string, unknown>).rawId === 'string' &&
-    (value as Record<string, unknown>).type === 'public-key' &&
-    typeof body.clientDataJSON === 'string';
-  return (
-    common &&
-    (authentication
-      ? typeof body.authenticatorData === 'string' && typeof body.signature === 'string'
-      : typeof body.attestationObject === 'string')
-  );
-}
-
-function bytesFromDb(value: unknown): Uint8Array<ArrayBuffer> {
-  try {
-    return coerceD1PublicKey(value);
-  } catch {
-    fail(500, 'DATABASE_ERROR', 'Stored credential is invalid');
-  }
-}
-
 function changes(result: { meta?: { changes?: number } }): number {
   return result.meta?.changes ?? 0;
 }
 
-async function purgeChallenges(db: D1Database): Promise<void> {
-  const current = Date.now();
-  const expired = new Date(current).toISOString();
-  const oldUsed = new Date(current - 10 * 60_000).toISOString();
-  await db
-    .prepare('DELETE FROM webauthn_challenges WHERE expires_at <= ? OR (used_at IS NOT NULL AND used_at < ?)')
-    .bind(expired, oldUsed)
-    .run();
+export function prepareBootstrapPasskeyStatement(
+  db: D1Database,
+  credentialId: string,
+  publicKey: unknown,
+  counter: number,
+  transport: string,
+  created: string,
+  userId: string,
+): D1PreparedStatement {
+  return db.prepare('SELECT ? AS credential_id, ? AS public_key, ? AS counter, ? AS transports, ? AS created_at, ? AS user_id')
+    .bind(credentialId, publicKey, counter, transport, created, userId);
 }
 
 function rateLimitAuth(c: Context<AppEnv>): void {
@@ -419,23 +391,6 @@ async function objectForUser(c: Context<AppEnv>, userId: string, objectId: strin
   return object;
 }
 
-export function prepareBootstrapPasskeyStatement(
-  db: D1Database,
-  credentialId: string,
-  publicKey: unknown,
-  counter: number,
-  transport: string,
-  created: string,
-  userId: string,
-): D1PreparedStatement {
-  return db
-    .prepare(
-      `INSERT INTO passkeys (id, user_id, public_key, counter, transports, created_at)
-    SELECT ?, id, ?, ?, ?, ? FROM users WHERE id = ? AND status = 'active'`,
-    )
-    .bind(credentialId, publicKey, counter, transport, created, userId);
-}
-
 // Request IDs and security headers are attached to every response, including errors.
 app.use('*', async (c, next) => {
   const incoming = c.req.header('X-Request-ID');
@@ -474,11 +429,6 @@ app.use('*', async (c, next) => {
       fail(403, 'ORIGIN_REQUIRED', 'Exact application origin required');
     await validateMutationCsrf(c);
   }
-  await next();
-});
-
-app.use('/v1/auth/passkey/*', async (c, next) => {
-  rateLimitAuth(c);
   await next();
 });
 
@@ -522,311 +472,60 @@ app.get('/v1/auth/session', async (c) => {
   return c.json({ user: { id: session.id, username: session.username, displayName: session.display_name } });
 });
 
-app.post('/v1/auth/passkey/register/options', async (c) => {
-  requireConfig(c.env, 'APP_ORIGIN', 'RP_ID', 'RP_NAME', 'BOOTSTRAP_TOKEN');
-  const body = record(await readJson<unknown>(c));
-  await purgeChallenges(c.env.DB);
-  const active = await first<{ count: number }>(
-    c.env.DB,
-    "SELECT COUNT(*) AS count FROM users WHERE status = 'active'",
-  );
-  const session = await getSession(c);
-  let user: UserRow | null = null;
-  let mode: 'bootstrap_registration' | 'add_passkey';
-  let issuedSessionId: string | null = null;
-  if ((active?.count ?? 0) === 0) {
-    const bootstrap = c.req.header('X-Bootstrap-Token');
-    if (!bootstrap || !constantTimeEqual(bootstrap, c.env.BOOTSTRAP_TOKEN))
-      fail(403, 'BOOTSTRAP_REQUIRED', 'Bootstrap token required');
-    const username = stringValue(body.userName, 'userName', 128).trim().toLocaleLowerCase('en-US');
-    if (!username) fail(422, 'INVALID_FIELD', 'userName is invalid');
-    const displayName = stringValue(body.displayName ?? username, 'displayName', 128).trim();
-    if (!displayName) fail(422, 'INVALID_FIELD', 'displayName is invalid');
-    user = await first<UserRow>(
-      c.env.DB,
-      'SELECT id, username, display_name, status FROM users WHERE username = ?',
-      username,
-    );
-    if (user && user.status !== 'pending') fail(403, 'BOOTSTRAP_CLOSED', 'Bootstrap registration is closed');
-    if (!user) {
-      user = { id: randomToken(18), username, display_name: displayName, status: 'pending' };
-    }
-    mode = 'bootstrap_registration';
-  } else {
-    if (!session) fail(401, 'AUTH_REQUIRED', 'Authenticated session required to add passkey');
-    user = session;
-    mode = 'add_passkey';
-    issuedSessionId = session.session_id;
-  }
-
-  const options = await generateRegistrationOptions({
-    rpName: c.env.RP_NAME,
-    rpID: c.env.RP_ID,
-    userName: user.username,
-    userDisplayName: user.display_name,
-    userID: new TextEncoder().encode(user.id),
-    attestationType: 'none',
-    timeout: 60_000,
-    authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
-  });
-  const challengeId = randomToken(18);
-  try {
-    const statements = [
-      ...(user.status === 'pending'
-        ? [
-            c.env.DB.prepare(
-              'INSERT INTO users (id, username, display_name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
-            ).bind(user.id, user.username, user.display_name, user.status, now(), now()),
-          ]
-        : []),
-      c.env.DB.prepare(
-        `
-        INSERT INTO webauthn_challenges (id, user_id, kind, mode, issued_session_id, challenge, metadata_json, expires_at, created_at)
-        VALUES (?, ?, 'registration', ?, ?, ?, ?, ?, ?)
-      `,
-      ).bind(
-        challengeId,
-        user.id,
-        mode,
-        issuedSessionId,
-        options.challenge,
-        JSON.stringify({ username: user.username }),
-        new Date(Date.now() + 5 * 60_000).toISOString(),
-        now(),
-      ),
-    ];
-    await c.env.DB.batch(statements);
-  } catch (error) {
-    if (isConstraintError(error) && mode === 'bootstrap_registration')
-      fail(409, 'BOOTSTRAP_IN_PROGRESS', 'Another bootstrap registration is in progress');
-    throw error;
-  }
-  return c.json({ challengeId, options });
-});
-
-app.post('/v1/auth/passkey/register/verify', async (c) => {
-  requireConfig(c.env, 'APP_ORIGIN', 'RP_ID', 'APP_SESSION_SECRET');
-  const body = record(await readJson<unknown>(c));
-  const challengeId = stringValue(body.challengeId, 'challengeId', 128);
-  if (!isWebAuthnResponse(body.response, false)) fail(422, 'INVALID_PASSKEY_RESPONSE', 'Passkey response is invalid');
-  const claimed = await c.env.DB.prepare(
-    `
-    UPDATE webauthn_challenges SET used_at = ?
-    WHERE id = ? AND kind = 'registration' AND mode IN ('bootstrap_registration', 'add_passkey')
-      AND used_at IS NULL AND expires_at > ?
-  `,
-  )
-    .bind(now(), challengeId, now())
-    .run();
-  if ((claimed.meta?.changes ?? 0) !== 1) fail(422, 'CHALLENGE_INVALID', 'Passkey challenge expired or already used');
-  const challenge = await first<{ user_id: string; challenge: string; mode: string; issued_session_id: string | null }>(
-    c.env.DB,
-    'SELECT user_id, challenge, mode, issued_session_id FROM webauthn_challenges WHERE id = ?',
-    challengeId,
-  );
-  if (!challenge?.user_id || !['bootstrap_registration', 'add_passkey'].includes(challenge.mode))
-    fail(422, 'CHALLENGE_INVALID', 'Passkey challenge invalid');
-  if (challenge.mode === 'bootstrap_registration') {
-    requireConfig(c.env, 'BOOTSTRAP_TOKEN');
-    const bootstrap = c.req.header('X-Bootstrap-Token');
-    if (!bootstrap || !constantTimeEqual(bootstrap, c.env.BOOTSTRAP_TOKEN))
-      fail(403, 'BOOTSTRAP_REQUIRED', 'Bootstrap token required');
-    const pending = await first<{ status: string }>(
-      c.env.DB,
-      'SELECT status FROM users WHERE id = ?',
-      challenge.user_id,
-    );
-    if (!pending || pending.status !== 'pending') fail(403, 'BOOTSTRAP_CLOSED', 'Bootstrap registration is closed');
-  } else {
-    const session = await getSession(c);
-    if (!session || session.session_id !== challenge.issued_session_id || session.id !== challenge.user_id) {
-      fail(401, 'AUTH_REQUIRED', 'Issuing session is no longer valid');
-    }
-  }
-  const response = body.response as Parameters<typeof verifyRegistrationResponse>[0]['response'];
-  let verification: Awaited<ReturnType<typeof verifyRegistrationResponse>>;
-  try {
-    verification = await verifyRegistrationResponse({
-      response,
-      expectedChallenge: challenge.challenge,
-      expectedOrigin: c.env.APP_ORIGIN,
-      expectedRPID: c.env.RP_ID,
-      requireUserVerification: true,
-    });
-  } catch {
-    fail(422, 'PASSKEY_VERIFICATION_FAILED', 'Passkey verification failed');
-  }
-  if (!verification.verified || !verification.registrationInfo)
-    fail(422, 'PASSKEY_VERIFICATION_FAILED', 'Passkey verification failed');
-  const credential = verification.registrationInfo.credential;
-  const user = await first<UserRow>(
-    c.env.DB,
-    'SELECT id, username, display_name, status FROM users WHERE id = ?',
-    challenge.user_id,
-  );
-  if (!user) fail(422, 'USER_NOT_FOUND', 'Registration user is invalid');
+app.post('/v1/auth/telegram', async (c) => {
+  applySecurityHeaders(c);
+  rateLimitAuth(c);
+  const body = record(metadataOnly(await readJson<Record<string, unknown>>(c)));
+  const telegramId =
+    typeof body.telegramId === 'number' && Number.isSafeInteger(body.telegramId)
+      ? String(body.telegramId)
+      : stringValue(body.telegramId, 'telegramId', 64);
+  const displayName = optionalString(body.displayName, 'displayName', 255) || `User ${telegramId}`;
+  const username = optionalString(body.username, 'username', 255) || `tg_${telegramId}`;
+  const phone = optionalString(body.phone, 'phone', 64);
   const created = now();
-  const credentialId = credential.id;
-  const transport = 'transports' in credential ? JSON.stringify(credential.transports ?? []) : '[]';
-  try {
-    const workspaceId = randomToken(18);
-    const rootId = randomToken(18);
-    const statements =
-      challenge.mode === 'bootstrap_registration'
-        ? [
-            c.env.DB.prepare(
-              "UPDATE users SET status = 'active', updated_at = ? WHERE id = ? AND status = 'pending' AND NOT EXISTS (SELECT 1 FROM users WHERE status = 'active')",
-            ).bind(created, user.id),
-            prepareBootstrapPasskeyStatement(
-              c.env.DB,
-              credentialId,
-              credential.publicKey,
-              credential.counter,
-              transport,
-              created,
-              user.id,
-            ),
-            c.env.DB.prepare(
-              `INSERT INTO workspaces (id, owner_id, name, created_at, updated_at)
-        SELECT ?, id, 'My Drive', ?, ? FROM users WHERE id = ? AND status = 'active'
-          AND NOT EXISTS (SELECT 1 FROM workspaces WHERE owner_id = ?)`,
-            ).bind(workspaceId, created, created, user.id, user.id),
-            c.env.DB.prepare(
-              `INSERT INTO folders (id, workspace_id, parent_id, name, normalized_name, path_key, created_at, updated_at)
-        SELECT ?, id, NULL, 'My Drive', 'my drive', ?, ?, ? FROM workspaces
-        WHERE owner_id = ? AND NOT EXISTS (SELECT 1 FROM folders WHERE workspace_id = workspaces.id AND parent_id IS NULL)`,
-            ).bind(rootId, rootId, created, created, user.id),
-            c.env.DB.prepare(
-              `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
-        SELECT ?, ?, 'passkey.registered', 'user', ?, ? WHERE EXISTS (SELECT 1 FROM passkeys WHERE id = ? AND user_id = ?)`,
-            ).bind(randomToken(18), user.id, user.id, created, credentialId, user.id),
-          ]
-        : [
-            c.env.DB.prepare(
-              `INSERT INTO passkeys (id, user_id, public_key, counter, transports, created_at)
-        SELECT ?, u.id, ?, ?, ?, ? FROM users u JOIN sessions s ON s.user_id = u.id
-        WHERE u.id = ? AND u.status = 'active' AND s.id = ? AND s.expires_at > ?`,
-            ).bind(
-              credentialId,
-              credential.publicKey,
-              credential.counter,
-              transport,
-              created,
-              user.id,
-              challenge.issued_session_id,
-              now(),
-            ),
-            c.env.DB.prepare(
-              `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, created_at)
-        SELECT ?, ?, 'passkey.registered', 'user', ?, ? WHERE EXISTS (SELECT 1 FROM passkeys WHERE id = ? AND user_id = ?)`,
-            ).bind(randomToken(18), user.id, user.id, created, credentialId, user.id),
-          ];
-    const results = await c.env.DB.batch(statements);
-    const passkeyResult = challenge.mode === 'bootstrap_registration' ? results[1] : results[0];
-    if (changes(passkeyResult) !== 1) {
-      fail(
-        challenge.mode === 'bootstrap_registration' ? 409 : 401,
-        challenge.mode === 'bootstrap_registration' ? 'BOOTSTRAP_CLOSED' : 'AUTH_REQUIRED',
-        'Issuing authorization is no longer valid',
-      );
-    }
-  } catch (error) {
-    if (error instanceof HttpError) throw error;
-    if (isConstraintError(error)) fail(409, 'PASSKEY_EXISTS', 'Passkey is already registered');
-    throw error;
-  }
-  await c.env.DB.prepare('DELETE FROM webauthn_challenges WHERE id = ?').bind(challengeId).run();
-  const csrfToken = await setSession(c, user.id);
-  return c.json({ user: { id: user.id, username: user.username, displayName: user.display_name }, csrfToken });
-});
 
-app.post('/v1/auth/passkey/authenticate/options', async (c) => {
-  requireConfig(c.env, 'RP_ID');
-  const body = record(await readJson<unknown>(c));
-  await purgeChallenges(c.env.DB);
-  const username = stringValue(body.userName, 'userName', 128).trim().toLocaleLowerCase('en-US');
-  if (!username) fail(422, 'INVALID_FIELD', 'userName is invalid');
-  const user = await first<UserRow>(
+  let user = await first<UserRow>(
     c.env.DB,
-    "SELECT id, username, display_name, status FROM users WHERE username = ? AND status = 'active'",
+    'SELECT id, username, display_name, status FROM users WHERE telegram_id = ? OR username = ?',
+    telegramId,
     username,
   );
-  if (!user) fail(404, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const passkeys = await all<{ id: string }>(c.env.DB, 'SELECT id FROM passkeys WHERE user_id = ?', user.id);
-  if (passkeys.length === 0) fail(404, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const options = await generateAuthenticationOptions({
-    rpID: c.env.RP_ID,
-    allowCredentials: passkeys.map((passkey) => ({ id: passkey.id })),
-    userVerification: 'required',
-    timeout: 60_000,
-  });
-  const challengeId = randomToken(18);
-  await c.env.DB.prepare(
-    `
-    INSERT INTO webauthn_challenges (id, user_id, kind, mode, issued_session_id, challenge, metadata_json, expires_at, created_at)
-    VALUES (?, ?, 'authentication', 'authentication', NULL, ?, '{}', ?, ?)
-  `,
-  )
-    .bind(challengeId, user.id, options.challenge, new Date(Date.now() + 5 * 60_000).toISOString(), now())
-    .run();
-  return c.json({ challengeId, options });
-});
 
-app.post('/v1/auth/passkey/authenticate/verify', async (c) => {
-  requireConfig(c.env, 'APP_ORIGIN', 'RP_ID', 'APP_SESSION_SECRET');
-  const body = record(await readJson<unknown>(c));
-  const challengeId = stringValue(body.challengeId, 'challengeId', 128);
-  if (!isWebAuthnResponse(body.response, true)) fail(422, 'INVALID_PASSKEY_RESPONSE', 'Passkey response is invalid');
-  const claimed = await c.env.DB.prepare(
-    `
-    UPDATE webauthn_challenges SET used_at = ?
-    WHERE id = ? AND kind = 'authentication' AND used_at IS NULL AND expires_at > ?
-  `,
-  )
-    .bind(now(), challengeId, now())
-    .run();
-  if ((claimed.meta?.changes ?? 0) !== 1) fail(422, 'CHALLENGE_INVALID', 'Passkey challenge expired or already used');
-  const challenge = await first<{ user_id: string; challenge: string }>(
-    c.env.DB,
-    'SELECT user_id, challenge FROM webauthn_challenges WHERE id = ?',
-    challengeId,
-  );
-  if (!challenge) fail(422, 'CHALLENGE_INVALID', 'Passkey challenge invalid');
-  const passkey = await first<{ id: string; user_id: string; public_key: unknown; counter: number }>(
-    c.env.DB,
-    'SELECT id, user_id, public_key, counter FROM passkeys WHERE id = ?',
-    stringValue(body.response && (body.response as Record<string, unknown>).id, 'credentialId', 512),
-  );
-  if (!passkey || passkey.user_id !== challenge.user_id) fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const response = body.response as Parameters<typeof verifyAuthenticationResponse>[0]['response'];
-  let verification: Awaited<ReturnType<typeof verifyAuthenticationResponse>>;
-  try {
-    verification = await verifyAuthenticationResponse({
-      response,
-      expectedChallenge: challenge.challenge,
-      expectedOrigin: c.env.APP_ORIGIN,
-      expectedRPID: c.env.RP_ID,
-      credential: { id: passkey.id, publicKey: bytesFromDb(passkey.public_key), counter: passkey.counter },
-      requireUserVerification: true,
-    });
-  } catch {
-    fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
+  if (!user) {
+    const userId = randomToken(18);
+    const workspaceId = randomToken(18);
+    const rootId = randomToken(18);
+
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        'INSERT INTO users (id, username, display_name, status, telegram_id, phone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      ).bind(userId, username, displayName, 'active', telegramId, phone ?? null, created, created),
+      c.env.DB.prepare(
+        'INSERT INTO workspaces (id, owner_id, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      ).bind(workspaceId, userId, 'My Drive', created, created),
+      c.env.DB.prepare(
+        'INSERT INTO folders (id, workspace_id, parent_id, name, normalized_name, path_key, created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, ?, ?)',
+      ).bind(rootId, workspaceId, 'My Drive', 'my drive', rootId, created, created),
+      audit(c.env.DB, userId, 'telegram.registered', 'user', userId),
+    ]);
+
+    user = await first<UserRow>(c.env.DB, 'SELECT id, username, display_name, status FROM users WHERE id = ?', userId);
+  } else {
+    await c.env.DB.prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?')
+      .bind('active', created, user.id)
+      .run();
   }
-  if (!verification.verified) fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  const newCounter = verification.authenticationInfo.newCounter;
-  await c.env.DB.prepare('UPDATE passkeys SET counter = MAX(counter, ?), last_used_at = ? WHERE id = ?')
-    .bind(newCounter, now(), passkey.id)
-    .run();
-  const csrfToken = await setSession(c, challenge.user_id);
-  const user = await first<UserRow>(
-    c.env.DB,
-    'SELECT id, username, display_name, status FROM users WHERE id = ?',
-    challenge.user_id,
-  );
-  if (!user) fail(401, 'AUTHENTICATION_FAILED', 'Authentication failed');
-  await audit(c.env.DB, user.id, 'session.created', 'user', user.id).run();
-  await c.env.DB.prepare('DELETE FROM webauthn_challenges WHERE id = ?').bind(challengeId).run();
-  return c.json({ user: { id: user.id, username: user.username, displayName: user.display_name }, csrfToken });
+
+  if (!user) fail(500, 'USER_CREATION_FAILED', 'Failed to create or load user');
+
+  const csrfToken = await setSession(c, user.id);
+
+  return c.json({
+    ok: true,
+    csrfToken,
+    user: { id: user.id, username: user.username, displayName: user.display_name },
+  });
 });
 
 app.post('/v1/auth/logout', async (c) => {
@@ -1214,6 +913,28 @@ app.post('/v1/folders/:id/restore', async (c) => {
     throw error;
   }
   return c.json({ ok: true, restored: true });
+});
+
+app.delete('/v1/trash/purge-all', async (c) => {
+  const session = await requireSession(c);
+  const objects = await c.env.DB.prepare(
+    `DELETE FROM objects WHERE status = 'deleted' AND deleted_at IS NOT NULL
+      AND workspace_id IN (SELECT id FROM workspaces WHERE owner_id = ?)`
+  ).bind(session.id).run();
+  let folders = 0;
+  for (let pass = 0; pass < 100; pass += 1) {
+    const result = await c.env.DB.prepare(
+      `DELETE FROM folders WHERE deleted_at IS NOT NULL
+        AND workspace_id IN (SELECT id FROM workspaces WHERE owner_id = ?)
+        AND NOT EXISTS (SELECT 1 FROM folders child WHERE child.parent_id = folders.id)
+        AND NOT EXISTS (SELECT 1 FROM objects object WHERE object.folder_id = folders.id)`
+    ).bind(session.id).run();
+    const removed = changes(result);
+    folders += removed;
+    if (!removed) break;
+  }
+  await audit(c.env.DB, session.id, 'trash.purged', 'workspace', session.id).run();
+  return c.json({ ok: true, objects: changes(objects), folders });
 });
 
 app.delete('/v1/folders/:id/permanent', async (c) => {

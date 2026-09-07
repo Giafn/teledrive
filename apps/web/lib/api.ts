@@ -1,10 +1,3 @@
-import type {
-  AuthenticationResponseJSON,
-  PublicKeyCredentialCreationOptionsJSON,
-  PublicKeyCredentialRequestOptionsJSON,
-  RegistrationResponseJSON,
-} from '@simplewebauthn/browser';
-
 export type ApiUser = { id: string; username: string; displayName: string };
 export type Folder = { id: string; name: string; parentId: string | null };
 export type Workspace = { id: string; name: string };
@@ -18,6 +11,7 @@ export type FolderItem = {
   size: number | null;
   status: string | null;
   createdAt: string;
+  updatedAt?: string;
 };
 export type FolderChildrenResponse = {
   folder: Pick<Folder, 'id' | 'name'>;
@@ -26,10 +20,11 @@ export type FolderChildrenResponse = {
 };
 
 export type ObjectListItem = {
+  type?: 'object' | 'folder';
   id: string;
   name: string;
-  mime: string;
-  size: number;
+  mime: string | null;
+  size: number | null;
   status: string;
   createdAt: string;
   updatedAt?: string;
@@ -164,14 +159,6 @@ export type ExportResponse = {
   parts: ExportPart[];
 };
 
-export type PasskeyRegisterOptionsResponse = {
-  challengeId: string;
-  options: PublicKeyCredentialCreationOptionsJSON;
-};
-export type PasskeyAuthenticateOptionsResponse = {
-  challengeId: string;
-  options: PublicKeyCredentialRequestOptionsJSON;
-};
 export type AuthResponse = { user: ApiUser; csrfToken: string };
 export type CurrentSessionResponse = { user: ApiUser | null };
 
@@ -193,24 +180,14 @@ type JsonRecord = Record<string, unknown>;
 
 export interface ApiClient {
   getCsrf(): Promise<string>;
-  registerPasskeyOptions(
-    userName: string,
-    displayName?: string,
-    bootstrapToken?: string,
-  ): Promise<PasskeyRegisterOptionsResponse>;
-  registerPasskeyVerify(
-    challengeId: string,
-    response: RegistrationResponseJSON,
-    bootstrapToken?: string,
-  ): Promise<AuthResponse>;
-  authenticatePasskeyOptions(userName: string): Promise<PasskeyAuthenticateOptionsResponse>;
-  authenticatePasskeyVerify(challengeId: string, response: AuthenticationResponseJSON): Promise<AuthResponse>;
+  authenticateTelegram(params: { telegramId: number | string; displayName?: string; username?: string; phone?: string }): Promise<AuthResponse>;
   getCurrentSession(): Promise<ApiUser | null>;
   logout(): Promise<{ ok: true }>;
   getWorkspace(): Promise<WorkspaceResponse>;
   listFolderChildren(folderId: string, options?: { limit?: number; cursor?: string }): Promise<FolderChildrenResponse>;
   listRecent(options?: { limit?: number; cursor?: string }): Promise<PaginatedObjectResponse>;
   listTrash(options?: { limit?: number; cursor?: string }): Promise<PaginatedObjectResponse>;
+  purgeTrash(): Promise<{ ok: true; objects: number; folders: number }>;
   createFolder(name: string, parentId: string | null): Promise<Folder>;
   updateFolder(folderId: string, input: FolderUpdateInput): Promise<FolderUpdateResponse>;
   updateObject(objectId: string, input: ObjectUpdateInput): Promise<ObjectUpdateResponse>;
@@ -309,51 +286,12 @@ export class MetadataApiClient implements ApiClient {
     return this.csrfRequest;
   }
 
-  async registerPasskeyOptions(userName: string, displayName?: string, bootstrapToken?: string) {
-    const headers = bootstrapToken ? { 'X-Bootstrap-Token': bootstrapToken } : undefined;
-    return this.request<PasskeyRegisterOptionsResponse>(
-      '/v1/auth/passkey/register/options',
-      {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ userName, ...(displayName === undefined ? {} : { displayName }) }),
-      },
-      true,
-    );
-  }
-
-  async registerPasskeyVerify(challengeId: string, response: RegistrationResponseJSON, bootstrapToken?: string) {
-    const headers = bootstrapToken ? { 'X-Bootstrap-Token': bootstrapToken } : undefined;
+  async authenticateTelegram(params: { telegramId: number | string; displayName?: string; username?: string; phone?: string }) {
     const result = await this.request<AuthResponse>(
-      '/v1/auth/passkey/register/verify',
+      '/v1/auth/telegram',
       {
         method: 'POST',
-        headers,
-        body: JSON.stringify({ challengeId, response }),
-      },
-      true,
-    );
-    this.csrfToken = result.csrfToken;
-    return result;
-  }
-
-  authenticatePasskeyOptions(userName: string) {
-    return this.request<PasskeyAuthenticateOptionsResponse>(
-      '/v1/auth/passkey/authenticate/options',
-      {
-        method: 'POST',
-        body: JSON.stringify({ userName }),
-      },
-      true,
-    );
-  }
-
-  async authenticatePasskeyVerify(challengeId: string, response: AuthenticationResponseJSON) {
-    const result = await this.request<AuthResponse>(
-      '/v1/auth/passkey/authenticate/verify',
-      {
-        method: 'POST',
-        body: JSON.stringify({ challengeId, response }),
+        body: JSON.stringify(params),
       },
       true,
     );
@@ -453,6 +391,10 @@ export class MetadataApiClient implements ApiClient {
 
   softDeleteFolder(folderId: string) {
     return this.request<MutationResponse>(`/v1/folders/${encodeURIComponent(folderId)}`, { method: 'DELETE' }, true);
+  }
+
+  purgeTrash() {
+    return this.request<{ ok: true; objects: number; folders: number }>('/v1/trash/purge-all', { method: 'DELETE' }, true);
   }
 
   restoreFolder(folderId: string) {

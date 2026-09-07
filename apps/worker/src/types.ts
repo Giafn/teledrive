@@ -31,6 +31,8 @@ export interface UserRow {
   username: string;
   display_name: string;
   status: 'pending' | 'active' | 'disabled';
+  telegram_id?: string | null;
+  phone?: string | null;
 }
 
 export interface SessionRow extends UserRow {

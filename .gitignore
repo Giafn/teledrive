@@ -1,5 +1,8 @@
 node_modules
 .next
+.slim
+.vercel
+out
 
 # Ignore files
 .DS_Store
@@ -21,3 +24,4 @@ apps/web/.env.local
 apps/worker/.dev.vars
 apps/web/.env.local.tmp
 apps/worker/.dev.vars.tmp
+.env*

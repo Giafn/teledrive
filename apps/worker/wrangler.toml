@@ -5,5 +5,5 @@ compatibility_date = "2026-08-05"
 [[d1_databases]]
 binding = "DB"
 database_name = "teledrive"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "0576a24c-f53b-4f4c-8c68-95c0d823604b"
 migrations_dir = "../../migrations"

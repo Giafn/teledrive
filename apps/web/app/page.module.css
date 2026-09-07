@@ -3,6 +3,9 @@
   display: flex;
   background: var(--paper);
 }
+.mobileNav {
+  display: none;
+}
 .sidebar {
   width: 246px;
   background: #edf1e8;
@@ -178,6 +181,8 @@
 }
 .mobileBrand {
   display: none;
+  border: 0;
+  background: transparent;
 }
 .search {
   height: 39px;
@@ -466,6 +471,75 @@
 .fileRow > .rowMenuWrap {
   min-width: 32px;
   justify-self: end;
+}
+.galleryGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  grid-column: 1 / -1;
+}
+@media (max-width: 800px) {
+  .galleryGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+}
+.galleryCard {
+  position: relative;
+  border: 0;
+  background: white;
+  color: var(--ink);
+  border-radius: 10px;
+  padding: 0 0 10px;
+  overflow: hidden;
+  text-align: left;
+  width: 100%;
+}
+.galleryThumb {
+  background: #eef3e9;
+  aspect-ratio: 4 / 3;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+.galleryThumb img,
+.galleryThumb video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.galleryPlaceholder {
+  color: #8da080;
+}
+.galleryOpen {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+}
+.galleryMenu {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: #ffffffdd;
+  color: var(--ink);
+  padding: 5px;
+  z-index: 1;
+}
+.galleryCard > b {
+  display: block;
+  padding: 9px 10px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
 }
 .grid {
   display: grid;
@@ -853,9 +927,12 @@
     display: none;
   }
   .header {
-    height: 65px;
-    padding: 0 18px;
-    gap: 12px;
+    height: auto;
+    min-height: 65px;
+    padding: 12px 18px;
+    gap: 10px 12px;
+    flex-wrap: wrap;
+    position: relative;
   }
   .mobileBrand {
     display: flex;
@@ -868,10 +945,9 @@
   }
   .header .search {
     order: 3;
-    position: absolute;
-    top: 75px;
-    left: 18px;
-    right: 18px;
+    position: static;
+    flex-basis: 100%;
+    width: 100%;
     max-width: none;
   }
   .headerActions {
@@ -881,7 +957,8 @@
     display: none;
   }
   .content {
-    padding-top: 58px;
+    padding-top: 0;
+    padding-bottom: 76px;
   }
   .pageTop {
     padding: 35px 18px 24px;
@@ -915,6 +992,14 @@
   .fileArea {
     margin: 0 18px;
   }
+  .empty {
+    width: 100%;
+    box-sizing: border-box;
+    text-align: center;
+    display: flex;
+    align-items: center;
+    flex-direction: column;
+  }
   .fileRow {
     grid-template-columns: 20px 32px minmax(0, 1fr) 0 32px;
     gap: 8px;
@@ -937,7 +1022,40 @@
   .uploadPill {
     left: 18px;
     right: 18px;
-    bottom: 17px;
+    bottom: 74px;
+    z-index: 4;
+  }
+  .mobileNav {
+    display: flex;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 60px;
+    background: #fafbf8;
+    border-top: 1px solid var(--line);
+    z-index: 4;
+    justify-content: space-around;
+    align-items: center;
+  }
+  .mobileNavItem {
+    border: 0;
+    background: transparent;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    color: #7f8c83;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 6px 12px;
+    flex: 1;
+  }
+  .mobileNavActive {
+    color: var(--deep);
+  }
+  .mobileNavActive svg {
+    color: var(--deep);
   }
   .drawer {
     inset: auto 10px 10px;

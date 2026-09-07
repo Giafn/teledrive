@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { authenticatePasskey, registerPasskey } from '../lib/passkey';
 import {
   api,
   ApiError,
@@ -18,6 +17,7 @@ import {
   DownloadError,
 } from '../lib/download-controller';
 import { telegramGateway, type TelegramAuthState } from '../lib/telegram-gateway';
+import { getThumbnail, setThumbnail } from '../lib/thumbnail-cache';
 import styles from './page.module.css';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
@@ -213,6 +213,38 @@ function formatDate(...values: unknown[]) {
   return '—';
 }
 
+async function createThumbnail(file: File): Promise<string | undefined> {
+  if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) return undefined;
+  const url = URL.createObjectURL(file);
+  try {
+    if (file.type.startsWith('video/')) {
+      const video = document.createElement('video');
+      video.src = url;
+      video.muted = true;
+      await new Promise<void>((resolve, reject) => {
+        video.addEventListener('loadeddata', () => resolve(), { once: true });
+        video.addEventListener('error', () => reject(new Error('Video thumbnail failed')), { once: true });
+      });
+      const canvas = document.createElement('canvas');
+      const scale = Math.min(1, 320 / video.videoWidth);
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL('image/jpeg', 0.65);
+    }
+    const image = await createImageBitmap(file);
+    const scale = Math.min(1, 320 / image.width);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(image.width * scale));
+    canvas.height = Math.max(1, Math.round(image.height * scale));
+    canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
+    image.close();
+    return canvas.toDataURL('image/jpeg', 0.65);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 export default function Page() {
   const [user, setUser] = useState<{ displayName: string; username: string } | null>(null);
   const [sessionReady, setSessionReady] = useState(false);
@@ -235,7 +267,8 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState('');
   const [query, setQuery] = useState('');
-  const [layout, setLayout] = useState<'list' | 'grid'>('list');
+  const [layout, setLayout] = useState<'list' | 'grid'>('grid');
+  const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
   const [sort, setSort] = useState('Terakhir diubah');
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [downloads, setDownloads] = useState<Record<string, DownloadAction>>({});
@@ -244,6 +277,9 @@ export default function Page() {
   const [folderDialog, setFolderDialog] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const settings = useRef({ chunkSize: 16 * 1024 * 1024, concurrency: 3 });
+  useEffect(() => {
+    if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
+  }, []);
   useEffect(() => {
     setMenuId(null);
     setSelected({});
@@ -326,6 +362,16 @@ export default function Page() {
   useEffect(() => {
     void restoreSession();
   }, []);
+  async function purgeTrash() {
+    if (!window.confirm('Hapus permanen semua isi Sampah? Tindakan ini tidak dapat dibatalkan.')) return;
+    setLoadError('');
+    try {
+      await api.purgeTrash();
+      await loadSpecial('trash');
+    } catch (error) {
+      setLoadError(message(error));
+    }
+  }
   async function loadSpecial(nextView: 'recent' | 'trash', append = false) {
     setView(nextView);
     setSpecialLoading(true);
@@ -361,10 +407,10 @@ export default function Page() {
             setMoveDialog(true);
             return;
           }
-          setMutationError('Folder belum memiliki endpoint rename atau move.');
-          return;
-        }
-        if (action === 'rename') {
+            const name = window.prompt('Nama folder baru', currentName ?? '');
+            if (!name?.trim()) return;
+            await api.updateFolder(id, { name: name.trim() });
+         } else if (action === 'rename') {
           const name = window.prompt('Nama baru', currentName ?? '');
           if (!name?.trim()) return;
           await api.updateObject(id, { name: name.trim() });
@@ -388,11 +434,15 @@ export default function Page() {
           await api.permanentDeleteObject(id);
         }
       }
-      if (view === 'drive' && workspace) await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
-      else await loadSpecial(view === 'trash' ? 'trash' : 'recent');
-    } catch (error) {
-      setMutationError(message(error));
-    }
+       if (view === 'drive' && workspace) await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
+       else if (view === 'recent' || view === 'trash') await loadSpecial(view);
+     } catch (error) {
+       setMutationError(
+         error instanceof ApiError && error.code === 'FOLDER_NOT_EMPTY'
+           ? 'Folder tidak dapat dipindahkan ke sampah karena masih berisi file atau subfolder.'
+           : message(error),
+       );
+     }
   }
   function toggleSelection(entry: SelectedEntry) {
     setSelected((current) => {
@@ -468,6 +518,9 @@ export default function Page() {
       });
       const item = { id, file, controller };
       setUploads((items) => [item, ...items]);
+      void createThumbnail(file).then((thumbnail) => {
+        if (thumbnail) setThumbnails((current) => ({ ...current, [id]: thumbnail }));
+      });
       setDrawer(true);
       controller
         .start()
@@ -504,6 +557,7 @@ export default function Page() {
     }
   }
   async function logout() {
+    await telegramGateway.logout().catch(() => undefined);
     await api.logout().catch(() => undefined);
     setUser(null);
     setWorkspace(null);
@@ -563,10 +617,7 @@ export default function Page() {
         <div className={styles.sideBottom}>
           <div className={styles.storageLabel}>
             <span>Penyimpanan</span>
-            <b>Telegram</b>
-          </div>
-          <div className={styles.storageBar}>
-            <i />
+            <b>Unlimited dengan Telegram</b>
           </div>
           <button className={styles.settingsLink} onClick={() => setView('settings')}>
             <Icon name="settings" /> Pengaturan
@@ -624,8 +675,9 @@ export default function Page() {
             loading={specialLoading}
             error={loadError}
             cursor={specialCursor}
-            onLoadMore={() => loadSpecial(view as 'recent' | 'trash', true)}
-            onRetry={() => loadSpecial(view as 'recent' | 'trash')}
+             onLoadMore={() => loadSpecial(view as 'recent' | 'trash', true)}
+             onRetry={() => loadSpecial(view as 'recent' | 'trash')}
+             onPurgeAll={purgeTrash}
             onMutate={mutate}
             menuId={menuId}
             setMenuId={setMenuId}
@@ -696,9 +748,23 @@ export default function Page() {
               />
             )}{' '}
             {!loading && !loadError && (
-              <div className={`${styles.fileArea} ${layout === 'grid' ? styles.grid : ''}`}>
-                {items.map((item) => (
-                  <FileRow
+               <div className={`${styles.fileArea} ${layout === 'grid' ? styles.grid : ''}`}>
+                 {layout === 'grid' && (
+                     <GalleryView
+                     items={items}
+                     thumbnails={thumbnails}
+                     menuId={menuId}
+                     setMenuId={setMenuId}
+                     onMutate={mutate}
+                     onOpen={(item) =>
+                       item.kind === 'folder'
+                         ? loadFolder(item.id, [...crumbs, { id: item.id, name: item.name }])
+                         : setPreview({ id: item.id, name: item.name, mime: item.mime ?? 'application/octet-stream', size: item.size })
+                     }
+                   />
+                 )}
+                 {layout === 'list' && items.map((item) => (
+                   <FileRow
                     key={item.id}
                     item={item}
                     onOpen={() =>
@@ -779,6 +845,39 @@ export default function Page() {
           onConfirm={completeMove}
         />
       )}
+      <nav className={styles.mobileNav} aria-label="Navigasi bawah mobile">
+        <button
+          className={`${styles.mobileNavItem} ${view === 'drive' ? styles.mobileNavActive : ''}`}
+          onClick={() => {
+            setView('drive');
+            if (workspace) loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
+          }}
+        >
+          <Icon name="drive" size={20} />
+          <span>Drive</span>
+        </button>
+        <button
+          className={`${styles.mobileNavItem} ${view === 'recent' ? styles.mobileNavActive : ''}`}
+          onClick={() => loadSpecial('recent')}
+        >
+          <Icon name="clock" size={20} />
+          <span>Terbaru</span>
+        </button>
+        <button
+          className={`${styles.mobileNavItem} ${view === 'trash' ? styles.mobileNavActive : ''}`}
+          onClick={() => loadSpecial('trash')}
+        >
+          <Icon name="trash" size={20} />
+          <span>Sampah</span>
+        </button>
+        <button
+          className={`${styles.mobileNavItem} ${view === 'settings' ? styles.mobileNavActive : ''}`}
+          onClick={() => setView('settings')}
+        >
+          <Icon name="settings" size={20} />
+          <span>Pengaturan</span>
+        </button>
+      </nav>
     </main>
   );
 }
@@ -970,21 +1069,33 @@ function AuthScreen({
   onError: (v: string) => void;
   onSuccess: (u: { displayName: string; username: string }) => void;
 }) {
-  const [register, setRegister] = useState(false);
-  const [username, setUsername] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [bootstrap, setBootstrap] = useState('');
+  const [step, setStep] = useState<'phone' | 'code' | 'password'>('phone');
+  const [phone, setPhone] = useState('');
+  const [code, setCode] = useState('');
+  const [password, setPassword] = useState('');
   async function submit() {
-    if (!username.trim() || (register && !displayName.trim())) return;
+    if (!phone.trim() || (step === 'code' && !code.trim()) || (step === 'password' && !password)) return;
     onBusy(true);
     onError('');
-    const token = bootstrap;
-    setBootstrap('');
     try {
-      const result = register
-        ? await registerPasskey(username.trim(), displayName.trim(), token || undefined)
-        : await authenticatePasskey(username.trim());
-      onSuccess(result.user);
+      const authState =
+        step === 'phone'
+          ? await telegramGateway.sendCode(phone.trim())
+          : step === 'code'
+            ? await telegramGateway.signIn(code.trim())
+            : await telegramGateway.checkPassword(password);
+      if (authState.state === 'code_sent') setStep('code');
+      else if (authState.state === 'password_required') setStep('password');
+      else if (authState.state === 'authorized') {
+        const session = await telegramGateway.checkSession();
+        if (!session.user) throw new Error('Sesi Telegram tidak ditemukan.');
+        const result = await api.authenticateTelegram({
+          telegramId: session.user.id,
+          displayName: session.user.displayName,
+          phone: phone.trim(),
+        });
+        onSuccess(result.user);
+      }
     } catch (e) {
       onError(message(e));
     } finally {
@@ -1001,62 +1112,28 @@ function AuthScreen({
           ruang<span className={styles.dot}>.</span>
         </div>
         <div className={styles.eyebrow}>DRIVE PRIBADI</div>
-        <h1>{register ? 'Mulai ruangmu.' : 'Selamat datang kembali.'}</h1>
-        <p className={styles.authIntro}>File rapi, sesi tetap di perangkatmu. Masuk dengan passkey tanpa password.</p>
-        {register && (
-          <label className={styles.field}>
-            Nama tampilan
-            <input
-              autoFocus
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Contoh: Andi Rahman"
-            />
-          </label>
-        )}
+        <h1>Masuk dengan Telegram.</h1>
+        <p className={styles.authIntro}>Nomor telepon Telegram menjadi login sekaligus menghubungkan akun MTProto.</p>
         <label className={styles.field}>
-          Username
+          {step === 'phone' ? 'Nomor telepon Telegram' : step === 'code' ? 'Kode Telegram' : 'Password 2FA Telegram'}
           <input
-            autoFocus={!register}
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="andi"
-            autoComplete="username"
+            autoFocus
+            type={step === 'password' ? 'password' : 'text'}
+            value={step === 'phone' ? phone : step === 'code' ? code : password}
+            onChange={(e) => {
+              if (step === 'phone') setPhone(e.target.value);
+              else if (step === 'code') setCode(e.target.value);
+              else setPassword(e.target.value);
+            }}
+            placeholder={step === 'phone' ? '+628123456789' : step === 'code' ? '12345' : 'Password 2FA'}
+            autoComplete={step === 'password' ? 'current-password' : 'one-time-code'}
           />
         </label>
-        {register && (
-          <label className={styles.field}>
-            Bootstrap token <span className={styles.fieldHint}>sekali pakai</span>
-            <input
-              value={bootstrap}
-              onChange={(e) => setBootstrap(e.target.value)}
-              autoComplete="off"
-              placeholder="Dari administrator"
-            />
-          </label>
-        )}{' '}
-        {error && (
-          <div className={styles.formError} role="alert">
-            <Icon name="info" size={16} />
-            {error}
-          </div>
-        )}
+        {error && <div className={styles.formError} role="alert"><Icon name="info" size={16} />{error}</div>}
         <button className={styles.primaryButton} disabled={busy} onClick={submit}>
-          {busy ? 'Menyiapkan passkey…' : register ? 'Daftar dengan passkey' : 'Masuk dengan passkey'}
+          {busy ? 'Menghubungkan…' : step === 'phone' ? 'Kirim kode Telegram' : step === 'code' ? 'Verifikasi kode' : 'Verifikasi 2FA'}
         </button>
-        <p className={styles.authSwitch}>
-          {register ? 'Sudah punya akun?' : 'Belum punya akun?'}{' '}
-          <button
-            onClick={() => {
-              setRegister(!register);
-              onError('');
-              setBootstrap('');
-            }}
-          >
-            {register ? 'Masuk' : 'Daftar'}
-          </button>
-        </p>
-        <small className={styles.secureNote}>Butuh browser modern dan secure origin (HTTPS atau localhost).</small>
+        <small className={styles.secureNote}>Telegram tidak mengirim password atau session ke server Teledrive.</small>
       </div>
     </main>
   );
@@ -1079,6 +1156,114 @@ function NavItem({
     </button>
   );
 }
+function GalleryView({ items, thumbnails, menuId, setMenuId, onMutate, onOpen }: {
+  items: FolderItem[];
+  thumbnails: Record<string, string>;
+  menuId: string | null;
+  setMenuId: (id: string | null) => void;
+  onMutate: (kind: 'folder' | 'object', action: 'rename' | 'move' | 'delete' | 'restore' | 'purge', id: string, name?: string) => void;
+  onOpen: (item: FolderItem) => void;
+}) {
+  return <div className={styles.galleryGrid}>
+    {items.map((item) => (
+      <article className={styles.galleryCard} key={item.id}>
+        <button className={styles.galleryOpen} onClick={() => onOpen(item)}>
+          <div className={styles.galleryThumb}><GalleryThumbnail item={item} src={thumbnails[item.id]} /></div>
+          <b>{item.name}</b>
+          <small>{item.kind === 'folder' ? 'Folder' : formatSize(item.size)}</small>
+        </button>
+        <button className={styles.galleryMenu} onClick={() => setMenuId(menuId === item.id ? null : item.id)} aria-label={`Opsi ${item.name}`}>
+          <Icon name="more" size={18} />
+        </button>
+        {menuId === item.id && <div className={styles.rowMenuPopup} role="menu">
+          <button role="menuitem" onClick={() => onMutate(item.kind, 'rename', item.id, item.name)}>Ganti nama</button>
+          <button role="menuitem" onClick={() => onMutate(item.kind, 'move', item.id, item.name)}>Pindahkan ke</button>
+          <button role="menuitem" className={styles.dangerAction} onClick={() => onMutate(item.kind, 'delete', item.id, item.name)}>Pindahkan ke sampah</button>
+        </div>}
+      </article>
+    ))}
+  </div>;
+}
+
+function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
+  const cacheKey = `thumbnail:${item.id}:${item.updatedAt}`;
+  const [preview, setPreview] = useState(src);
+  useEffect(() => {
+    if (src || item.kind === 'folder') return;
+    let active = true;
+    void getThumbnail(cacheKey).then((cached) => {
+      if (active && cached) setPreview(cached);
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [cacheKey, item.kind, src]);
+  useEffect(() => {
+    if (src || item.kind === 'folder' || !item.mime?.startsWith('image/') && !item.mime?.startsWith('video/')) return;
+    const controller = createDownloadController();
+    let active = true;
+    void controller.loadPreview(item.id).then(async (result) => {
+      if (item.mime?.startsWith('video/')) {
+        if (active) setPreview(result.url);
+        const video = document.createElement('video');
+        video.src = result.url;
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        await new Promise<void>((resolve) => {
+          const finish = () => resolve();
+          video.addEventListener('loadeddata', finish, { once: true });
+          video.addEventListener('error', finish, { once: true });
+          video.load();
+        });
+        if (video.readyState >= 2 && video.duration > 0) {
+          video.currentTime = 0;
+          await new Promise<void>((resolve) => {
+            video.addEventListener('seeked', () => resolve(), { once: true });
+            window.setTimeout(resolve, 1000);
+          });
+        }
+        if (video.videoWidth && video.videoHeight) {
+          const canvas = document.createElement('canvas');
+          const scale = Math.min(1, 640 / video.videoWidth);
+          canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+          canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+          canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+          await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
+          if (active) setPreview(dataUrl);
+        }
+        result.revoke();
+      } else {
+        const image = new Image();
+        image.src = result.url;
+        await new Promise<void>((resolve) => {
+          image.onload = () => resolve();
+          image.onerror = () => resolve();
+        });
+        if (image.naturalWidth && image.naturalHeight) {
+          const canvas = document.createElement('canvas');
+          const scale = Math.min(1, 640 / image.naturalWidth);
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+          canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+          await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
+          if (active) setPreview(dataUrl);
+        }
+        result.revoke();
+      }
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [item.id, item.kind, item.mime, src]);
+  if (item.kind === 'folder') return <span className={styles.galleryPlaceholder}><Icon name="folder" size={28} /></span>;
+  return preview ? (
+    item.mime?.startsWith('video/') ? <video src={preview} muted preload="metadata" /> : <img src={preview} alt="" />
+  ) : <span className={`${styles.galleryPlaceholder} ${mimeStyle(item.mime)}`}><Icon name="info" size={28} /></span>;
+}
+
 function FileRow({
   item,
   onOpen,
@@ -1386,6 +1571,7 @@ function SpecialView({
   cursor,
   onLoadMore,
   onRetry,
+  onPurgeAll,
   onMutate,
   menuId,
   setMenuId,
@@ -1404,6 +1590,7 @@ function SpecialView({
   cursor: string | null;
   onLoadMore: () => void;
   onRetry: () => void;
+  onPurgeAll: () => Promise<void>;
   onMutate: (
     kind: 'folder' | 'object',
     action: 'rename' | 'move' | 'delete' | 'restore' | 'purge',
@@ -1429,11 +1616,16 @@ function SpecialView({
             RUANG PRIBADI <span>•</span> SERVER METADATA
           </div>
           <h1>{title}</h1>
-          <p className={styles.subtle}>
-            {trashView
-              ? 'File dihapus dari Drive. Retensi dan status berasal dari server.'
-              : 'File yang baru diubah atau diunggah.'}
-          </p>
+           <p className={styles.subtle}>
+             {trashView
+               ? 'File dan folder dihapus dari Drive. Retensi dan status berasal dari server.'
+               : 'File yang baru diubah atau diunggah.'}
+           </p>
+           {trashView && (
+             <button className={styles.secondaryButton} onClick={onPurgeAll} disabled={loading || !items.length}>
+               Hapus semua
+             </button>
+           )}
         </div>
       </div>
       {mutationError && (
@@ -1508,7 +1700,9 @@ function ObjectRow({
   onToggleSelection: (entry: SelectedEntry) => void;
   onMove: (entries?: SelectedEntry[]) => void;
 }) {
-  const downloadable = { id: item.id, name: item.name, mime: item.mime, size: item.size };
+  const folder = item.type === 'folder';
+  const mime = item.mime ?? 'application/octet-stream';
+  const downloadable = { id: item.id, name: item.name, mime, size: item.size };
   return (
     <article className={styles.fileRow}>
       {!trash && (
@@ -1516,14 +1710,14 @@ function ObjectRow({
           className={styles.selectionCheckbox}
           type="checkbox"
           checked={Boolean(selected[item.id])}
-          onChange={() => onToggleSelection({ id: item.id, kind: 'object', name: item.name })}
+          onChange={() => onToggleSelection({ id: item.id, kind: folder ? 'folder' : 'object', name: item.name })}
           aria-label={`Pilih ${item.name}`}
         />
       )}
-      <span className={`${styles.fileIcon} ${mimeStyle(item.mime)}`}>
-        <b>{item.mime.split('/')[1]?.slice(0, 4).toUpperCase() || 'FILE'}</b>
+      <span className={`${styles.fileIcon} ${folder ? styles.folderIcon : mimeStyle(mime)}`}>
+        {folder ? <Icon name="folder" size={20} /> : <b>{mime.split('/')[1]?.slice(0, 4).toUpperCase() || 'FILE'}</b>}
       </span>
-      <button className={styles.fileName} onClick={() => onPreview(downloadable)}>
+      <button className={styles.fileName} onClick={() => !folder && onPreview(downloadable)}>
         <b>{item.name}</b>
         <small>
           {formatSize(item.size)} ·{' '}
@@ -1546,13 +1740,13 @@ function ObjectRow({
           <div className={styles.rowMenuPopup} role="menu">
             {trash ? (
               <>
-                <button role="menuitem" onClick={() => onMutate('object', 'restore', item.id, item.name)}>
+                <button role="menuitem" onClick={() => onMutate(folder ? 'folder' : 'object', 'restore', item.id, item.name)}>
                   Pulihkan
                 </button>
                 <button
                   role="menuitem"
                   className={styles.dangerAction}
-                  onClick={() => onMutate('object', 'purge', item.id, item.name)}
+                  onClick={() => onMutate(folder ? 'folder' : 'object', 'purge', item.id, item.name)}
                 >
                   Hapus metadata permanen
                 </button>
@@ -1729,180 +1923,20 @@ function Settings({
   settings: React.MutableRefObject<{ chunkSize: number; concurrency: number }>;
   onLogout: () => Promise<void>;
 }) {
-  const [auth, setAuth] = useState<TelegramAuthState>({ state: 'logged_out' });
-  const [session, setSession] = useState<{ connected: boolean; authorized: boolean } | null>(null);
-  const [phone, setPhone] = useState('');
-  const [code, setCode] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [probing, setProbing] = useState(true);
-  async function probe() {
-    setProbing(true);
-    setError('');
-    try {
-      const result = await telegramGateway.checkSession();
-      setSession(result);
-      setAuth(result.authorized ? { state: 'authorized' } : { state: 'logged_out' });
-    } catch (e) {
-      setSession(null);
-      setError(telegramError(e));
-    } finally {
-      setProbing(false);
-    }
-  }
-  useEffect(() => {
-    void probe();
-  }, []);
-  async function run(action: () => Promise<TelegramAuthState>, probeAfter = false) {
-    setBusy(true);
-    setError('');
-    try {
-      const state = await action();
-      setAuth(state);
-      if (probeAfter) await probe();
-    } catch (e) {
-      setError(telegramError(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function send() {
-    const value = phone;
-    setPhone('');
-    if (value) await run(() => telegramGateway.sendCode(value));
-  }
-  async function signIn() {
-    const value = code;
-    setCode('');
-    if (value) await run(() => telegramGateway.signIn(value), true);
-  }
-  async function checkPassword() {
-    const value = password;
-    setPassword('');
-    if (value) await run(() => telegramGateway.checkPassword(value), true);
-  }
-  async function resend() {
-    await run(() => telegramGateway.resendCode());
-  }
-  async function logoutTelegram() {
-    await run(() => telegramGateway.logout(), true);
-  }
   async function exportData() {
-    setError('');
-    try {
-      const data = await api.exportWorkspace();
-      const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `ruang-export-${new Date().toISOString().slice(0, 10)}.json`;
-      link.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setError(message(e));
-    }
+    const data = await api.exportWorkspace();
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `ruang-export-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
-  const authorized = session?.authorized === true;
   return (
     <div className={styles.settings}>
       <div className={styles.eyebrow}>PREFERENSI</div>
       <h1>Pengaturan</h1>
-      <p className={styles.subtle}>Koneksi, upload, dan data lokal perangkat ini.</p>
-      <section className={styles.settingsCard}>
-        <div className={styles.settingTitle}>
-          <span className={styles.telegramMark}>✦</span>
-          <div>
-            <h2>Koneksi Telegram</h2>
-            <p>{probing ? 'Memeriksa otorisasi…' : authorized ? 'Sesi terotorisasi' : 'Belum terotorisasi'}</p>
-          </div>
-          <span className={styles.statusTag}>
-            {probing ? 'Memeriksa' : authorized ? 'Terotorisasi' : 'Perlu sambung ulang'}
-          </span>
-        </div>
-        {!probing && !authorized && (
-          <p className={styles.reconnectGuide}>
-            Sesi Telegram belum terotorisasi di browser ini. Hubungkan kembali untuk upload; kredensial tetap diproses
-            lokal.
-          </p>
-        )}
-        {auth.state === 'logged_out' && !authorized && (
-          <div className={styles.telegramFlow}>
-            <label className={styles.field}>
-              Nomor telepon
-              <input
-                inputMode="tel"
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                placeholder="+62…"
-                autoComplete="off"
-              />
-            </label>
-            <button className={styles.primaryButton} disabled={busy || !phone} onClick={send}>
-              Kirim kode
-            </button>
-          </div>
-        )}
-        {auth.state === 'code_sent' && (
-          <div className={styles.telegramFlow}>
-            <p className={styles.flowHint}>Kode dikirim lewat Telegram. Kode hanya digunakan di browser.</p>
-            <label className={styles.field}>
-              Kode OTP
-              <input
-                inputMode="numeric"
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                autoComplete="one-time-code"
-              />
-            </label>
-            <div className={styles.flowButtons}>
-              <button className={styles.primaryButton} disabled={busy || !code} onClick={signIn}>
-                Verifikasi
-              </button>
-              <button className={styles.textButton} disabled={busy} onClick={resend}>
-                Kirim ulang
-              </button>
-            </div>
-          </div>
-        )}
-        {auth.state === 'password_required' && (
-          <div className={styles.telegramFlow}>
-            <p className={styles.flowHint}>Telegram meminta password 2FA. Tidak disimpan atau dikirim ke API.</p>
-            <label className={styles.field}>
-              Password 2FA
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete="off"
-              />
-            </label>
-            <button className={styles.primaryButton} disabled={busy || !password} onClick={checkPassword}>
-              Lanjutkan
-            </button>
-          </div>
-        )}
-        {authorized && (
-          <div className={styles.flowButtons}>
-            <button className={styles.secondaryButton} disabled={probing} onClick={probe}>
-              Buktikan otorisasi Telegram
-            </button>
-            <button className={styles.textButton} onClick={logoutTelegram}>
-              Keluar dari Telegram
-            </button>
-          </div>
-        )}
-        {error && (
-          <div className={styles.formError} role="alert">
-            <Icon name="info" size={16} />
-            {error}
-          </div>
-        )}
-        <p className={styles.disclaimer}>
-          API ID/hash dan channel harus dikonfigurasi deployment. Pemeriksaan di atas membuktikan sesi Telegram
-          terotorisasi, bukan sekadar koneksi socket. Private channel bukan storage dengan SLA. Upload mobile dapat
-          berhenti saat browser berada di latar.
-        </p>
-      </section>
+      <p className={styles.subtle}>Upload dan data lokal perangkat ini.</p>
       <section className={styles.settingsCard}>
         <h2>Upload</h2>
         <div className={styles.settingLine}>
