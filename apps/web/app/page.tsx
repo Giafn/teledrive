@@ -17,6 +17,7 @@ import {
   DownloadError,
 } from '../lib/download-controller';
 import { telegramGateway, type TelegramAuthState } from '../lib/telegram-gateway';
+import { getThumbnail, setThumbnail } from '../lib/thumbnail-cache';
 import styles from './page.module.css';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
@@ -225,20 +226,20 @@ async function createThumbnail(file: File): Promise<string | undefined> {
         video.addEventListener('error', () => reject(new Error('Video thumbnail failed')), { once: true });
       });
       const canvas = document.createElement('canvas');
-      const scale = Math.min(1, 480 / video.videoWidth);
+      const scale = Math.min(1, 320 / video.videoWidth);
       canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
       canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
       canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
-      return canvas.toDataURL('image/jpeg', 0.78);
+      return canvas.toDataURL('image/jpeg', 0.65);
     }
     const image = await createImageBitmap(file);
-    const scale = Math.min(1, 480 / image.width);
+    const scale = Math.min(1, 320 / image.width);
     const canvas = document.createElement('canvas');
     canvas.width = Math.max(1, Math.round(image.width * scale));
     canvas.height = Math.max(1, Math.round(image.height * scale));
     canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
     image.close();
-    return canvas.toDataURL('image/jpeg', 0.78);
+    return canvas.toDataURL('image/jpeg', 0.65);
   } finally {
     URL.revokeObjectURL(url);
   }
@@ -749,9 +750,12 @@ export default function Page() {
             {!loading && !loadError && (
                <div className={`${styles.fileArea} ${layout === 'grid' ? styles.grid : ''}`}>
                  {layout === 'grid' && (
-                   <GalleryView
+                     <GalleryView
                      items={items}
                      thumbnails={thumbnails}
+                     menuId={menuId}
+                     setMenuId={setMenuId}
+                     onMutate={mutate}
                      onOpen={(item) =>
                        item.kind === 'folder'
                          ? loadFolder(item.id, [...crumbs, { id: item.id, name: item.name }])
@@ -1152,24 +1156,48 @@ function NavItem({
     </button>
   );
 }
-function GalleryView({ items, thumbnails, onOpen }: { items: FolderItem[]; thumbnails: Record<string, string>; onOpen: (item: FolderItem) => void }) {
-  return (
-    <div className={styles.galleryGrid}>
-      {items.map((item) => (
-        <button className={styles.galleryCard} key={item.id} onClick={() => onOpen(item)}>
-          <div className={styles.galleryThumb}>
-            <GalleryThumbnail item={item} src={thumbnails[item.id]} />
-          </div>
+function GalleryView({ items, thumbnails, menuId, setMenuId, onMutate, onOpen }: {
+  items: FolderItem[];
+  thumbnails: Record<string, string>;
+  menuId: string | null;
+  setMenuId: (id: string | null) => void;
+  onMutate: (kind: 'folder' | 'object', action: 'rename' | 'move' | 'delete' | 'restore' | 'purge', id: string, name?: string) => void;
+  onOpen: (item: FolderItem) => void;
+}) {
+  return <div className={styles.galleryGrid}>
+    {items.map((item) => (
+      <article className={styles.galleryCard} key={item.id}>
+        <button className={styles.galleryOpen} onClick={() => onOpen(item)}>
+          <div className={styles.galleryThumb}><GalleryThumbnail item={item} src={thumbnails[item.id]} /></div>
           <b>{item.name}</b>
           <small>{item.kind === 'folder' ? 'Folder' : formatSize(item.size)}</small>
         </button>
-      ))}
-    </div>
-  );
+        <button className={styles.galleryMenu} onClick={() => setMenuId(menuId === item.id ? null : item.id)} aria-label={`Opsi ${item.name}`}>
+          <Icon name="more" size={18} />
+        </button>
+        {menuId === item.id && <div className={styles.rowMenuPopup} role="menu">
+          <button role="menuitem" onClick={() => onMutate(item.kind, 'rename', item.id, item.name)}>Ganti nama</button>
+          <button role="menuitem" onClick={() => onMutate(item.kind, 'move', item.id, item.name)}>Pindahkan ke</button>
+          <button role="menuitem" className={styles.dangerAction} onClick={() => onMutate(item.kind, 'delete', item.id, item.name)}>Pindahkan ke sampah</button>
+        </div>}
+      </article>
+    ))}
+  </div>;
 }
 
 function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
+  const cacheKey = `thumbnail:${item.id}:${item.updatedAt}`;
   const [preview, setPreview] = useState(src);
+  useEffect(() => {
+    if (src || item.kind === 'folder') return;
+    let active = true;
+    void getThumbnail(cacheKey).then((cached) => {
+      if (active && cached) setPreview(cached);
+    }).catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [cacheKey, item.kind, src]);
   useEffect(() => {
     if (src || item.kind === 'folder' || !item.mime?.startsWith('image/') && !item.mime?.startsWith('video/')) return;
     const controller = createDownloadController();
@@ -1177,9 +1205,54 @@ function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
     void controller.loadPreview(item.id).then(async (result) => {
       if (item.mime?.startsWith('video/')) {
         if (active) setPreview(result.url);
-        else result.revoke();
-      } else if (active) setPreview(result.url);
-      else result.revoke();
+        const video = document.createElement('video');
+        video.src = result.url;
+        video.muted = true;
+        video.playsInline = true;
+        video.preload = 'auto';
+        await new Promise<void>((resolve) => {
+          const finish = () => resolve();
+          video.addEventListener('loadeddata', finish, { once: true });
+          video.addEventListener('error', finish, { once: true });
+          video.load();
+        });
+        if (video.readyState >= 2 && video.duration > 0) {
+          video.currentTime = 0;
+          await new Promise<void>((resolve) => {
+            video.addEventListener('seeked', () => resolve(), { once: true });
+            window.setTimeout(resolve, 1000);
+          });
+        }
+        if (video.videoWidth && video.videoHeight) {
+          const canvas = document.createElement('canvas');
+          const scale = Math.min(1, 640 / video.videoWidth);
+          canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+          canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+          canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+          await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
+          if (active) setPreview(dataUrl);
+        }
+        result.revoke();
+      } else {
+        const image = new Image();
+        image.src = result.url;
+        await new Promise<void>((resolve) => {
+          image.onload = () => resolve();
+          image.onerror = () => resolve();
+        });
+        if (image.naturalWidth && image.naturalHeight) {
+          const canvas = document.createElement('canvas');
+          const scale = Math.min(1, 640 / image.naturalWidth);
+          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+          canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+          await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
+          if (active) setPreview(dataUrl);
+        }
+        result.revoke();
+      }
     }).catch(() => undefined);
     return () => {
       active = false;

@@ -487,6 +487,7 @@
   }
 }
 .galleryCard {
+  position: relative;
   border: 0;
   background: white;
   color: var(--ink);
@@ -511,6 +512,26 @@
 }
 .galleryPlaceholder {
   color: #8da080;
+}
+.galleryOpen {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+}
+.galleryMenu {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: #ffffffdd;
+  color: var(--ink);
+  padding: 5px;
+  z-index: 1;
 }
 .galleryCard > b {
   display: block;

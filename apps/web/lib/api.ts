@@ -11,6 +11,7 @@ export type FolderItem = {
   size: number | null;
   status: string | null;
   createdAt: string;
+  updatedAt?: string;
 };
 export type FolderChildrenResponse = {
   folder: Pick<Folder, 'id' | 'name'>;
