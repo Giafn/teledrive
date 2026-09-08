@@ -1274,6 +1274,63 @@
   margin: 0;
 }
 
+/* ===== Session splash ===== */
+.splash {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  text-align: center;
+}
+.splashLogo {
+  display: grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 16px;
+  box-shadow: var(--shadow-card);
+  animation: splash-pulse 1.6s ease-in-out infinite;
+}
+.splashText {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 13.5px;
+}
+.splashBar {
+  width: 168px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.splashBar i {
+  display: block;
+  width: 40%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  animation: splash-slide 1.2s ease-in-out infinite;
+}
+@keyframes splash-pulse {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.06);
+  }
+}
+@keyframes splash-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(350%);
+  }
+}
+
 /* ===== Auth ===== */
 .authPage {
   min-height: 100vh;

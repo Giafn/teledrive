@@ -776,7 +776,11 @@ export default function Page() {
                 onRetry={() => workspace && loadFolder(folder?.folder.id ?? workspace.rootFolder.id)}
               />
             )}
-            {loading && !loadError && (layout === 'grid' ? <GridSkeleton /> : <ListSkeleton />)}
+            {loading && !loadError && (
+              <div className={styles.fileArea}>
+                {layout === 'grid' ? <GridSkeleton /> : <ListSkeleton />}
+              </div>
+            )}
             {!loading && !loadError && (
               <div className={styles.fileArea}>
                 {layout === 'grid' && (
@@ -923,9 +927,23 @@ export default function Page() {
 }
 
 function SessionRestore({ error, onRetry }: { error?: string; onRetry?: () => void }) {
+  if (!error)
+    return (
+      <main className={styles.authPage} aria-busy="true">
+        <div className={styles.splash}>
+          <span className={styles.splashLogo}>
+            <Icon name="brand" size={26} />
+          </span>
+          <p className={styles.splashText}>Menyiapkan ruang kerja kamu…</p>
+          <span className={styles.splashBar} aria-hidden="true">
+            <i />
+          </span>
+        </div>
+      </main>
+    );
   return (
     <main className={styles.authPage}>
-      <div className={styles.authCard} role={error ? 'alert' : undefined}>
+      <div className={styles.authCard} role="alert">
         <div className={styles.brand}>
           <span className={styles.logo}>
             <Icon name="brand" size={17} />
@@ -933,23 +951,17 @@ function SessionRestore({ error, onRetry }: { error?: string; onRetry?: () => vo
           ruang<span className={styles.dot}>.</span>
         </div>
         <div className={styles.eyebrow}>RUANG PRIBADI</div>
-        <h1>{error ? 'Sesi belum dapat dipulihkan.' : 'Memulihkan sesi…'}</h1>
+        <h1>Tidak bisa memuat ruang kerja</h1>
         <p className={styles.authIntro}>
-          {error
-            ? 'Periksa koneksi lalu coba lagi. Login tidak ditampilkan sebelum pemeriksaan sesi selesai.'
-            : 'Memeriksa sesi aman dan memuat ruang kerja kamu.'}
+          Sesi kamu tidak dapat dipulihkan. Periksa koneksi internet lalu coba lagi.
         </p>
-        {error && (
-          <>
-            <div className={styles.formError}>
-              <Icon name="info" size={16} />
-              {message(error)}
-            </div>
-            <button className={styles.primaryButton} onClick={onRetry}>
-              Coba pulihkan lagi
-            </button>
-          </>
-        )}
+        <div className={styles.formError}>
+          <Icon name="info" size={16} />
+          {message(error)}
+        </div>
+        <button className={styles.primaryButton} onClick={onRetry}>
+          Coba lagi
+        </button>
       </div>
     </main>
   );
@@ -1113,8 +1125,11 @@ function AuthScreen({
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
   const [password, setPassword] = useState('');
+  const submitting = useRef(false);
   async function submit() {
+    if (submitting.current) return;
     if (!phone.trim() || (step === 'code' && !code.trim()) || (step === 'password' && !password)) return;
+    submitting.current = true;
     onBusy(true);
     onError('');
     try {
@@ -1139,6 +1154,7 @@ function AuthScreen({
     } catch (e) {
       onError(message(e));
     } finally {
+      submitting.current = false;
       onBusy(false);
     }
   }
