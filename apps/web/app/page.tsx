@@ -18,6 +18,13 @@ import {
 } from '../lib/download-controller';
 import { telegramGateway, type TelegramAuthState } from '../lib/telegram-gateway';
 import { getThumbnail, setThumbnail } from '../lib/thumbnail-cache';
+import {
+  blobToDataURL,
+  captureVideoFrameFromUrl,
+  createMediaThumbnail,
+  encodeImageFromUrl,
+  type MediaThumbnailResult,
+} from '../lib/media-thumbnail';
 import styles from './page.module.css';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
@@ -220,36 +227,20 @@ function formatDate(...values: unknown[]) {
   return '—';
 }
 
-async function createThumbnail(file: File): Promise<string | undefined> {
-  if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) return undefined;
-  const url = URL.createObjectURL(file);
-  try {
-    if (file.type.startsWith('video/')) {
-      const video = document.createElement('video');
-      video.src = url;
-      video.muted = true;
-      await new Promise<void>((resolve, reject) => {
-        video.addEventListener('loadeddata', () => resolve(), { once: true });
-        video.addEventListener('error', () => reject(new Error('Video thumbnail failed')), { once: true });
-      });
-      const canvas = document.createElement('canvas');
-      const scale = Math.min(1, 320 / video.videoWidth);
-      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-      canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
-      return canvas.toDataURL('image/jpeg', 0.65);
-    }
-    const image = await createImageBitmap(file);
-    const scale = Math.min(1, 320 / image.width);
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.round(image.width * scale));
-    canvas.height = Math.max(1, Math.round(image.height * scale));
-    canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
-    image.close();
-    return canvas.toDataURL('image/jpeg', 0.65);
-  } finally {
-    URL.revokeObjectURL(url);
+const MAX_THUMBNAIL_LOADS = 2;
+let activeThumbnailLoads = 0;
+const thumbnailWaiters: Array<() => void> = [];
+async function acquireThumbnailSlot(): Promise<void> {
+  if (activeThumbnailLoads < MAX_THUMBNAIL_LOADS) {
+    activeThumbnailLoads += 1;
+    return;
   }
+  await new Promise<void>((resolve) => thumbnailWaiters.push(resolve));
+  activeThumbnailLoads += 1;
+}
+function releaseThumbnailSlot(): void {
+  activeThumbnailLoads = Math.max(0, activeThumbnailLoads - 1);
+  thumbnailWaiters.shift()?.();
 }
 
 export default function Page() {
@@ -276,7 +267,6 @@ export default function Page() {
   const [loadError, setLoadError] = useState('');
   const [query, setQuery] = useState('');
   const [layout, setLayout] = useState<'list' | 'grid'>('grid');
-  const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
   const [sort, setSort] = useState('Terakhir diubah');
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [downloads, setDownloads] = useState<Record<string, DownloadAction>>({});
@@ -513,12 +503,28 @@ export default function Page() {
       failures.length ? `${entries.length - failures.length} berhasil dipindahkan. Gagal: ${failures.join(', ')}` : '',
     );
   }
+  async function commitObjectThumbnail(objectId: string, thumbnail: Promise<MediaThumbnailResult>) {
+    try {
+      const result = await thumbnail;
+      if (result.status !== 'ready') return;
+      const uploaded = await telegramGateway.uploadPart(result.blob, 0);
+      await api.setObjectThumbnail(objectId, {
+        messageId: uploaded.messageId,
+        mime: result.mime,
+        size: result.blob.size,
+        sha256: uploaded.sha256,
+      });
+    } catch (error) {
+      console.error(JSON.stringify({ operation: 'thumbnail.sidecar_upload_failed', error: message(error) }));
+    }
+  }
+
   function uploadFiles(files: FileList | File[]) {
     if (!workspace) return;
     Array.from(files).forEach((file) => {
       const id = crypto.randomUUID();
-      let controller: UploadController;
-      controller = createUploadController({
+      const thumbnailPromise = createMediaThumbnail(file);
+      const controller = createUploadController({
         file,
         folderId: folder?.folder.id ?? workspace.rootFolder.id,
         chunkSize: settings.current.chunkSize,
@@ -528,13 +534,13 @@ export default function Page() {
       });
       const item = { id, file, controller };
       setUploads((items) => [item, ...items]);
-      void createThumbnail(file).then((thumbnail) => {
-        if (thumbnail) setThumbnails((current) => ({ ...current, [id]: thumbnail }));
-      });
       setDrawer(true);
       controller
         .start()
-        .then(() => loadFolder(folder?.folder.id ?? workspace.rootFolder.id))
+        .then(async (result) => {
+          await commitObjectThumbnail(result.objectId, thumbnailPromise);
+          await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
+        })
         .catch((error) => {
           if (error?.name !== 'UploadCancelledError')
             setUploads((items) => items.map((x) => (x.id === id ? { ...x, error: message(error) } : x)));
@@ -776,7 +782,6 @@ export default function Page() {
                 {layout === 'grid' && (
                   <GalleryView
                     items={items}
-                    thumbnails={thumbnails}
                     menuId={menuId}
                     setMenuId={setMenuId}
                     onMutate={mutate}
@@ -1193,7 +1198,6 @@ function NavItem({
 }
 function GalleryView({
   items,
-  thumbnails,
   menuId,
   setMenuId,
   onMutate,
@@ -1205,7 +1209,6 @@ function GalleryView({
   onMove,
 }: {
   items: FolderItem[];
-  thumbnails: Record<string, string>;
   menuId: string | null;
   setMenuId: (id: string | null) => void;
   onMutate: (
@@ -1249,7 +1252,7 @@ function GalleryView({
               aria-label={folder ? `Buka folder ${item.name}` : `Pratinjau ${item.name}`}
             >
               <div className={styles.galleryThumb}>
-                <GalleryThumbnail item={item} src={thumbnails[item.id]} />
+                <GalleryThumbnail item={item} />
               </div>
               <span className={styles.galleryMeta}>
                 <b title={item.name}>{item.name}</b>
@@ -1309,25 +1312,27 @@ function GalleryView({
   );
 }
 
-function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
-  const cacheKey = `thumbnail:${item.id}:${item.updatedAt}`;
-  const [state, setState] = useState<'loading' | 'ready' | 'unsupported' | 'error'>(src ? 'ready' : 'loading');
-  const [preview, setPreview] = useState(src);
+const LEGACY_VIDEO_THUMBNAIL_LIMIT = 100 * 1024 * 1024;
+
+function legacyThumbnailEligible(item: FolderItem): boolean {
+  if (!item.mime?.startsWith('image/') && !item.mime?.startsWith('video/')) return false;
+  const parts = item.partCount ?? 1;
+  return parts <= 1 && (item.size ?? 0) <= LEGACY_VIDEO_THUMBNAIL_LIMIT;
+}
+
+function GalleryThumbnail({ item }: { item: FolderItem }) {
+  const [state, setState] = useState<'loading' | 'ready' | 'unsupported' | 'error'>(() =>
+    item.kind === 'folder' || item.thumbnail || legacyThumbnailEligible(item) ? 'loading' : 'unsupported',
+  );
+  const [preview, setPreview] = useState<string>();
   useEffect(() => {
-    if (src) {
-      setPreview(src);
-      setState('ready');
-      return;
-    }
     if (item.kind === 'folder') return;
-    const supported = Boolean(item.mime?.startsWith('image/') || item.mime?.startsWith('video/'));
-    if (!supported) {
-      setState('unsupported');
-      return;
-    }
     let active = true;
     let revokeUrl: (() => void) | undefined;
-    setState('loading');
+    const reference = item.thumbnail ?? null;
+    const cacheKey = reference
+      ? `thumbnail:${item.id}:${reference.sha256}`
+      : `thumbnail:${item.id}:${item.updatedAt ?? item.createdAt}`;
     void (async () => {
       try {
         const cached = await getThumbnail(cacheKey).catch(() => undefined);
@@ -1337,73 +1342,50 @@ function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
           setState('ready');
           return;
         }
-        const controller = createDownloadController();
-        const result = await controller.loadPreview(item.id);
-        revokeUrl = result.revoke;
-        if (!active) return;
-        let dataUrl: string | undefined;
-        if (item.mime?.startsWith('video/')) {
-          const video = document.createElement('video');
-          video.src = result.url;
-          video.muted = true;
-          video.playsInline = true;
-          video.preload = 'auto';
-          await new Promise<void>((resolve) => {
-            video.addEventListener('loadeddata', () => resolve(), { once: true });
-            video.addEventListener('error', () => resolve(), { once: true });
-            video.load();
-          });
-          if (video.readyState >= 2 && video.duration > 0) {
-            video.currentTime = 0;
-            await new Promise<void>((resolve) => {
-              video.addEventListener('seeked', () => resolve(), { once: true });
-              window.setTimeout(resolve, 1000);
-            });
-          }
-          if (video.videoWidth && video.videoHeight) {
-            const canvas = document.createElement('canvas');
-            const scale = Math.min(1, 640 / video.videoWidth);
-            canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-            canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-            canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
-            dataUrl = canvas.toDataURL('image/jpeg', 0.65);
-          }
-        } else {
-          const image = new Image();
-          image.src = result.url;
-          await new Promise<void>((resolve) => {
-            image.onload = () => resolve();
-            image.onerror = () => resolve();
-          });
-          if (image.naturalWidth && image.naturalHeight) {
-            const canvas = document.createElement('canvas');
-            const scale = Math.min(1, 640 / image.naturalWidth);
-            canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-            canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-            canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
-            dataUrl = canvas.toDataURL('image/jpeg', 0.72);
-          }
+        if (!reference && !legacyThumbnailEligible(item)) {
+          setState('unsupported');
+          return;
         }
-        if (!active) return;
-        if (dataUrl) {
+        await acquireThumbnailSlot();
+        if (!active) {
+          releaseThumbnailSlot();
+          return;
+        }
+        try {
+          const controller = createDownloadController();
+          const result = reference
+            ? await controller.loadThumbnail(reference)
+            : await controller.loadPreview(item.id);
+          revokeUrl = result.revoke;
+          if (!active) return;
+          const dataUrl = reference
+            ? await blobToDataURL(await (await fetch(result.url)).blob())
+            : item.mime?.startsWith('video/')
+              ? await captureVideoFrameFromUrl(result.url)
+              : await encodeImageFromUrl(result.url);
+          result.revoke();
+          revokeUrl = undefined;
+          if (!active) return;
+          if (!dataUrl) {
+            setState('error');
+            return;
+          }
           await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
           if (!active) return;
           setPreview(dataUrl);
           setState('ready');
-        } else {
-          setState('error');
+        } finally {
+          releaseThumbnailSlot();
         }
       } catch {
         if (active) setState('error');
-      } finally {
-        revokeUrl?.();
       }
     })();
     return () => {
       active = false;
       revokeUrl?.();
     };
-  }, [cacheKey, item.id, item.kind, item.mime, src]);
+  }, [item.id, item.kind, item.mime, item.size, item.partCount, item.thumbnail, item.updatedAt, item.createdAt]);
   if (item.kind === 'folder') {
     return (
       <span className={styles.thumbFolder}>
@@ -1414,13 +1396,6 @@ function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
   if (state === 'ready' && preview) {
     return <img src={preview} alt="" />;
   }
-  if (state === 'loading') {
-    return (
-      <span className={styles.thumbLoading}>
-        <span className={styles.thumbSpinner} aria-hidden="true" />
-      </span>
-    );
-  }
   if (state === 'error') {
     return (
       <span className={styles.thumbError}>
@@ -1429,9 +1404,16 @@ function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
       </span>
     );
   }
+  if (state === 'unsupported') {
+    return (
+      <span className={`${styles.thumbTile} ${mimeStyle(item.mime)}`}>
+        {item.mime?.split('/')[1]?.slice(0, 4).toUpperCase() ?? 'FILE'}
+      </span>
+    );
+  }
   return (
-    <span className={`${styles.thumbTile} ${mimeStyle(item.mime)}`}>
-      {item.mime?.split('/')[1]?.slice(0, 4).toUpperCase() ?? 'FILE'}
+    <span className={styles.thumbLoading}>
+      <span className={styles.thumbSpinner} aria-hidden="true" />
     </span>
   );
 }

@@ -28,6 +28,7 @@ import {
   retentionUntil,
   TRASH_RETENTION_DAYS,
 } from './metadata';
+import { sameThumbnail, thumbnailResponse, validateThumbnailInput } from './thumbnail';
 
 const app = new Hono<AppEnv>();
 const SESSION_COOKIE = '__Host-td_session';
@@ -376,11 +377,16 @@ async function objectForUser(c: Context<AppEnv>, userId: string, objectId: strin
     deleted_at: string | null;
     created_at: string;
     updated_at: string;
+    thumbnail_message_id: string | null;
+    thumbnail_mime: string | null;
+    thumbnail_size: number | null;
+    thumbnail_sha256: string | null;
   }>(
     c.env.DB,
     `
     SELECT o.id, o.workspace_id, o.folder_id, o.name, o.mime, o.size, o.sha256, o.part_count,
-           o.status, o.deleted_at, o.created_at, o.updated_at
+           o.status, o.deleted_at, o.created_at, o.updated_at,
+           o.thumbnail_message_id, o.thumbnail_mime, o.thumbnail_size, o.thumbnail_sha256
     FROM objects o JOIN workspaces w ON w.id = o.workspace_id
     WHERE o.id = ? AND w.owner_id = ? ${includeDeleted ? '' : 'AND o.deleted_at IS NULL'}
   `,
@@ -551,17 +557,24 @@ app.get('/v1/folders/:id/children', async (c) => {
     status: string | null;
     created_at: string;
     sort_at: string;
+    part_count: number | null;
+    thumbnail_message_id: string | null;
+    thumbnail_mime: string | null;
+    thumbnail_size: number | null;
+    thumbnail_sha256: string | null;
   }>(
     c.env.DB,
     `
     SELECT * FROM (
       SELECT 'folder' AS kind, f.id, f.name, NULL AS mime, NULL AS size, NULL AS status,
-             f.created_at, f.created_at AS sort_at
+             f.created_at, f.created_at AS sort_at, NULL AS part_count,
+             NULL AS thumbnail_message_id, NULL AS thumbnail_mime, NULL AS thumbnail_size, NULL AS thumbnail_sha256
       FROM folders f WHERE f.workspace_id = (SELECT workspace_id FROM folders WHERE id = ?)
         AND f.parent_id = ? AND f.deleted_at IS NULL
       UNION ALL
       SELECT 'object' AS kind, o.id, o.name, o.mime, o.size, o.status,
-             o.created_at, o.created_at AS sort_at
+             o.created_at, o.created_at AS sort_at, o.part_count,
+             o.thumbnail_message_id, o.thumbnail_mime, o.thumbnail_size, o.thumbnail_sha256
       FROM objects o WHERE o.workspace_id = (SELECT workspace_id FROM folders WHERE id = ?)
         AND o.folder_id = ? AND o.status = 'completed' AND o.deleted_at IS NULL
     ) entries
@@ -586,6 +599,8 @@ app.get('/v1/folders/:id/children', async (c) => {
     size: row.size,
     status: row.status,
     createdAt: row.created_at,
+    partCount: row.kind === 'object' ? row.part_count : null,
+    thumbnail: row.kind === 'object' ? thumbnailResponse(row) : null,
   }));
   const last = rows[limit - 1];
   return c.json({
@@ -629,10 +644,15 @@ app.get('/v1/objects/recent', async (c) => {
     part_count: number;
     created_at: string;
     updated_at: string;
+    thumbnail_message_id: string | null;
+    thumbnail_mime: string | null;
+    thumbnail_size: number | null;
+    thumbnail_sha256: string | null;
   }>(
     c.env.DB,
     `
-    SELECT o.id, o.folder_id, o.name, o.mime, o.size, o.sha256, o.part_count, o.created_at, o.updated_at
+    SELECT o.id, o.folder_id, o.name, o.mime, o.size, o.sha256, o.part_count, o.created_at, o.updated_at,
+           o.thumbnail_message_id, o.thumbnail_mime, o.thumbnail_size, o.thumbnail_sha256
     FROM objects o JOIN workspaces w ON w.id = o.workspace_id
     WHERE w.owner_id = ? AND o.status = 'completed' AND o.deleted_at IS NULL
       AND (o.updated_at < ? OR (o.updated_at = ? AND (o.created_at < ? OR (o.created_at = ? AND o.id > ?))))
@@ -659,6 +679,7 @@ app.get('/v1/objects/recent', async (c) => {
     status: 'completed',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    thumbnail: thumbnailResponse(row),
   }));
   const last = rows[limit - 1];
   return c.json({
@@ -689,17 +710,23 @@ app.get('/v1/trash', async (c) => {
     created_at: string;
     updated_at: string;
     sort_at: string;
+    thumbnail_message_id: string | null;
+    thumbnail_mime: string | null;
+    thumbnail_size: number | null;
+    thumbnail_sha256: string | null;
   }>(
     c.env.DB,
     `
     SELECT * FROM (
       SELECT 'folder' AS kind, f.id, f.parent_id, NULL AS folder_id, f.name, NULL AS mime, NULL AS size,
-             NULL AS sha256, NULL AS part_count, f.deleted_at, f.created_at, f.updated_at, f.deleted_at AS sort_at
+             NULL AS sha256, NULL AS part_count, f.deleted_at, f.created_at, f.updated_at, f.deleted_at AS sort_at,
+             NULL AS thumbnail_message_id, NULL AS thumbnail_mime, NULL AS thumbnail_size, NULL AS thumbnail_sha256
       FROM folders f JOIN workspaces w ON w.id = f.workspace_id
       WHERE w.owner_id = ? AND f.deleted_at IS NOT NULL
       UNION ALL
       SELECT 'object' AS kind, o.id, NULL AS parent_id, o.folder_id, o.name, o.mime, o.size,
-             o.sha256, o.part_count, o.deleted_at, o.created_at, o.updated_at, o.deleted_at AS sort_at
+             o.sha256, o.part_count, o.deleted_at, o.created_at, o.updated_at, o.deleted_at AS sort_at,
+             o.thumbnail_message_id, o.thumbnail_mime, o.thumbnail_size, o.thumbnail_sha256
       FROM objects o JOIN workspaces w ON w.id = o.workspace_id
       WHERE w.owner_id = ? AND o.status = 'deleted' AND o.deleted_at IS NOT NULL
     ) entries
@@ -739,6 +766,7 @@ app.get('/v1/trash', async (c) => {
           size: row.size,
           sha256: row.sha256,
           partCount: row.part_count,
+          thumbnail: thumbnailResponse(row),
           deletedAt: row.deleted_at,
           createdAt: row.created_at,
           updatedAt: row.updated_at,
@@ -1365,9 +1393,39 @@ app.get('/v1/objects/:id/manifest', async (c) => {
       deletedAt: object.deleted_at,
       createdAt: object.created_at,
       updatedAt: object.updated_at,
+      thumbnail: thumbnailResponse(object),
     },
     parts: parts.map(partResponse),
   });
+});
+
+app.put('/v1/objects/:id/thumbnail', async (c) => {
+  const session = await requireSession(c);
+  const body = metadataOnly(record(await readJson<unknown>(c)));
+  const object = await objectForUser(c, session.id, c.req.param('id'), false);
+  if (object.status !== 'completed')
+    fail(409, 'OBJECT_NOT_COMPLETE', 'Only completed objects can store a thumbnail reference');
+  const validation = validateThumbnailInput(body);
+  if (!validation.valid) fail(422, validation.code, validation.message);
+  const existing = thumbnailResponse(object);
+  if (existing && sameThumbnail(existing, validation.thumbnail))
+    return c.json({ ok: true, thumbnail: existing, idempotent: true });
+  const result = await c.env.DB.prepare(
+    `UPDATE objects SET thumbnail_message_id = ?, thumbnail_mime = ?, thumbnail_size = ?, thumbnail_sha256 = ?
+    WHERE id = ? AND workspace_id = ? AND status = 'completed' AND deleted_at IS NULL`,
+  )
+    .bind(
+      validation.thumbnail.messageId,
+      validation.thumbnail.mime,
+      validation.thumbnail.size,
+      validation.thumbnail.sha256,
+      object.id,
+      object.workspace_id,
+    )
+    .run();
+  if (changes(result) !== 1) fail(409, 'OBJECT_STATE_CHANGED', 'Object state changed; retry');
+  await audit(c.env.DB, session.id, 'object.thumbnail_set', 'object', object.id).run();
+  return c.json({ ok: true, thumbnail: validation.thumbnail, idempotent: false });
 });
 
 app.delete('/v1/objects/:id', async (c) => {
@@ -1441,7 +1499,7 @@ app.get('/v1/export', async (c) => {
   );
   const objects = await all(
     c.env.DB,
-    'SELECT id, folder_id, name, normalized_name, mime, size, sha256, part_count, status, deleted_at, created_at, updated_at FROM objects WHERE workspace_id = ? ORDER BY id',
+    'SELECT id, folder_id, name, normalized_name, mime, size, sha256, part_count, status, deleted_at, created_at, updated_at, thumbnail_message_id, thumbnail_mime, thumbnail_size, thumbnail_sha256 FROM objects WHERE workspace_id = ? ORDER BY id',
     workspace.id,
   );
   const objectIds = (objects as { id: string }[]).map((object) => object.id);

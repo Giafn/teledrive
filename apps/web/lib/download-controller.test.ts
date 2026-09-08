@@ -1,8 +1,13 @@
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { ApiClient, ManifestResponse } from './api';
-import { DownloadController, MAX_BLOB_FALLBACK_BYTES, MAX_PREVIEW_BYTES } from './download-controller';
+import type { ApiClient, ManifestResponse, ThumbnailReference } from './api';
+import {
+  DownloadController,
+  MAX_BLOB_FALLBACK_BYTES,
+  MAX_PREVIEW_BYTES,
+  MAX_THUMBNAIL_BYTES,
+} from './download-controller';
 import type { TelegramDownloadResult } from './telegram-gateway';
 
 const streamSaverMock = vi.hoisted(() => ({
@@ -39,6 +44,7 @@ function makeManifest(data: Uint8Array[], mime = 'application/pdf'): ManifestRes
       deletedAt: null,
       createdAt: '2099-01-01T00:00:00.000Z',
       updatedAt: '2099-01-01T00:00:00.000Z',
+      thumbnail: null,
     },
     parts: data.map((bytes, partNo) => ({
       id: `part-${partNo}`,
@@ -314,5 +320,103 @@ describe('DownloadController', () => {
     });
     expect(writer.close).toHaveBeenCalledOnce();
     expect(blob).not.toHaveBeenCalled();
+  });
+});
+
+describe('DownloadController.loadThumbnail', () => {
+  function thumbnailBytes(): Uint8Array {
+    return Uint8Array.from({ length: 64 }, (_, index) => index + 1);
+  }
+
+  function reference(bytes: Uint8Array = thumbnailBytes()): ThumbnailReference {
+    return { messageId: '7', mime: 'image/jpeg', size: bytes.byteLength, sha256: bytesToHex(sha256(bytes)) };
+  }
+
+  function thumbnailGateway(
+    bytes: Uint8Array = thumbnailBytes(),
+    events: string[] = [],
+    options: { authorized?: boolean; corrupt?: boolean } = {},
+  ) {
+    return {
+      checkSession: vi.fn(async () => {
+        events.push('session');
+        return { connected: true, authorized: options.authorized ?? true };
+      }),
+      downloadPart: vi.fn(async (_channel: string, requestedMessageId: number): Promise<TelegramDownloadResult> => {
+        events.push(`part:${requestedMessageId}`);
+        const data = options.corrupt ? Uint8Array.from(bytes, () => 200) : bytes;
+        return { messageId: requestedMessageId, data, fileName: 'thumb', mime: 'image/jpeg', size: data.byteLength };
+      }),
+    };
+  }
+
+  it('downloads a small sidecar, verifies its hash, and never touches the object manifest', async () => {
+    vi.stubGlobal('window', {});
+    const createObjectURL = vi.fn(() => 'blob:thumb');
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal('URL', { createObjectURL, revokeObjectURL });
+    const getManifest = vi.fn();
+    const events: string[] = [];
+    const gateway = thumbnailGateway(thumbnailBytes(), events);
+    const controller = new DownloadController({
+      channel: 'configured-channel',
+      api: { getManifest } as unknown as Pick<ApiClient, 'getManifest'>,
+      gateway,
+    });
+
+    const thumbnail = await controller.loadThumbnail(reference());
+    expect(events).toEqual(['session', 'part:7']);
+    expect(getManifest).not.toHaveBeenCalled();
+    expect(thumbnail).toMatchObject({ url: 'blob:thumb', mime: 'image/jpeg', size: 64 });
+    thumbnail.revoke();
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:thumb');
+  });
+
+  it('rejects oversized or unsupported sidecars before contacting Telegram', async () => {
+    vi.stubGlobal('window', {});
+    const events: string[] = [];
+    const gateway = thumbnailGateway(thumbnailBytes(), events);
+    const controller = new DownloadController({ channel: 'c', api: { getManifest: vi.fn() }, gateway });
+
+    await expect(controller.loadThumbnail({ ...reference(), size: MAX_THUMBNAIL_BYTES + 1 })).rejects.toMatchObject({
+      code: 'THUMBNAIL_TOO_LARGE',
+    });
+    await expect(controller.loadThumbnail({ ...reference(), mime: 'image/png' })).rejects.toMatchObject({
+      code: 'THUMBNAIL_UNSUPPORTED_MIME',
+    });
+    expect(events).toEqual([]);
+    expect(gateway.checkSession).not.toHaveBeenCalled();
+  });
+
+  it('fails integrity validation when the sidecar hash does not match', async () => {
+    vi.stubGlobal('window', {});
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(), revokeObjectURL: vi.fn() });
+    const events: string[] = [];
+    const gateway = thumbnailGateway(thumbnailBytes(), events, { corrupt: true });
+    const controller = new DownloadController({ channel: 'c', api: { getManifest: vi.fn() }, gateway });
+
+    await expect(controller.loadThumbnail(reference())).rejects.toMatchObject({ code: 'PART_HASH_MISMATCH' });
+  });
+
+  it('requires authorization and honors pre-aborted signals', async () => {
+    vi.stubGlobal('window', {});
+    const events: string[] = [];
+    const unauthorized = thumbnailGateway(thumbnailBytes(), events, { authorized: false });
+    await expect(
+      new DownloadController({ channel: 'c', api: { getManifest: vi.fn() }, gateway: unauthorized }).loadThumbnail(
+        reference(),
+      ),
+    ).rejects.toMatchObject({ code: 'TG_AUTH_REQUIRED' });
+    expect(events).toEqual(['session']);
+
+    const abortController = new AbortController();
+    abortController.abort();
+    const gateway = thumbnailGateway(thumbnailBytes(), events);
+    await expect(
+      new DownloadController({ channel: 'c', api: { getManifest: vi.fn() }, gateway, signal: abortController.signal }).loadThumbnail(
+        reference(),
+      ),
+    ).rejects.toMatchObject({ code: 'DOWNLOAD_ABORTED' });
+    expect(gateway.checkSession).not.toHaveBeenCalled();
   });
 });

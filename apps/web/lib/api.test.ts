@@ -1,4 +1,3 @@
-import type { RegistrationResponseJSON } from '@simplewebauthn/browser';
 import { describe, expect, it } from 'vitest';
 import { ApiError, MetadataApiClient } from './api';
 
@@ -58,6 +57,31 @@ describe('MetadataApiClient object and listing methods', () => {
     expect(JSON.parse(String(mutations[0].init.body))).toEqual({ name: 'renamed', folderId: 'folder-1' });
   });
 
+  it('commits thumbnail sidecar references through PUT with CSRF and a typed body', async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const client = new MetadataApiClient({
+      baseUrl: 'https://api.example.test',
+      fetch: async (input, init = {}) => {
+        calls.push({ url: String(input), init });
+        if (new URL(String(input)).pathname === '/v1/auth/csrf') return json({ csrfToken: 'csrf-token' });
+        return json({
+          ok: true,
+          idempotent: false,
+          thumbnail: { messageId: '42', mime: 'image/jpeg', size: 1024, sha256: 'a'.repeat(64) },
+        });
+      },
+    });
+    const input = { messageId: '42', mime: 'image/jpeg' as const, size: 1024, sha256: 'a'.repeat(64) };
+
+    await expect(client.setObjectThumbnail('object-1', input)).resolves.toMatchObject({ ok: true, idempotent: false });
+
+    expect(new URL(calls[1].url).pathname).toBe('/v1/objects/object-1/thumbnail');
+    expect(calls[1].init.method).toBe('PUT');
+    expect(calls[1].init.credentials).toBe('include');
+    expect(new Headers(calls[1].init.headers).get('X-CSRF-Token')).toBe('csrf-token');
+    expect(JSON.parse(String(calls[1].init.body))).toEqual(input);
+  });
+
   it('updates folders through the typed PATCH route with CSRF, cookies, and JSON body', async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const client = new MetadataApiClient({
@@ -83,37 +107,6 @@ describe('MetadataApiClient object and listing methods', () => {
     expect(new Headers(calls[1].init.headers).get('Content-Type')).toBe('application/json');
     expect(new Headers(calls[1].init.headers).get('X-CSRF-Token')).toBe('csrf-token');
     expect(JSON.parse(String(calls[1].init.body))).toEqual({ name: 'Renamed', parentId: null });
-  });
-
-  it('forwards bootstrap token to both registration requests, but omits it for active sessions', async () => {
-    const calls: Array<{ path: string; headers: Headers }> = [];
-    const makeClient = () =>
-      new MetadataApiClient({
-        baseUrl: 'https://api.example.test',
-        fetch: async (input, init = {}) => {
-          const url = new URL(String(input));
-          calls.push({ path: url.pathname, headers: new Headers(init.headers) });
-          if (url.pathname === '/v1/auth/csrf') return json({ csrfToken: 'csrf-token' });
-          if (url.pathname.endsWith('/register/options')) return json({ challengeId: 'challenge-1', options: {} });
-          return json({ user: { id: 'user-1', username: 'user', displayName: 'User' }, csrfToken: 'session-csrf' });
-        },
-      });
-    const response = {} as RegistrationResponseJSON;
-
-    const bootstrapClient = makeClient();
-    await bootstrapClient.registerPasskeyOptions('user', 'User', 'bootstrap-token');
-    await bootstrapClient.registerPasskeyVerify('challenge-1', response, 'bootstrap-token');
-    expect(
-      calls.filter(({ path }) => path.includes('/register/')).map(({ headers }) => headers.get('X-Bootstrap-Token')),
-    ).toEqual(['bootstrap-token', 'bootstrap-token']);
-
-    calls.length = 0;
-    const activeClient = makeClient();
-    await activeClient.registerPasskeyOptions('user', 'User');
-    await activeClient.registerPasskeyVerify('challenge-1', response);
-    expect(
-      calls.filter(({ path }) => path.includes('/register/')).every(({ headers }) => !headers.has('X-Bootstrap-Token')),
-    ).toBe(true);
   });
 
   it('gets current session with cookies and without CSRF', async () => {

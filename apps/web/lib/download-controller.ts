@@ -1,11 +1,13 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { api, type ApiClient, type ManifestResponse } from './api';
+import { api, type ApiClient, type ManifestResponse, type ThumbnailReference } from './api';
 import { telegramGateway, type TelegramDownloadResult, type TelegramGateway } from './telegram-gateway';
 
 export const MAX_PREVIEW_BYTES = 200 * 1024 * 1024;
 // ponytail: Blob fallback capped at 200 MiB; FSA and StreamSaver paths stream above ceiling.
 export const MAX_BLOB_FALLBACK_BYTES = MAX_PREVIEW_BYTES;
+export const MAX_THUMBNAIL_BYTES = 2 * 1024 * 1024;
+const THUMBNAIL_MIME_TYPES = new Set(['image/jpeg', 'image/webp']);
 const MAX_PART_ATTEMPTS = 3;
 const PART_RETRY_BASE_DELAY_MS = 100;
 
@@ -233,6 +235,39 @@ export class DownloadController {
       throw new DownloadError('PREVIEW_UNAVAILABLE', 'Object URL preview is unavailable.');
     const url = URL.createObjectURL(blob);
     return { url, mime: object.mime, size: object.size, revoke: () => URL.revokeObjectURL(url) };
+  }
+
+  async loadThumbnail(reference: ThumbnailReference, signal = this.signal): Promise<PreviewResult> {
+    requireBrowser();
+    throwIfAborted(signal);
+    if (!THUMBNAIL_MIME_TYPES.has(reference.mime)) {
+      throw new DownloadError('THUMBNAIL_UNSUPPORTED_MIME', 'Thumbnail media type is not supported.');
+    }
+    if (
+      !Number.isSafeInteger(reference.size) ||
+      reference.size < 1 ||
+      reference.size > MAX_THUMBNAIL_BYTES
+    ) {
+      throw new DownloadError('THUMBNAIL_TOO_LARGE', 'Thumbnail exceeds the safe size limit.');
+    }
+    const session = await this.gateway.checkSession();
+    if (!session.authorized) throw new DownloadError('TG_AUTH_REQUIRED', 'Connect Telegram before downloading.');
+    throwIfAborted(signal);
+    const channel = configuredChannel(this.channel);
+    const result = await this.downloadPartWithRetry(channel, messageId(reference.messageId), signal, () => undefined);
+    throwIfAborted(signal);
+    if (!(result.data instanceof Uint8Array) || result.data.byteLength !== reference.size) {
+      throw new DownloadError('PART_SIZE_MISMATCH', 'Downloaded Telegram part size does not match manifest.');
+    }
+    const partHash = bytesToHex(sha256(result.data));
+    if (partHash.toLowerCase() !== reference.sha256.toLowerCase()) {
+      throw new DownloadError('PART_HASH_MISMATCH', 'Downloaded Telegram part failed integrity validation.');
+    }
+    const blob = new Blob([result.data], { type: reference.mime });
+    if (typeof URL.createObjectURL !== 'function')
+      throw new DownloadError('PREVIEW_UNAVAILABLE', 'Object URL preview is unavailable.');
+    const url = URL.createObjectURL(blob);
+    return { url, mime: reference.mime, size: blob.size, revoke: () => URL.revokeObjectURL(url) };
   }
 
   async save(objectId: string, signal = this.signal): Promise<SaveResult> {

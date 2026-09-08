@@ -3,6 +3,10 @@ export type Folder = { id: string; name: string; parentId: string | null };
 export type Workspace = { id: string; name: string };
 export type WorkspaceResponse = { workspace: Workspace; rootFolder: Pick<Folder, 'id' | 'name'> };
 
+export type ThumbnailMime = 'image/jpeg' | 'image/webp';
+export type ThumbnailReference = { messageId: string; mime: ThumbnailMime; size: number; sha256: string };
+export type ThumbnailSetInput = ThumbnailReference;
+
 export type FolderItem = {
   kind: 'folder' | 'object';
   id: string;
@@ -12,6 +16,8 @@ export type FolderItem = {
   status: string | null;
   createdAt: string;
   updatedAt?: string;
+  partCount?: number | null;
+  thumbnail?: ThumbnailReference | null;
 };
 export type FolderChildrenResponse = {
   folder: Pick<Folder, 'id' | 'name'>;
@@ -29,6 +35,8 @@ export type ObjectListItem = {
   createdAt: string;
   updatedAt?: string;
   deletedAt?: string | null;
+  partCount?: number | null;
+  thumbnail?: ThumbnailReference | null;
 };
 export type PaginatedObjectResponse = { items: ObjectListItem[]; nextCursor: string | null };
 export type ObjectUpdateInput = { name?: string; folderId?: string | null };
@@ -112,6 +120,7 @@ export type ManifestResponse = {
     deletedAt: string | null;
     createdAt: string;
     updatedAt: string;
+    thumbnail: ThumbnailReference | null;
   };
   parts: UploadPart[];
 };
@@ -139,6 +148,10 @@ export type ExportObject = {
   deleted_at: string | null;
   created_at: string;
   updated_at: string;
+  thumbnail_message_id: string | null;
+  thumbnail_mime: string | null;
+  thumbnail_size: number | null;
+  thumbnail_sha256: string | null;
 };
 export type ExportPart = {
   id: string;
@@ -202,6 +215,7 @@ export interface ApiClient {
   commitPart(uploadId: string, part: UploadPartInput | Omit<UploadPartInput, 'idempotencyKey'>): Promise<UploadPart>;
   completeUpload(uploadId: string, metadata?: CompleteUploadInput): Promise<CompleteUploadResponse>;
   abortUpload(uploadId: string): Promise<AbortUploadResponse>;
+  setObjectThumbnail(objectId: string, input: ThumbnailSetInput): Promise<{ ok: true; thumbnail: ThumbnailReference; idempotent: boolean }>;
   getManifest(objectId: string): Promise<ManifestResponse>;
   exportWorkspace(): Promise<ExportResponse>;
 }
@@ -482,6 +496,14 @@ export class MetadataApiClient implements ApiClient {
 
   abortUpload(uploadId: string) {
     return this.request<AbortUploadResponse>(`/v1/uploads/${encodeURIComponent(uploadId)}`, { method: 'DELETE' }, true);
+  }
+
+  setObjectThumbnail(objectId: string, input: ThumbnailSetInput) {
+    return this.request<{ ok: true; thumbnail: ThumbnailReference; idempotent: boolean }>(
+      `/v1/objects/${encodeURIComponent(objectId)}/thumbnail`,
+      { method: 'PUT', body: JSON.stringify(input) },
+      true,
+    );
   }
 
   getManifest(objectId: string) {
