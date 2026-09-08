@@ -733,9 +733,12 @@
   border-radius: 8px;
 }
 .thumbLoading {
+  display: grid;
+  place-items: center;
   color: var(--text-3);
 }
 .thumbSpinner {
+  display: block;
   width: 18px;
   height: 18px;
   border: 2px solid var(--border-strong);
