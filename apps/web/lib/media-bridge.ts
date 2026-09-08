@@ -82,10 +82,17 @@ export function ensureMediaStream(): Promise<ServiceWorker> {
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
     return Promise.reject(new Error('Media streaming requires a browser with Service Worker support.'));
   }
+  // Harus SW scope root: SW hanya mencegat fetch dari halaman yang ia kontrol,
+  // dan halaman aplikasi berada di "/" — scope /media/ tidak akan pernah kena.
   registrationPromise ??= navigator.serviceWorker
-    .register('/media/sw.js')
+    .register('/sw.js', { scope: '/' })
     .then(async (registration) => {
       registerPageMessageHandler();
+      // Bersihkan registrasi SW /media/ lama (percobaan pertama) yang tak pernah mengontrol halaman.
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      for (const reg of registrations) {
+        if (new URL(reg.scope).pathname === '/media/') void reg.unregister();
+      }
       if (registration.active) return registration.active;
       const worker = registration.installing || registration.waiting;
       if (!worker) throw new Error('Media Service Worker is not activating.');
