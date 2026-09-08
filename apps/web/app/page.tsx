@@ -34,8 +34,9 @@ type SelectedEntry = { id: string; kind: 'folder' | 'object'; name: string; pare
 const iconPaths: Record<string, React.ReactNode> = {
   drive: (
     <>
-      <path d="m7 3 5 0 7 12H5L2 10" />
-      <path d="M5 15 2.5 19h15L15 15" />
+      <path d="M12 3 20 7.5v9L12 21 4 16.5v-9z" />
+      <path d="m4 7.5 8 4.5 8-4.5" />
+      <path d="M12 12v9" />
     </>
   ),
   clock: (
@@ -124,7 +125,13 @@ const iconPaths: Record<string, React.ReactNode> = {
       <path d="M12 11v5m0-8v.01" />
     </>
   ),
-  spark: <path d="m12 2 1.8 7.2L21 11l-7.2 1.8L12 20l-1.8-7.2L3 11l7.2-1.8z" />,
+  brand: (
+    <>
+      <path d="M12 3 20 7.5v9L12 21 4 16.5v-9z" />
+      <path d="m4 7.5 8 4.5 8-4.5" />
+      <path d="M12 12v9" />
+    </>
+  ),
 };
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
   return (
@@ -257,6 +264,7 @@ export default function Page() {
   const [trash, setTrash] = useState<ObjectListItem[]>([]);
   const [specialCursor, setSpecialCursor] = useState<string | null>(null);
   const [specialLoading, setSpecialLoading] = useState(false);
+  const [specialMoreLoading, setSpecialMoreLoading] = useState(false);
   const [menuId, setMenuId] = useState<string | null>(null);
   const [selected, setSelected] = useState<Record<string, SelectedEntry>>({});
   const [moveSelection, setMoveSelection] = useState<SelectedEntry[]>([]);
@@ -374,7 +382,8 @@ export default function Page() {
   }
   async function loadSpecial(nextView: 'recent' | 'trash', append = false) {
     setView(nextView);
-    setSpecialLoading(true);
+    if (append) setSpecialMoreLoading(true);
+    else setSpecialLoading(true);
     setLoadError('');
     try {
       const result =
@@ -389,6 +398,7 @@ export default function Page() {
       setLoadError(message(error));
     } finally {
       setSpecialLoading(false);
+      setSpecialMoreLoading(false);
     }
   }
   async function mutate(
@@ -594,7 +604,7 @@ export default function Page() {
       <aside className={styles.sidebar}>
         <div className={styles.brand}>
           <span className={styles.logo}>
-            <Icon name="spark" size={17} />
+            <Icon name="brand" size={17} />
           </span>
           ruang<span className={styles.dot}>.</span>
         </div>
@@ -635,7 +645,7 @@ export default function Page() {
         <header className={styles.header}>
           <button className={styles.mobileBrand}>
             <span className={styles.logo}>
-              <Icon name="spark" size={15} />
+              <Icon name="brand" size={15} />
             </span>
             ruang<span className={styles.dot}>.</span>
           </button>
@@ -647,6 +657,11 @@ export default function Page() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
+            {query && (
+              <button className={styles.searchClear} onClick={() => setQuery('')} aria-label="Bersihkan pencarian">
+                <Icon name="close" size={14} />
+              </button>
+            )}
             <kbd>⌘ K</kbd>
           </label>
           <div className={styles.headerActions}>
@@ -673,6 +688,7 @@ export default function Page() {
             title={view === 'recent' ? 'Terbaru' : 'Sampah'}
             items={view === 'recent' ? recent : trash}
             loading={specialLoading}
+            moreLoading={specialMoreLoading}
             error={loadError}
             cursor={specialCursor}
              onLoadMore={() => loadSpecial(view as 'recent' | 'trash', true)}
@@ -701,7 +717,12 @@ export default function Page() {
                   {crumbs.map((crumb, i) => (
                     <span className={styles.breadcrumbItem} key={crumb.id}>
                       {i > 0 && <Icon name="chevron" size={14} />}
-                      <button onClick={() => loadFolder(crumb.id, crumbs.slice(0, i + 1))}>{crumb.name}</button>
+                      <button
+                        onClick={() => loadFolder(crumb.id, crumbs.slice(0, i + 1))}
+                        aria-current={i === crumbs.length - 1 ? 'page' : undefined}
+                      >
+                        {crumb.name}
+                      </button>
                     </span>
                   ))}
                 </div>
@@ -728,6 +749,7 @@ export default function Page() {
                     className={layout === 'list' ? styles.selected : ''}
                     onClick={() => setLayout('list')}
                     aria-label="Tampilan daftar"
+                    aria-pressed={layout === 'list'}
                   >
                     <Icon name="list" size={17} />
                   </button>
@@ -735,6 +757,7 @@ export default function Page() {
                     className={layout === 'grid' ? styles.selected : ''}
                     onClick={() => setLayout('grid')}
                     aria-label="Tampilan grid"
+                    aria-pressed={layout === 'grid'}
                   >
                     <Icon name="grid" size={17} />
                   </button>
@@ -746,28 +769,18 @@ export default function Page() {
                 error={loadError}
                 onRetry={() => workspace && loadFolder(folder?.folder.id ?? workspace.rootFolder.id)}
               />
-            )}{' '}
+            )}
+            {loading && !loadError && (layout === 'grid' ? <GridSkeleton /> : <ListSkeleton />)}
             {!loading && !loadError && (
-               <div className={`${styles.fileArea} ${layout === 'grid' ? styles.grid : ''}`}>
-                 {layout === 'grid' && (
-                     <GalleryView
-                     items={items}
-                     thumbnails={thumbnails}
-                     menuId={menuId}
-                     setMenuId={setMenuId}
-                     onMutate={mutate}
-                     onOpen={(item) =>
-                       item.kind === 'folder'
-                         ? loadFolder(item.id, [...crumbs, { id: item.id, name: item.name }])
-                         : setPreview({ id: item.id, name: item.name, mime: item.mime ?? 'application/octet-stream', size: item.size })
-                     }
-                   />
-                 )}
-                 {layout === 'list' && items.map((item) => (
-                   <FileRow
-                    key={item.id}
-                    item={item}
-                    onOpen={() =>
+              <div className={styles.fileArea}>
+                {layout === 'grid' && (
+                  <GalleryView
+                    items={items}
+                    thumbnails={thumbnails}
+                    menuId={menuId}
+                    setMenuId={setMenuId}
+                    onMutate={mutate}
+                    onOpen={(item) =>
                       item.kind === 'folder'
                         ? loadFolder(item.id, [...crumbs, { id: item.id, name: item.name }])
                         : setPreview({
@@ -777,16 +790,38 @@ export default function Page() {
                             size: item.size,
                           })
                     }
-                    onMutate={mutate}
                     onDownload={startDownload}
-                    download={downloads[item.id]}
-                    menuId={menuId}
-                    setMenuId={setMenuId}
+                    downloads={downloads}
                     selected={selected}
                     onToggleSelection={toggleSelection}
                     onMove={openMove}
                   />
-                ))}
+                )}
+                {layout === 'list' &&
+                  items.map((item) => (
+                    <FileRow
+                      key={item.id}
+                      item={item}
+                      onOpen={() =>
+                        item.kind === 'folder'
+                          ? loadFolder(item.id, [...crumbs, { id: item.id, name: item.name }])
+                          : setPreview({
+                              id: item.id,
+                              name: item.name,
+                              mime: item.mime ?? 'application/octet-stream',
+                              size: item.size,
+                            })
+                      }
+                      onMutate={mutate}
+                      onDownload={startDownload}
+                      download={downloads[item.id]}
+                      menuId={menuId}
+                      setMenuId={setMenuId}
+                      selected={selected}
+                      onToggleSelection={toggleSelection}
+                      onMove={openMove}
+                    />
+                  ))}
                 {!items.length && <Empty query={query} />}
               </div>
             )}
@@ -888,7 +923,7 @@ function SessionRestore({ error, onRetry }: { error?: string; onRetry?: () => vo
       <div className={styles.authCard} role={error ? 'alert' : undefined}>
         <div className={styles.brand}>
           <span className={styles.logo}>
-            <Icon name="spark" size={17} />
+            <Icon name="brand" size={17} />
           </span>
           ruang<span className={styles.dot}>.</span>
         </div>
@@ -1107,7 +1142,7 @@ function AuthScreen({
       <div className={styles.authCard}>
         <div className={styles.brand}>
           <span className={styles.logo}>
-            <Icon name="spark" size={17} />
+            <Icon name="brand" size={17} />
           </span>
           ruang<span className={styles.dot}>.</span>
         </div>
@@ -1156,112 +1191,249 @@ function NavItem({
     </button>
   );
 }
-function GalleryView({ items, thumbnails, menuId, setMenuId, onMutate, onOpen }: {
+function GalleryView({
+  items,
+  thumbnails,
+  menuId,
+  setMenuId,
+  onMutate,
+  onOpen,
+  onDownload,
+  downloads,
+  selected,
+  onToggleSelection,
+  onMove,
+}: {
   items: FolderItem[];
   thumbnails: Record<string, string>;
   menuId: string | null;
   setMenuId: (id: string | null) => void;
-  onMutate: (kind: 'folder' | 'object', action: 'rename' | 'move' | 'delete' | 'restore' | 'purge', id: string, name?: string) => void;
+  onMutate: (
+    kind: 'folder' | 'object',
+    action: 'rename' | 'move' | 'delete' | 'restore' | 'purge',
+    id: string,
+    name?: string,
+  ) => void;
   onOpen: (item: FolderItem) => void;
+  onDownload: (item: DownloadItem) => void;
+  downloads: Record<string, DownloadAction>;
+  selected: Record<string, SelectedEntry>;
+  onToggleSelection: (entry: SelectedEntry) => void;
+  onMove: (entries?: SelectedEntry[]) => void;
 }) {
-  return <div className={styles.galleryGrid}>
-    {items.map((item) => (
-      <article className={styles.galleryCard} key={item.id}>
-        <button className={styles.galleryOpen} onClick={() => onOpen(item)}>
-          <div className={styles.galleryThumb}><GalleryThumbnail item={item} src={thumbnails[item.id]} /></div>
-          <b>{item.name}</b>
-          <small>{item.kind === 'folder' ? 'Folder' : formatSize(item.size)}</small>
-        </button>
-        <button className={styles.galleryMenu} onClick={() => setMenuId(menuId === item.id ? null : item.id)} aria-label={`Opsi ${item.name}`}>
-          <Icon name="more" size={18} />
-        </button>
-        {menuId === item.id && <div className={styles.rowMenuPopup} role="menu">
-          <button role="menuitem" onClick={() => onMutate(item.kind, 'rename', item.id, item.name)}>Ganti nama</button>
-          <button role="menuitem" onClick={() => onMutate(item.kind, 'move', item.id, item.name)}>Pindahkan ke</button>
-          <button role="menuitem" className={styles.dangerAction} onClick={() => onMutate(item.kind, 'delete', item.id, item.name)}>Pindahkan ke sampah</button>
-        </div>}
-      </article>
-    ))}
-  </div>;
+  return (
+    <div className={styles.galleryGrid}>
+      {items.map((item) => {
+        const folder = item.kind === 'folder';
+        const isSelected = Boolean(selected[item.id]);
+        const download = downloads[item.id];
+        const downloadable = {
+          id: item.id,
+          name: item.name,
+          mime: item.mime ?? 'application/octet-stream',
+          size: item.size,
+        };
+        return (
+          <article key={item.id} className={`${styles.galleryCard} ${isSelected ? styles.gallerySelected : ''}`}>
+            <input
+              className={styles.galleryCheck}
+              type="checkbox"
+              checked={isSelected}
+              onChange={() => onToggleSelection({ id: item.id, kind: folder ? 'folder' : 'object', name: item.name })}
+              onClick={(event) => event.stopPropagation()}
+              aria-label={`Pilih ${item.name}`}
+            />
+            <button
+              className={styles.galleryOpen}
+              onClick={() => onOpen(item)}
+              aria-label={folder ? `Buka folder ${item.name}` : `Pratinjau ${item.name}`}
+            >
+              <div className={styles.galleryThumb}>
+                <GalleryThumbnail item={item} src={thumbnails[item.id]} />
+              </div>
+              <span className={styles.galleryMeta}>
+                <b title={item.name}>{item.name}</b>
+                <small>
+                  {folder ? 'Folder' : formatSize(item.size)} · {formatDate(item.updatedAt, item.createdAt)}
+                </small>
+              </span>
+            </button>
+            <span className={styles.rowMenuWrap} data-file-menu>
+              <button
+                className={styles.galleryMenu}
+                aria-label={`Opsi ${item.name}`}
+                aria-expanded={menuId === item.id}
+                onClick={() => setMenuId(menuId === item.id ? null : item.id)}
+              >
+                <Icon name="more" size={18} />
+              </button>
+              {menuId === item.id && (
+                <div className={styles.rowMenuPopup} role="menu">
+                  {!folder && (
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        setMenuId(null);
+                        onDownload(downloadable);
+                      }}
+                    >
+                      {download?.error
+                        ? 'Coba lagi'
+                        : download?.done
+                          ? 'Selesai'
+                          : download?.progress?.totalBytes
+                            ? `Unduh ${Math.round((download.progress.bytesDownloaded / download.progress.totalBytes) * 100)}%`
+                            : 'Unduh file'}
+                    </button>
+                  )}
+                  <button role="menuitem" onClick={() => onMutate(item.kind, 'rename', item.id, item.name)}>
+                    Ganti nama
+                  </button>
+                  <button role="menuitem" onClick={() => onMove([{ id: item.id, kind: folder ? 'folder' : 'object', name: item.name }])}>
+                    Pindahkan ke
+                  </button>
+                  <button
+                    role="menuitem"
+                    className={styles.dangerAction}
+                    onClick={() => onMutate(item.kind, 'delete', item.id, item.name)}
+                  >
+                    Pindahkan ke sampah
+                  </button>
+                </div>
+              )}
+            </span>
+          </article>
+        );
+      })}
+    </div>
+  );
 }
 
 function GalleryThumbnail({ item, src }: { item: FolderItem; src?: string }) {
   const cacheKey = `thumbnail:${item.id}:${item.updatedAt}`;
+  const [state, setState] = useState<'loading' | 'ready' | 'unsupported' | 'error'>(src ? 'ready' : 'loading');
   const [preview, setPreview] = useState(src);
   useEffect(() => {
-    if (src || item.kind === 'folder') return;
+    if (src) {
+      setPreview(src);
+      setState('ready');
+      return;
+    }
+    if (item.kind === 'folder') return;
+    const supported = Boolean(item.mime?.startsWith('image/') || item.mime?.startsWith('video/'));
+    if (!supported) {
+      setState('unsupported');
+      return;
+    }
     let active = true;
-    void getThumbnail(cacheKey).then((cached) => {
-      if (active && cached) setPreview(cached);
-    }).catch(() => undefined);
-    return () => {
-      active = false;
-    };
-  }, [cacheKey, item.kind, src]);
-  useEffect(() => {
-    if (src || item.kind === 'folder' || !item.mime?.startsWith('image/') && !item.mime?.startsWith('video/')) return;
-    const controller = createDownloadController();
-    let active = true;
-    void controller.loadPreview(item.id).then(async (result) => {
-      if (item.mime?.startsWith('video/')) {
-        if (active) setPreview(result.url);
-        const video = document.createElement('video');
-        video.src = result.url;
-        video.muted = true;
-        video.playsInline = true;
-        video.preload = 'auto';
-        await new Promise<void>((resolve) => {
-          const finish = () => resolve();
-          video.addEventListener('loadeddata', finish, { once: true });
-          video.addEventListener('error', finish, { once: true });
-          video.load();
-        });
-        if (video.readyState >= 2 && video.duration > 0) {
-          video.currentTime = 0;
+    let revokeUrl: (() => void) | undefined;
+    setState('loading');
+    void (async () => {
+      try {
+        const cached = await getThumbnail(cacheKey).catch(() => undefined);
+        if (!active) return;
+        if (cached) {
+          setPreview(cached);
+          setState('ready');
+          return;
+        }
+        const controller = createDownloadController();
+        const result = await controller.loadPreview(item.id);
+        revokeUrl = result.revoke;
+        if (!active) return;
+        let dataUrl: string | undefined;
+        if (item.mime?.startsWith('video/')) {
+          const video = document.createElement('video');
+          video.src = result.url;
+          video.muted = true;
+          video.playsInline = true;
+          video.preload = 'auto';
           await new Promise<void>((resolve) => {
-            video.addEventListener('seeked', () => resolve(), { once: true });
-            window.setTimeout(resolve, 1000);
+            video.addEventListener('loadeddata', () => resolve(), { once: true });
+            video.addEventListener('error', () => resolve(), { once: true });
+            video.load();
           });
+          if (video.readyState >= 2 && video.duration > 0) {
+            video.currentTime = 0;
+            await new Promise<void>((resolve) => {
+              video.addEventListener('seeked', () => resolve(), { once: true });
+              window.setTimeout(resolve, 1000);
+            });
+          }
+          if (video.videoWidth && video.videoHeight) {
+            const canvas = document.createElement('canvas');
+            const scale = Math.min(1, 640 / video.videoWidth);
+            canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+            canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+            canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
+            dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+          }
+        } else {
+          const image = new Image();
+          image.src = result.url;
+          await new Promise<void>((resolve) => {
+            image.onload = () => resolve();
+            image.onerror = () => resolve();
+          });
+          if (image.naturalWidth && image.naturalHeight) {
+            const canvas = document.createElement('canvas');
+            const scale = Math.min(1, 640 / image.naturalWidth);
+            canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+            canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+            canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
+            dataUrl = canvas.toDataURL('image/jpeg', 0.72);
+          }
         }
-        if (video.videoWidth && video.videoHeight) {
-          const canvas = document.createElement('canvas');
-          const scale = Math.min(1, 640 / video.videoWidth);
-          canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
-          canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
-          canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+        if (!active) return;
+        if (dataUrl) {
           await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
-          if (active) setPreview(dataUrl);
+          if (!active) return;
+          setPreview(dataUrl);
+          setState('ready');
+        } else {
+          setState('error');
         }
-        result.revoke();
-      } else {
-        const image = new Image();
-        image.src = result.url;
-        await new Promise<void>((resolve) => {
-          image.onload = () => resolve();
-          image.onerror = () => resolve();
-        });
-        if (image.naturalWidth && image.naturalHeight) {
-          const canvas = document.createElement('canvas');
-          const scale = Math.min(1, 640 / image.naturalWidth);
-          canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-          canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
-          canvas.getContext('2d')?.drawImage(image, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
-          await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
-          if (active) setPreview(dataUrl);
-        }
-        result.revoke();
+      } catch {
+        if (active) setState('error');
+      } finally {
+        revokeUrl?.();
       }
-    }).catch(() => undefined);
+    })();
     return () => {
       active = false;
+      revokeUrl?.();
     };
-  }, [item.id, item.kind, item.mime, src]);
-  if (item.kind === 'folder') return <span className={styles.galleryPlaceholder}><Icon name="folder" size={28} /></span>;
-  return preview ? (
-    item.mime?.startsWith('video/') ? <video src={preview} muted preload="metadata" /> : <img src={preview} alt="" />
-  ) : <span className={`${styles.galleryPlaceholder} ${mimeStyle(item.mime)}`}><Icon name="info" size={28} /></span>;
+  }, [cacheKey, item.id, item.kind, item.mime, src]);
+  if (item.kind === 'folder') {
+    return (
+      <span className={styles.thumbFolder}>
+        <Icon name="folder" size={30} />
+      </span>
+    );
+  }
+  if (state === 'ready' && preview) {
+    return <img src={preview} alt="" />;
+  }
+  if (state === 'loading') {
+    return (
+      <span className={styles.thumbLoading}>
+        <span className={styles.thumbSpinner} aria-hidden="true" />
+      </span>
+    );
+  }
+  if (state === 'error') {
+    return (
+      <span className={styles.thumbError}>
+        <Icon name="info" size={22} />
+        <small>Pratinjau gagal</small>
+      </span>
+    );
+  }
+  return (
+    <span className={`${styles.thumbTile} ${mimeStyle(item.mime)}`}>
+      {item.mime?.split('/')[1]?.slice(0, 4).toUpperCase() ?? 'FILE'}
+    </span>
+  );
 }
 
 function FileRow({
@@ -1296,7 +1468,7 @@ function FileRow({
   const downloadable = { id: item.id, name: item.name, mime: item.mime ?? 'application/octet-stream', size: item.size };
   return (
     <article
-      className={styles.fileRow}
+      className={`${styles.fileRow} ${selected[item.id] ? styles.rowSelected : ''}`}
       onDoubleClick={onOpen}
       tabIndex={folder ? 0 : undefined}
       onKeyDown={(e) => folder && e.key === 'Enter' && onOpen()}
@@ -1480,11 +1652,22 @@ function PreviewModal({
               </button>
             </div>
           ) : item.mime.startsWith('image/') ? (
-            <img className={styles.previewImage} src={preview.url} alt={item.name} />
+            <img
+              className={styles.previewImage}
+              src={preview.url}
+              alt={item.name}
+              onError={() => setError('Pratinjau tidak dapat ditampilkan oleh browser.')}
+            />
           ) : item.mime === 'application/pdf' ? (
             <iframe className={styles.previewFrame} src={preview.url} title={`Pratinjau ${item.name}`} />
           ) : (
-            <video className={styles.previewVideo} src={preview.url} controls preload="metadata" />
+            <video
+              className={styles.previewVideo}
+              src={preview.url}
+              controls
+              preload="metadata"
+              onError={() => setError('Video tidak dapat diputar oleh browser.')}
+            />
           )}
         </div>
         <footer className={styles.previewFooter}>
@@ -1526,23 +1709,42 @@ function DownloadButton({
     </span>
   );
 }
-function Empty({ query }: { query: string }) {
+function Empty({ query, context = 'folder' }: { query?: string; context?: 'folder' | 'recent' | 'trash' | 'search' }) {
+  const mode = query ? 'search' : context;
+  const copy = {
+    folder: { icon: 'folder', title: 'Folder masih kosong', text: 'Unggah file atau buat folder baru untuk mulai.' },
+    search: { icon: 'search', title: 'File tidak ditemukan', text: `Tidak ada hasil untuk “${query}”. Coba kata kunci lain.` },
+    recent: {
+      icon: 'clock',
+      title: 'Belum ada aktivitas terbaru',
+      text: 'File yang baru diunggah atau diubah akan muncul di sini.',
+    },
+    trash: { icon: 'trash', title: 'Sampah kosong', text: 'Item yang dihapus dari Drive akan ditahan di sini.' },
+  }[mode];
   return (
     <div className={styles.empty}>
       <span className={styles.emptyArt}>
-        <Icon name={query ? 'search' : 'folder'} size={30} />
+        <Icon name={copy.icon} size={30} />
       </span>
-      <h2>{query ? 'File tidak ditemukan' : 'Folder masih kosong'}</h2>
-      <p>{query ? 'Coba kata kunci lain.' : 'Unggah file atau buat folder baru untuk mulai.'}</p>
+      <h2>{copy.title}</h2>
+      <p>{copy.text}</p>
     </div>
   );
 }
-function ErrorState({ error, onRetry }: { error: string; onRetry: () => void }) {
+function ErrorState({
+  error,
+  onRetry,
+  title = 'Drive tidak dapat dimuat',
+}: {
+  error: string;
+  onRetry: () => void;
+  title?: string;
+}) {
   return (
     <div className={styles.errorState} role="alert">
       <Icon name="info" />
       <div>
-        <b>Drive tidak dapat dimuat</b>
+        <b>{title}</b>
         <p>{error}</p>
         <button className={styles.textButton} onClick={onRetry}>
           Coba lagi
@@ -1551,15 +1753,31 @@ function ErrorState({ error, onRetry }: { error: string; onRetry: () => void }) 
     </div>
   );
 }
-function Unavailable({ title }: { title: string }) {
+function GridSkeleton() {
   return (
-    <div className={styles.unavailable}>
-      <span className={styles.emptyArt}>
-        <Icon name={title === 'Sampah' ? 'trash' : 'clock'} size={30} />
-      </span>
-      <h1>{title}</h1>
-      <h2>Belum tersedia di API</h2>
-      <p>Endpoint untuk {title.toLowerCase()} belum tersedia. Ruang tidak menampilkan data palsu.</p>
+    <div className={styles.skeletonGrid} aria-hidden="true">
+      {Array.from({ length: 8 }, (_, index) => (
+        <div className={styles.skeletonCard} key={index}>
+          <div className={styles.skeletonThumb} />
+          <div className={styles.skeletonLine} />
+          <div className={`${styles.skeletonLine} ${styles.skeletonLineShort}`} />
+        </div>
+      ))}
+    </div>
+  );
+}
+function ListSkeleton() {
+  return (
+    <div aria-hidden="true">
+      {Array.from({ length: 6 }, (_, index) => (
+        <div className={styles.skeletonRow} key={index}>
+          <span className={styles.skeletonRowIcon} />
+          <div>
+            <div className={styles.skeletonLine} />
+            <div className={`${styles.skeletonLine} ${styles.skeletonLineShort}`} />
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1567,6 +1785,7 @@ function SpecialView({
   title,
   items,
   loading,
+  moreLoading,
   error,
   cursor,
   onLoadMore,
@@ -1586,6 +1805,7 @@ function SpecialView({
   title: string;
   items: ObjectListItem[];
   loading: boolean;
+  moreLoading: boolean;
   error: string;
   cursor: string | null;
   onLoadMore: () => void;
@@ -1634,7 +1854,7 @@ function SpecialView({
           <span>{mutationError}</span>
         </div>
       )}
-      {error && <ErrorState error={error} onRetry={onRetry} />}{' '}
+      {error && <ErrorState error={error} onRetry={onRetry} title={trashView ? 'Sampah tidak dapat dimuat' : 'Daftar tidak dapat dimuat'} />}
       {!error && (
         <div className={styles.fileArea}>
           {loading && (
@@ -1659,10 +1879,10 @@ function SpecialView({
                 onMove={onMove}
               />
             ))}
-          {!loading && !items.length && <Empty query="" />}
+          {!loading && !items.length && <Empty context={trashView ? 'trash' : 'recent'} />}
           {!loading && cursor && (
-            <button className={styles.loadMore} onClick={onLoadMore}>
-              Muat lebih banyak
+            <button className={styles.loadMore} onClick={onLoadMore} disabled={moreLoading}>
+              {moreLoading ? 'Memuat…' : 'Muat lebih banyak'}
             </button>
           )}
         </div>
@@ -1704,7 +1924,15 @@ function ObjectRow({
   const mime = item.mime ?? 'application/octet-stream';
   const downloadable = { id: item.id, name: item.name, mime, size: item.size };
   return (
-    <article className={styles.fileRow}>
+    <article
+      className={[
+        styles.fileRow,
+        trash ? styles.rowNoSelect : '',
+        !trash && selected[item.id] ? styles.rowSelected : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+    >
       {!trash && (
         <input
           className={styles.selectionCheckbox}

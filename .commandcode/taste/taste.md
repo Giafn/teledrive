@@ -1,0 +1,4 @@
+- Prefers communication and implementation plans in Indonesian. Confidence: 0.85
+- Prefers detailed, concrete, step-by-step plans that a low-cost AI model can execute with minimal ambiguity or additional decisions. Confidence: 0.95
+- Prefers workspace/file-management interfaces inspired by Google Drive’s information hierarchy and usability, without necessarily copying its branding. Confidence: 0.9
+- Prefers proper custom SVG branding assets, including favicon SVGs, and wants outdated drive-style icons replaced rather than retained. Confidence: 0.9

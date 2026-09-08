@@ -1,13 +1,27 @@
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
 :root {
-  --ink: #19332b;
-  --muted: #78847d;
-  --line: #e4e7df;
-  --paper: #f7f8f4;
-  --white: #fff;
-  --lime: #c8ee55;
-  --deep: #21473a;
-  --orange: #e77848;
+  color-scheme: light;
+  --bg: #f6f8f7;
+  --surface: #ffffff;
+  --surface-2: #eff3f1;
+  --border: #e3e8e5;
+  --border-strong: #d2dad5;
+  --ink: #182b25;
+  --text-2: #55645d;
+  --text-3: #86938c;
+  --accent: #147a54;
+  --accent-strong: #0d5f40;
+  --accent-soft: #e0f0e9;
+  --accent-ring: #2f9c70;
+  --danger: #b04a33;
+  --danger-soft: #fbeeea;
+  --radius-s: 8px;
+  --radius-m: 12px;
+  --radius-l: 16px;
+  --shadow-card: 0 1px 2px rgb(24 43 37 / 5%), 0 6px 18px rgb(24 43 37 / 6%);
+  --shadow-pop: 0 10px 32px rgb(24 43 37 / 18%);
+  --pad-x: clamp(16px, 3.4vw, 40px);
+  --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
 }
 * {
   box-sizing: border-box;
@@ -16,9 +30,10 @@ html,
 body {
   margin: 0;
   min-height: 100%;
-  background: var(--paper);
+  background: var(--bg);
   color: var(--ink);
-  font-family: Manrope, sans-serif;
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
 }
 button,
 input,
@@ -30,8 +45,10 @@ button {
 }
 button:focus-visible,
 input:focus-visible,
-select:focus-visible {
-  outline: 3px solid #9ccf25;
+select:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent-ring);
   outline-offset: 2px;
 }
 svg {
