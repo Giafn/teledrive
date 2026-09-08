@@ -11,11 +11,13 @@
     "@mtcute/web": "0.31.0",
     "@noble/hashes": "2.2.0",
     "@simplewebauthn/browser": "13.3.0",
+    "@vidstack/react": "^0.6.15",
     "next": "14.2.15",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-photo-album": "^3.6.1",
-    "streamsaver": "^2.0.6"
+    "streamsaver": "^2.0.6",
+    "vidstack": "^0.6.15"
   },
   "devDependencies": {
     "@types/node": "22.10.2",

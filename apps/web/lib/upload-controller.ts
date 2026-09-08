@@ -4,7 +4,9 @@ import { ApiError, api, type ApiClient, type UploadPart, type UploadStartInput }
 import { telegramGateway, type TelegramGateway, type TelegramUploadResult } from './telegram-gateway';
 
 export const MIN_CHUNK_SIZE = 8 * 1024 * 1024;
-export const DEFAULT_CHUNK_SIZE = 16 * 1024 * 1024;
+// Chunk size ditetapkan sistem (bukan pengaturan pengguna): 19 MiB adalah batas backend
+// yang meminimalkan jumlah part — paling sedikit round-trip Telegram dan risiko FLOOD_WAIT.
+export const DEFAULT_CHUNK_SIZE = 19 * 1024 * 1024;
 export const MAX_CHUNK_SIZE = 19 * 1024 * 1024;
 export const DEFAULT_CONCURRENCY = 3;
 

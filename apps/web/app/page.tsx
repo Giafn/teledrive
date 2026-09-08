@@ -25,11 +25,20 @@ import {
   encodeImageFromUrl,
   type MediaThumbnailResult,
 } from '../lib/media-thumbnail';
+import dynamic from 'next/dynamic';
+import 'vidstack/styles/defaults.css';
+import 'vidstack/styles/community-skin/video.css';
+import { buildMediaManifest, openMediaStream, VIDEO_PROXY_MIN_BYTES, type MediaStream } from '../lib/media-bridge';
 import styles from './page.module.css';
+
+const VideoPlayer = dynamic(() => import('./media-player'), {
+  ssr: false,
+  loading: () => <span className={styles.spinner} />,
+});
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
 type Upload = { id: string; file: File; controller: UploadController; progress?: UploadProgress; error?: string };
-type DownloadItem = { id: string; name: string; mime: string; size: number | null };
+type DownloadItem = { id: string; name: string; mime: string; size: number | null; partCount?: number | null };
 type DownloadAction = {
   controller: ReturnType<typeof createDownloadController>;
   progress?: DownloadProgress;
@@ -274,7 +283,7 @@ export default function Page() {
   const [drawer, setDrawer] = useState(false);
   const [folderDialog, setFolderDialog] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-  const settings = useRef({ chunkSize: 16 * 1024 * 1024, concurrency: 3 });
+  const settings = useRef({ concurrency: 3 });
   useEffect(() => {
     if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
   }, []);
@@ -527,7 +536,6 @@ export default function Page() {
       const controller = createUploadController({
         file,
         folderId: folder?.folder.id ?? workspace.rootFolder.id,
-        chunkSize: settings.current.chunkSize,
         concurrency: settings.current.concurrency,
         onProgress: (progress) =>
           setUploads((items) => items.map((item) => (item.id === id ? { ...item, progress } : item))),
@@ -551,7 +559,6 @@ export default function Page() {
     const controller = createUploadController({
       file: item.file,
       folderId: folder?.folder.id ?? workspace?.rootFolder.id,
-      chunkSize: settings.current.chunkSize,
       concurrency: settings.current.concurrency,
       onProgress: (progress) =>
         setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, controller, progress, error: undefined } : x))),
@@ -797,6 +804,7 @@ export default function Page() {
                             name: item.name,
                             mime: item.mime ?? 'application/octet-stream',
                             size: item.size,
+                            partCount: item.partCount,
                           })
                     }
                     onDownload={startDownload}
@@ -819,6 +827,7 @@ export default function Page() {
                               name: item.name,
                               mime: item.mime ?? 'application/octet-stream',
                               size: item.size,
+                              partCount: item.partCount,
                             })
                       }
                       onMutate={mutate}
@@ -1562,13 +1571,38 @@ function PreviewModal({
 }) {
   const [progress, setProgress] = useState<DownloadProgress>();
   const [preview, setPreview] = useState<{ url: string; mime: string; revoke: () => void }>();
+  const [stream, setStream] = useState<MediaStream>();
   const [error, setError] = useState('');
   const urlRef = useRef<{ revoke: () => void }>();
-  const tooLarge = (item.size ?? 0) > 200 * 1024 * 1024;
+  const isVideo = item.mime.startsWith('video/');
+  const useStream = isVideo && ((item.size ?? 0) > VIDEO_PROXY_MIN_BYTES || (item.partCount ?? 1) > 1);
+  const tooLarge = !useStream && (item.size ?? 0) > 200 * 1024 * 1024;
   const supported = isPreviewMimeSupported(item.mime) && !tooLarge;
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => event.key === 'Escape' && onClose();
     window.addEventListener('keydown', onKey);
+    if (useStream) {
+      let cancelled = false;
+      let closeStream: (() => void) | undefined;
+      api
+        .getManifest(item.id)
+        .then((manifest) => openMediaStream(buildMediaManifest(manifest)))
+        .then((session) => {
+          if (cancelled) {
+            session.close();
+            return;
+          }
+          closeStream = session.close;
+          setStream(session);
+        })
+        .catch((reason) => {
+          if (!cancelled) setError(downloadError(reason));
+        });
+      return () => {
+        cancelled = true;
+        closeStream?.();
+      };
+    }
     if (supported) {
       const abort = new AbortController();
       const controller = createDownloadController({ signal: abort.signal, onProgress: setProgress });
@@ -1588,7 +1622,7 @@ function PreviewModal({
       };
     }
     return () => window.removeEventListener('keydown', onKey);
-  }, [item.id, supported]);
+  }, [item.id, supported, useStream]);
   const percent = progress?.totalBytes ? Math.round((progress.bytesDownloaded / progress.totalBytes) * 100) : 0;
   return (
     <div className={styles.previewBackdrop} role="presentation" onMouseDown={onClose}>
@@ -1638,12 +1672,21 @@ function PreviewModal({
                 <DownloadButton item={item} action={download} onDownload={onDownload} />
               </div>
             </div>
+          ) : useStream && stream ? (
+            <VideoPlayer
+              className={styles.previewVideo}
+              src={stream.url}
+              title={item.name}
+              playsInline
+            />
           ) : !preview ? (
             <div className={styles.previewLoading} aria-live="polite">
               <span className={styles.spinner} />
-              <b>Menyiapkan pratinjau…</b>
+              <b>{useStream ? 'Menyiapkan streaming…' : 'Menyiapkan pratinjau…'}</b>
               <small>
-                {percent}% · {progress?.completedParts ?? 0}/{progress?.totalParts ?? 0} bagian
+                {useStream
+                  ? 'Video diputar langsung dari Telegram, seek bebas.'
+                  : `${percent}% · ${progress?.completedParts ?? 0}/${progress?.totalParts ?? 0} bagian`}
               </small>
               <button className={styles.textButton} onClick={onClose}>
                 Batalkan
@@ -2146,7 +2189,7 @@ function Settings({
   settings,
   onLogout,
 }: {
-  settings: React.MutableRefObject<{ chunkSize: number; concurrency: number }>;
+  settings: React.MutableRefObject<{ concurrency: number }>;
   onLogout: () => Promise<void>;
 }) {
   async function exportData() {
@@ -2175,20 +2218,6 @@ function Settings({
             <option value="2">2 bagian</option>
             <option value="3">3 bagian</option>
             <option value="4">4 bagian</option>
-          </select>
-        </div>
-        <div className={styles.settingLine}>
-          <span>
-            <b>Ukuran bagian</b>
-            <small>8–19 MiB, memengaruhi resume</small>
-          </span>
-          <select
-            defaultValue="16"
-            onChange={(e) => (settings.current.chunkSize = Number(e.target.value) * 1024 * 1024)}
-          >
-            <option value="8">8 MiB</option>
-            <option value="16">16 MiB</option>
-            <option value="19">19 MiB</option>
           </select>
         </div>
       </section>
