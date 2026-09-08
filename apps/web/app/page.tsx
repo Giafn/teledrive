@@ -25,16 +25,8 @@ import {
   encodeImageFromUrl,
   type MediaThumbnailResult,
 } from '../lib/media-thumbnail';
-import dynamic from 'next/dynamic';
-import 'vidstack/styles/defaults.css';
-import 'vidstack/styles/community-skin/video.css';
-import { buildMediaManifest, openMediaStream, VIDEO_PROXY_MIN_BYTES, type MediaStream } from '../lib/media-bridge';
+import { buildMediaManifest, openMediaStream, type MediaStream } from '../lib/media-bridge';
 import styles from './page.module.css';
-
-const VideoPlayer = dynamic(() => import('./media-player'), {
-  ssr: false,
-  loading: () => <span className={styles.spinner} />,
-});
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
 type Upload = { id: string; file: File; controller: UploadController; progress?: UploadProgress; error?: string };
@@ -1575,7 +1567,7 @@ function PreviewModal({
   const [error, setError] = useState('');
   const urlRef = useRef<{ revoke: () => void }>();
   const isVideo = item.mime.startsWith('video/');
-  const useStream = isVideo && ((item.size ?? 0) > VIDEO_PROXY_MIN_BYTES || (item.partCount ?? 1) > 1);
+  const useStream = isVideo;
   const tooLarge = !useStream && (item.size ?? 0) > 200 * 1024 * 1024;
   const supported = isPreviewMimeSupported(item.mime) && !tooLarge;
   useEffect(() => {
@@ -1673,11 +1665,14 @@ function PreviewModal({
               </div>
             </div>
           ) : useStream && stream ? (
-            <VideoPlayer
+            <video
               className={styles.previewVideo}
               src={stream.url}
-              title={item.name}
+              controls
+              autoPlay
               playsInline
+              preload="metadata"
+              onError={() => setError('Streaming gagal — periksa koneksi Telegram lalu coba lagi, atau unduh video.')}
             />
           ) : !preview ? (
             <div className={styles.previewLoading} aria-live="polite">
