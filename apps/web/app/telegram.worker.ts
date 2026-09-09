@@ -103,6 +103,7 @@ async function downloadPart(client: BaseTelegramClient, params: TelegramWorkerDo
     throw new TelegramConfigurationError('Download message ID must be a positive integer.');
   }
 
+  await client.connect();
   const [message] = await getMessages(client, params.channel, params.messageId);
   if (!message) throw new TelegramConfigurationError('Telegram message was not found in requested channel.');
 
