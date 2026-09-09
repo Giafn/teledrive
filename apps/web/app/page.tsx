@@ -1679,7 +1679,6 @@ function PreviewModal({
     }
     return () => window.removeEventListener('keydown', onKey);
   }, [item.id, supported, useStream]);
-  const percent = progress?.totalBytes ? Math.round((progress.bytesDownloaded / progress.totalBytes) * 100) : 0;
   return (
     <div className={styles.previewBackdrop} role="presentation" onMouseDown={onClose}>
       <section
