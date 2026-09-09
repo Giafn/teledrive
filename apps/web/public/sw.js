@@ -10,6 +10,7 @@ const SHELL = ['/'];
 
 const sessions = new Map(); // objectId -> manifest { objectId, mime, size, parts: [{ partNo, messageId, sha256, size }] }
 const partCache = new Map(); // "objectId:partNo" -> Uint8Array (urutan Map = urutan masuk, untuk evict LRU)
+const partRequests = new Map(); // "objectId:partNo" -> Promise<worker reply>
 const CACHE_BUDGET_BYTES = 128 * 1024 * 1024;
 const DEFAULT_FIRST_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
@@ -124,19 +125,32 @@ function requestManifestFromClients(objectId) {
 }
 
 function requestPartFromClient(client, objectId, partNo) {
-  return new Promise((resolve) => {
-    const channel = new MessageChannel();
-    const timer = setTimeout(() => {
-      channel.port1.onmessage = null;
-      resolve(null);
-    }, PART_REQUEST_TIMEOUT_MS);
-    channel.port1.onmessage = (event) => {
-      clearTimeout(timer);
-      channel.port1.onmessage = null;
-      resolve(event.data);
-    };
-    client.postMessage({ type: 'td-media-part', objectId, partNo }, [channel.port2]);
-  });
+  const key = `${objectId}:${partNo}`;
+  const existing = partRequests.get(key);
+  if (existing) return existing;
+
+  const request = (async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const reply = await new Promise((resolve) => {
+        const channel = new MessageChannel();
+        const timer = setTimeout(() => {
+          channel.port1.onmessage = null;
+          resolve(null);
+        }, PART_REQUEST_TIMEOUT_MS);
+        channel.port1.onmessage = (event) => {
+          clearTimeout(timer);
+          channel.port1.onmessage = null;
+          resolve(event.data);
+        };
+        client.postMessage({ type: 'td-media-part', objectId, partNo }, [channel.port2]);
+      });
+      if (reply && reply.ok) return reply;
+    }
+    return null;
+  })().finally(() => partRequests.delete(key));
+
+  partRequests.set(key, request);
+  return request;
 }
 
 async function handleStream(request) {
