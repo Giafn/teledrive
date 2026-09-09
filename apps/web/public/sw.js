@@ -142,7 +142,13 @@ function requestPartFromClient(client, objectId, partNo) {
           channel.port1.onmessage = null;
           resolve(event.data);
         };
-        client.postMessage({ type: 'td-media-part', objectId, partNo }, [channel.port2]);
+        try {
+          client.postMessage({ type: 'td-media-part', objectId, partNo }, [channel.port2]);
+        } catch {
+          clearTimeout(timer);
+          channel.port1.onmessage = null;
+          resolve(null);
+        }
       });
       if (reply && reply.ok) return reply;
     }
@@ -236,7 +242,8 @@ async function handleStream(request) {
         'Cache-Control': 'no-store',
       },
     });
-  } catch {
+  } catch (error) {
+    console.error('[teledrive:media-sw]', error instanceof Error ? error.message : String(error));
     return new Response('media proxy error', { status: 502 });
   }
 }

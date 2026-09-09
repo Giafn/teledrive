@@ -190,12 +190,13 @@ export async function handlePartRequest(port: PortLike, objectId: string, partNo
   }
   const preloadKey = `${objectId}:${partNo}`;
   const ready = preloaded.get(preloadKey);
-  if (ready) {
+  if (ready && ready.byteLength === part.size) {
     preloaded.delete(preloadKey);
     const buffer = toArrayBuffer(ready);
     port.postMessage({ ok: true, bytes: buffer }, [buffer]);
     return;
   }
+  if (ready) preloaded.delete(preloadKey);
   await acquireSlot();
   try {
     const bytes = await fetchPartBytes(manifest, part);
