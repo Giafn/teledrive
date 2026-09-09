@@ -4,9 +4,7 @@ import type { ManifestResponse } from './api';
 import { telegramGateway } from './telegram-gateway';
 import type { MediaManifest, MediaManifestPart } from './media-range';
 
-const MAX_INFLIGHT_PARTS = 4;
-const PREFETCH_PARTS = 4;
-const MAX_PRELOADED_PARTS = 6;
+const MAX_INFLIGHT_PARTS = 2;
 const MAX_RETRIES = 4;
 const RETRY_BASE_DELAY_MS = 250;
 
@@ -202,7 +200,7 @@ export async function handlePartRequest(port: PortLike, objectId: string, partNo
     const bytes = await fetchPartBytes(manifest, part);
     const buffer = toArrayBuffer(bytes);
     port.postMessage({ ok: true, bytes: buffer }, [buffer]);
-    prefetchAhead(manifest, part.partNo + 1);
+    void prefetchNext(manifest, part.partNo + 1);
   } catch (error) {
     const code = error instanceof Error ? error.message : 'PART_DOWNLOAD_FAILED';
     console.error('[teledrive:media]', JSON.stringify({ operation: 'part_request', objectId, partNo, code }));
@@ -219,21 +217,19 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.slice().buffer as ArrayBuffer;
 }
 
-function prefetchAhead(manifest: MediaManifest, firstPartNo: number): void {
-  for (let partNo = firstPartNo; partNo < firstPartNo + PREFETCH_PARTS; partNo += 1) {
-    const part = manifest.parts.find((candidate) => candidate.partNo === partNo);
-    if (!part) break;
-    const key = `${manifest.objectId}:${partNo}`;
-    if (preloaded.has(key) || inflight.has(key)) continue;
-    void fetchPartBytes(manifest, part)
-      .then((bytes) => {
-        while (preloaded.size >= MAX_PRELOADED_PARTS) {
-          const oldest = preloaded.keys().next().value;
-          if (oldest === undefined) break;
-          preloaded.delete(oldest);
-        }
-        preloaded.set(key, bytes);
-      })
-      .catch(() => undefined);
-  }
+function prefetchNext(manifest: MediaManifest, partNo: number): void {
+  const part = manifest.parts.find((candidate) => candidate.partNo === partNo);
+  if (!part) return;
+  const key = `${manifest.objectId}:${partNo}`;
+  if (preloaded.has(key) || inflight.has(key)) return;
+  void fetchPartBytes(manifest, part)
+    .then((bytes) => {
+      while (preloaded.size >= 2) {
+        const oldest = preloaded.keys().next().value;
+        if (oldest === undefined) break;
+        preloaded.delete(oldest);
+      }
+      preloaded.set(key, bytes);
+    })
+    .catch(() => undefined);
 }

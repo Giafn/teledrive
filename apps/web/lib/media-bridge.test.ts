@@ -129,7 +129,7 @@ describe('handlePartRequest', () => {
     expect(port.replies[0].message).toMatchObject({ ok: true });
   });
 
-  it('allows four concurrent part downloads', async () => {
+  it('limits part downloads to two concurrent requests', async () => {
     const partData = [0, 1, 2].map((partNo) => Uint8Array.from([partNo, 1, 2, 3]));
     const parts = partData.map((data, partNo) => makePart(partNo, data));
     primeManifestCache(makeManifest(parts));
@@ -144,9 +144,10 @@ describe('handlePartRequest', () => {
 
     const runs = ports.map((port, index) => handlePartRequest(port, 'object-1', index));
     await Promise.resolve();
-    expect(mockedDownload).toHaveBeenCalledTimes(3);
+    expect(mockedDownload).toHaveBeenCalledTimes(2);
 
     gates[0].resolve();
+    await vi.waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(3));
     gates[1].resolve();
     gates[2].resolve();
     await Promise.all(runs);

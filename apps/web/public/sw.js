@@ -10,10 +10,9 @@ const SHELL = ['/'];
 
 const sessions = new Map(); // objectId -> manifest { objectId, mime, size, parts: [{ partNo, messageId, sha256, size }] }
 const partCache = new Map(); // "objectId:partNo" -> Uint8Array (urutan Map = urutan masuk, untuk evict LRU)
-const partRequests = new Map(); // "objectId:partNo" -> Promise<worker reply>
-const CACHE_BUDGET_BYTES = 128 * 1024 * 1024;
-const DEFAULT_FIRST_RESPONSE_BYTES = 4 * 1024 * 1024;
-const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+const CACHE_BUDGET_BYTES = 64 * 1024 * 1024;
+const DEFAULT_FIRST_RESPONSE_BYTES = 1024 * 1024;
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MANIFEST_REQUEST_TIMEOUT_MS = 5000;
 const PART_REQUEST_TIMEOUT_MS = 30000;
 
@@ -125,38 +124,19 @@ function requestManifestFromClients(objectId) {
 }
 
 function requestPartFromClient(client, objectId, partNo) {
-  const key = `${objectId}:${partNo}`;
-  const existing = partRequests.get(key);
-  if (existing) return existing;
-
-  const request = (async () => {
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      const reply = await new Promise((resolve) => {
-        const channel = new MessageChannel();
-        const timer = setTimeout(() => {
-          channel.port1.onmessage = null;
-          resolve(null);
-        }, PART_REQUEST_TIMEOUT_MS);
-        channel.port1.onmessage = (event) => {
-          clearTimeout(timer);
-          channel.port1.onmessage = null;
-          resolve(event.data);
-        };
-        try {
-          client.postMessage({ type: 'td-media-part', objectId, partNo }, [channel.port2]);
-        } catch {
-          clearTimeout(timer);
-          channel.port1.onmessage = null;
-          resolve(null);
-        }
-      });
-      if (reply && reply.ok) return reply;
-    }
-    return null;
-  })().finally(() => partRequests.delete(key));
-
-  partRequests.set(key, request);
-  return request;
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => {
+      channel.port1.onmessage = null;
+      resolve(null);
+    }, PART_REQUEST_TIMEOUT_MS);
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timer);
+      channel.port1.onmessage = null;
+      resolve(event.data);
+    };
+    client.postMessage({ type: 'td-media-part', objectId, partNo }, [channel.port2]);
+  });
 }
 
 async function handleStream(request) {
@@ -196,39 +176,36 @@ async function handleStream(request) {
     const client = await pickClient(session.clientId);
     if (!client) return new Response('no active page client', { status: 502 });
 
-    const requestedParts = [];
+    const slices = [];
     let offset = 0;
+    let written = 0;
     for (const part of manifest.parts) {
       const partStart = offset;
       const partEnd = offset + part.size - 1;
       offset += part.size;
       if (partEnd < range.start) continue;
       if (partStart > range.end) break;
-      requestedParts.push({ part, partStart, partEnd });
+
+      const cacheKey = `${objectId}:${part.partNo}`;
+      let bytes = partCache.get(cacheKey) || null;
+      if (!bytes || bytes.byteLength !== part.size) {
+        const reply = await requestPartFromClient(client, objectId, part.partNo);
+        if (!reply || !reply.ok || !(reply.bytes instanceof ArrayBuffer) || reply.bytes.byteLength !== part.size) {
+          return new Response(`part ${part.partNo} unavailable`, { status: 502 });
+        }
+        bytes = new Uint8Array(reply.bytes);
+        cachePut(cacheKey, bytes);
+      }
+      const sliceStart = Math.max(partStart, range.start) - partStart;
+      const sliceEnd = Math.min(partEnd, range.end) - partStart;
+      const slice = bytes.subarray(sliceStart, sliceEnd + 1);
+      slices.push(slice);
+      written += slice.byteLength;
     }
 
-    const loadedParts = await Promise.all(
-      requestedParts.map(async ({ part, partStart, partEnd }) => {
-        const cacheKey = `${objectId}:${part.partNo}`;
-        let bytes = partCache.get(cacheKey) || null;
-        if (!bytes || bytes.byteLength !== part.size) {
-          const reply = await requestPartFromClient(client, objectId, part.partNo);
-          if (!reply || !reply.ok || !(reply.bytes instanceof ArrayBuffer) || reply.bytes.byteLength !== part.size) {
-            throw new Error(`part ${part.partNo} unavailable`);
-          }
-          bytes = new Uint8Array(reply.bytes);
-          cachePut(cacheKey, bytes);
-        }
-        const sliceStart = Math.max(partStart, range.start) - partStart;
-        const sliceEnd = Math.min(partEnd, range.end) - partStart;
-        return bytes.subarray(sliceStart, sliceEnd + 1);
-      }),
-    );
-
-    const written = loadedParts.reduce((total, slice) => total + slice.byteLength, 0);
     const body = new Uint8Array(written);
     let position = 0;
-    for (const slice of loadedParts) {
+    for (const slice of slices) {
       body.set(slice, position);
       position += slice.byteLength;
     }
