@@ -230,18 +230,42 @@ function formatDate(...values: unknown[]) {
 
 const MAX_THUMBNAIL_LOADS = 2;
 let activeThumbnailLoads = 0;
-const thumbnailWaiters: Array<() => void> = [];
-async function acquireThumbnailSlot(): Promise<void> {
+type ThumbnailWaiter = { resolve: () => void; signal: AbortSignal };
+const thumbnailWaiters: ThumbnailWaiter[] = [];
+async function acquireThumbnailSlot(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw new DownloadError('DOWNLOAD_ABORTED', 'Thumbnail loading was aborted.');
   if (activeThumbnailLoads < MAX_THUMBNAIL_LOADS) {
     activeThumbnailLoads += 1;
     return;
   }
-  await new Promise<void>((resolve) => thumbnailWaiters.push(resolve));
+  await new Promise<void>((resolve, reject) => {
+    let waiter: ThumbnailWaiter;
+    const onAbort = () => {
+      const index = thumbnailWaiters.indexOf(waiter);
+      if (index >= 0) thumbnailWaiters.splice(index, 1);
+      reject(new DownloadError('DOWNLOAD_ABORTED', 'Thumbnail loading was aborted.'));
+    };
+    waiter = {
+      resolve: () => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      },
+      signal,
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    else thumbnailWaiters.push(waiter);
+  });
   activeThumbnailLoads += 1;
 }
 function releaseThumbnailSlot(): void {
   activeThumbnailLoads = Math.max(0, activeThumbnailLoads - 1);
-  thumbnailWaiters.shift()?.();
+  while (thumbnailWaiters.length) {
+    const waiter = thumbnailWaiters.shift();
+    if (!waiter || waiter.signal.aborted) continue;
+    waiter.resolve();
+    return;
+  }
 }
 
 export default function Page() {
@@ -408,10 +432,10 @@ export default function Page() {
             setMoveDialog(true);
             return;
           }
-            const name = window.prompt('Nama folder baru', currentName ?? '');
-            if (!name?.trim()) return;
-            await api.updateFolder(id, { name: name.trim() });
-         } else if (action === 'rename') {
+          const name = window.prompt('Nama folder baru', currentName ?? '');
+          if (!name?.trim()) return;
+          await api.updateFolder(id, { name: name.trim() });
+        } else if (action === 'rename') {
           const name = window.prompt('Nama baru', currentName ?? '');
           if (!name?.trim()) return;
           await api.updateObject(id, { name: name.trim() });
@@ -435,15 +459,15 @@ export default function Page() {
           await api.permanentDeleteObject(id);
         }
       }
-       if (view === 'drive' && workspace) await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
-       else if (view === 'recent' || view === 'trash') await loadSpecial(view);
-     } catch (error) {
-       setMutationError(
-         error instanceof ApiError && error.code === 'FOLDER_NOT_EMPTY'
-           ? 'Folder tidak dapat dipindahkan ke sampah karena masih berisi file atau subfolder.'
-           : message(error),
-       );
-     }
+      if (view === 'drive' && workspace) await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
+      else if (view === 'recent' || view === 'trash') await loadSpecial(view);
+    } catch (error) {
+      setMutationError(
+        error instanceof ApiError && error.code === 'FOLDER_NOT_EMPTY'
+          ? 'Folder tidak dapat dipindahkan ke sampah karena masih berisi file atau subfolder.'
+          : message(error),
+      );
+    }
   }
   function toggleSelection(entry: SelectedEntry) {
     setSelected((current) => {
@@ -696,9 +720,9 @@ export default function Page() {
             moreLoading={specialMoreLoading}
             error={loadError}
             cursor={specialCursor}
-             onLoadMore={() => loadSpecial(view as 'recent' | 'trash', true)}
-             onRetry={() => loadSpecial(view as 'recent' | 'trash')}
-             onPurgeAll={purgeTrash}
+            onLoadMore={() => loadSpecial(view as 'recent' | 'trash', true)}
+            onRetry={() => loadSpecial(view as 'recent' | 'trash')}
+            onPurgeAll={purgeTrash}
             onMutate={mutate}
             menuId={menuId}
             setMenuId={setMenuId}
@@ -776,9 +800,7 @@ export default function Page() {
               />
             )}
             {loading && !loadError && (
-              <div className={styles.fileArea}>
-                {layout === 'grid' ? <GridSkeleton /> : <ListSkeleton />}
-              </div>
+              <div className={styles.fileArea}>{layout === 'grid' ? <GridSkeleton /> : <ListSkeleton />}</div>
             )}
             {!loading && !loadError && (
               <div className={styles.fileArea}>
@@ -953,9 +975,7 @@ function SessionRestore({ error, onRetry }: { error?: string; onRetry?: () => vo
         </div>
         <div className={styles.eyebrow}>RUANG PRIBADI</div>
         <h1>Tidak bisa memuat ruang kerja</h1>
-        <p className={styles.authIntro}>
-          Sesi kamu tidak dapat dipulihkan. Periksa koneksi internet lalu coba lagi.
-        </p>
+        <p className={styles.authIntro}>Sesi kamu tidak dapat dipulihkan. Periksa koneksi internet lalu coba lagi.</p>
         <div className={styles.formError}>
           <Icon name="info" size={16} />
           {message(error)}
@@ -1186,9 +1206,20 @@ function AuthScreen({
             autoComplete={step === 'password' ? 'current-password' : 'one-time-code'}
           />
         </label>
-        {error && <div className={styles.formError} role="alert"><Icon name="info" size={16} />{error}</div>}
+        {error && (
+          <div className={styles.formError} role="alert">
+            <Icon name="info" size={16} />
+            {error}
+          </div>
+        )}
         <button className={styles.primaryButton} disabled={busy} onClick={submit}>
-          {busy ? 'Menghubungkan…' : step === 'phone' ? 'Kirim kode Telegram' : step === 'code' ? 'Verifikasi kode' : 'Verifikasi 2FA'}
+          {busy
+            ? 'Menghubungkan…'
+            : step === 'phone'
+              ? 'Kirim kode Telegram'
+              : step === 'code'
+                ? 'Verifikasi kode'
+                : 'Verifikasi 2FA'}
         </button>
         <small className={styles.secureNote}>Telegram tidak mengirim password atau session ke server Teledrive.</small>
       </div>
@@ -1309,7 +1340,10 @@ function GalleryView({
                   <button role="menuitem" onClick={() => onMutate(item.kind, 'rename', item.id, item.name)}>
                     Ganti nama
                   </button>
-                  <button role="menuitem" onClick={() => onMove([{ id: item.id, kind: folder ? 'folder' : 'object', name: item.name }])}>
+                  <button
+                    role="menuitem"
+                    onClick={() => onMove([{ id: item.id, kind: folder ? 'folder' : 'object', name: item.name }])}
+                  >
                     Pindahkan ke
                   </button>
                   <button
@@ -1338,19 +1372,24 @@ function legacyThumbnailEligible(item: FolderItem): boolean {
 }
 
 function GalleryThumbnail({ item }: { item: FolderItem }) {
-  const [state, setState] = useState<'loading' | 'ready' | 'unsupported' | 'error'>(() =>
-    item.kind === 'folder' || item.thumbnail || legacyThumbnailEligible(item) ? 'loading' : 'unsupported',
+  const [state, setState] = useState<'idle' | 'loading' | 'ready' | 'unsupported' | 'error'>(() =>
+    item.kind === 'folder' || item.thumbnail || legacyThumbnailEligible(item) ? 'idle' : 'unsupported',
   );
   const [preview, setPreview] = useState<string>();
+  const containerRef = useRef<HTMLSpanElement>(null);
   useEffect(() => {
     if (item.kind === 'folder') return;
+    const container = containerRef.current;
+    if (!container) return;
+    const controller = new AbortController();
     let active = true;
+    let slotAcquired = false;
     let revokeUrl: (() => void) | undefined;
     const reference = item.thumbnail ?? null;
     const cacheKey = reference
       ? `thumbnail:${item.id}:${reference.sha256}`
       : `thumbnail:${item.id}:${item.updatedAt ?? item.createdAt}`;
-    void (async () => {
+    const load = async () => {
       try {
         const cached = await getThumbnail(cacheKey).catch(() => undefined);
         if (!active) return;
@@ -1363,59 +1402,72 @@ function GalleryThumbnail({ item }: { item: FolderItem }) {
           setState('unsupported');
           return;
         }
-        await acquireThumbnailSlot();
-        if (!active) {
-          releaseThumbnailSlot();
+        await acquireThumbnailSlot(controller.signal);
+        slotAcquired = true;
+        if (!active) return;
+        setState('loading');
+        const downloader = createDownloadController({ signal: controller.signal });
+        const result = reference ? await downloader.loadThumbnail(reference) : await downloader.loadPreview(item.id);
+        revokeUrl = result.revoke;
+        if (!active) return;
+        const dataUrl = reference
+          ? await blobToDataURL(await (await fetch(result.url, { signal: controller.signal })).blob())
+          : item.mime?.startsWith('video/')
+            ? await captureVideoFrameFromUrl(result.url)
+            : await encodeImageFromUrl(result.url);
+        revokeUrl?.();
+        revokeUrl = undefined;
+        if (!active) return;
+        if (!dataUrl) {
+          setState('error');
           return;
         }
-        try {
-          const controller = createDownloadController();
-          const result = reference
-            ? await controller.loadThumbnail(reference)
-            : await controller.loadPreview(item.id);
-          revokeUrl = result.revoke;
-          if (!active) return;
-          const dataUrl = reference
-            ? await blobToDataURL(await (await fetch(result.url)).blob())
-            : item.mime?.startsWith('video/')
-              ? await captureVideoFrameFromUrl(result.url)
-              : await encodeImageFromUrl(result.url);
-          result.revoke();
-          revokeUrl = undefined;
-          if (!active) return;
-          if (!dataUrl) {
-            setState('error');
-            return;
-          }
-          await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
-          if (!active) return;
-          setPreview(dataUrl);
-          setState('ready');
-        } finally {
-          releaseThumbnailSlot();
-        }
-      } catch {
-        if (active) setState('error');
+        await setThumbnail(cacheKey, dataUrl).catch(() => undefined);
+        if (!active) return;
+        setPreview(dataUrl);
+        setState('ready');
+      } catch (error) {
+        if (active && !(error instanceof DownloadError && error.code === 'DOWNLOAD_ABORTED')) setState('error');
+      } finally {
+        revokeUrl?.();
+        revokeUrl = undefined;
+        if (slotAcquired) releaseThumbnailSlot();
       }
-    })();
+    };
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          observer.disconnect();
+          void load();
+        }
+      },
+      { root: null, rootMargin: '300px 0px' },
+    );
+    observer.observe(container);
     return () => {
       active = false;
+      observer.disconnect();
+      controller.abort();
       revokeUrl?.();
     };
   }, [item.id, item.kind, item.mime, item.size, item.partCount, item.thumbnail, item.updatedAt, item.createdAt]);
   if (item.kind === 'folder') {
     return (
-      <span className={styles.thumbFolder}>
+      <span ref={containerRef} className={styles.thumbFolder}>
         <Icon name="folder" size={30} />
       </span>
     );
   }
   if (state === 'ready' && preview) {
-    return <img src={preview} alt="" />;
+    return (
+      <span ref={containerRef} className={styles.thumbContent}>
+        <img src={preview} alt="" />
+      </span>
+    );
   }
   if (state === 'error') {
     return (
-      <span className={styles.thumbError}>
+      <span ref={containerRef} className={styles.thumbError}>
         <Icon name="info" size={22} />
         <small>Pratinjau gagal</small>
       </span>
@@ -1423,14 +1475,14 @@ function GalleryThumbnail({ item }: { item: FolderItem }) {
   }
   if (state === 'unsupported') {
     return (
-      <span className={`${styles.thumbTile} ${mimeStyle(item.mime)}`}>
+      <span ref={containerRef} className={`${styles.thumbTile} ${mimeStyle(item.mime)}`}>
         {item.mime?.split('/')[1]?.slice(0, 4).toUpperCase() ?? 'FILE'}
       </span>
     );
   }
   return (
-    <span className={styles.thumbLoading}>
-      <span className={styles.thumbSpinner} aria-hidden="true" />
+    <span ref={containerRef} className={styles.thumbLoading}>
+      {state === 'loading' && <span className={styles.thumbSpinner} aria-hidden="true" />}
     </span>
   );
 }
@@ -1762,7 +1814,11 @@ function Empty({ query, context = 'folder' }: { query?: string; context?: 'folde
   const mode = query ? 'search' : context;
   const copy = {
     folder: { icon: 'folder', title: 'Folder masih kosong', text: 'Unggah file atau buat folder baru untuk mulai.' },
-    search: { icon: 'search', title: 'File tidak ditemukan', text: `Tidak ada hasil untuk “${query}”. Coba kata kunci lain.` },
+    search: {
+      icon: 'search',
+      title: 'File tidak ditemukan',
+      text: `Tidak ada hasil untuk “${query}”. Coba kata kunci lain.`,
+    },
     recent: {
       icon: 'clock',
       title: 'Belum ada aktivitas terbaru',
@@ -1885,16 +1941,16 @@ function SpecialView({
             RUANG PRIBADI <span>•</span> SERVER METADATA
           </div>
           <h1>{title}</h1>
-           <p className={styles.subtle}>
-             {trashView
-               ? 'File dan folder dihapus dari Drive. Retensi dan status berasal dari server.'
-               : 'File yang baru diubah atau diunggah.'}
-           </p>
-           {trashView && (
-             <button className={styles.secondaryButton} onClick={onPurgeAll} disabled={loading || !items.length}>
-               Hapus semua
-             </button>
-           )}
+          <p className={styles.subtle}>
+            {trashView
+              ? 'File dan folder dihapus dari Drive. Retensi dan status berasal dari server.'
+              : 'File yang baru diubah atau diunggah.'}
+          </p>
+          {trashView && (
+            <button className={styles.secondaryButton} onClick={onPurgeAll} disabled={loading || !items.length}>
+              Hapus semua
+            </button>
+          )}
         </div>
       </div>
       {mutationError && (
@@ -1903,7 +1959,13 @@ function SpecialView({
           <span>{mutationError}</span>
         </div>
       )}
-      {error && <ErrorState error={error} onRetry={onRetry} title={trashView ? 'Sampah tidak dapat dimuat' : 'Daftar tidak dapat dimuat'} />}
+      {error && (
+        <ErrorState
+          error={error}
+          onRetry={onRetry}
+          title={trashView ? 'Sampah tidak dapat dimuat' : 'Daftar tidak dapat dimuat'}
+        />
+      )}
       {!error && (
         <div className={styles.fileArea}>
           {loading && (
@@ -2017,7 +2079,10 @@ function ObjectRow({
           <div className={styles.rowMenuPopup} role="menu">
             {trash ? (
               <>
-                <button role="menuitem" onClick={() => onMutate(folder ? 'folder' : 'object', 'restore', item.id, item.name)}>
+                <button
+                  role="menuitem"
+                  onClick={() => onMutate(folder ? 'folder' : 'object', 'restore', item.id, item.name)}
+                >
                   Pulihkan
                 </button>
                 <button

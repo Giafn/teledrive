@@ -95,7 +95,9 @@
   gap: 8px;
   font-size: 13px;
   font-weight: 600;
-  transition: background 0.15s, border-color 0.15s;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
 }
 .secondaryButton:hover {
   background: var(--bg);
@@ -235,7 +237,9 @@
   padding: 0 16px;
   max-width: 560px;
   flex: 1;
-  transition: background 0.15s, box-shadow 0.15s;
+  transition:
+    background 0.15s,
+    box-shadow 0.15s;
 }
 .search:focus-within {
   background: var(--surface);
@@ -625,7 +629,9 @@
   border-radius: var(--radius-m);
   overflow: hidden;
   width: 100%;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  transition:
+    border-color 0.15s,
+    box-shadow 0.15s;
 }
 .galleryCard:hover {
   border-color: var(--border-strong);
@@ -655,7 +661,6 @@
   display: grid;
   place-items: center;
   border-radius: 8px;
-  backdrop-filter: blur(4px);
 }
 .galleryMenu:hover {
   background: #fff;
@@ -698,6 +703,11 @@
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+.thumbContent {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 .galleryMeta {
   display: block;
