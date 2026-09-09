@@ -227,11 +227,17 @@ export function reportTelegramError(operation: string, error: unknown): void {
     normalized instanceof TelegramConfigurationError
       ? configurationCode(normalized)
       : (extractTelegramCode(error) ?? extractTelegramCode(normalized));
-  const payload: { operation: string; category: ReturnType<typeof reportCategory>; code?: string } = {
-    operation,
-    category: reportCategory(normalized, code),
-  };
+  const payload: { operation: string; category: ReturnType<typeof reportCategory>; code?: string; reason?: string } =
+    {
+      operation,
+      category: reportCategory(normalized, code),
+    };
   if (code) payload.code = code;
+  // Kategori konfigurasi punya pesan bawaan yang bisa memuat nilai sensitif — jangan dicatat.
+  if (payload.category !== 'configuration') {
+    const reason = boundedString(normalized.message, 200);
+    if (reason) payload.reason = reason;
+  }
   console.error(TELEGRAM_ERROR_PREFIX, payload);
 }
 

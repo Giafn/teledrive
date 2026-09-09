@@ -25,3 +25,7 @@ apps/worker/.dev.vars
 apps/web/.env.local.tmp
 apps/worker/.dev.vars.tmp
 .env*
+
+.commandcode/*
+
+taste.md

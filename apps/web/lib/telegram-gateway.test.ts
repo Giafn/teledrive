@@ -89,6 +89,7 @@ describe('Telegram worker error normalization', () => {
         operation: 'sendCode',
         category: 'rpc',
         code: 'API_ID_INVALID',
+        reason: 'Telegram API error: API_ID_INVALID — API_ID_INVALID — code 400',
       });
       expect(JSON.stringify(errorSpy.mock.calls)).not.toContain('+15551234567');
       expect(JSON.stringify(errorSpy.mock.calls)).not.toContain('secret-api-hash');

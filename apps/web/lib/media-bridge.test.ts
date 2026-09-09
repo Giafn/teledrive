@@ -74,7 +74,7 @@ describe('handlePartRequest', () => {
     expect(port.replies[0].transfer).toContain(reply.bytes);
   });
 
-  it('replies with ok:false on hash mismatch without retrying', async () => {
+  it('replies with ok:false on hash mismatch after exhausting retries', async () => {
     const bytes = Uint8Array.from([1, 2, 3, 4]);
     primeManifestCache(makeManifest([makePart(0, bytes)]));
     mockedDownload.mockResolvedValue({
@@ -88,7 +88,7 @@ describe('handlePartRequest', () => {
 
     await handlePartRequest(port, 'object-1', 0);
 
-    expect(mockedDownload).toHaveBeenCalledTimes(1);
+    expect(mockedDownload).toHaveBeenCalledTimes(4);
     expect(port.replies[0].message).toMatchObject({ ok: false, code: 'PART_HASH_MISMATCH' });
   });
 

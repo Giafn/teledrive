@@ -5,8 +5,8 @@ import { telegramGateway } from './telegram-gateway';
 import type { MediaManifest, MediaManifestPart } from './media-range';
 
 const MAX_INFLIGHT_PARTS = 2;
-const MAX_RETRIES = 3;
-const RETRY_BASE_DELAY_MS = 100;
+const MAX_RETRIES = 4;
+const RETRY_BASE_DELAY_MS = 250;
 
 /** Video di atas ambang ini (atau multi-part) diputar via Service Worker streaming. */
 export const VIDEO_PROXY_MIN_BYTES = 32 * 1024 * 1024;
@@ -156,7 +156,9 @@ async function fetchPartBytes(manifest: MediaManifest, part: MediaManifestPart):
       } catch (error) {
         lastError = error;
         const messageText = error instanceof Error ? error.message : String(error);
-        if (messageText === 'PART_SIZE_MISMATCH' || messageText === 'PART_HASH_MISMATCH') break;
+        // Ukuran beda = manifest/systematis (pesan salah) — jangan diulang.
+        // Hash beda bisa karena transfer terpotong/korup di jalan — layak diulang.
+        if (messageText === 'PART_SIZE_MISMATCH') break;
         if (attempt === MAX_RETRIES) break;
         const flood = floodWaitSeconds(error);
         await sleep(flood === undefined ? RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) : flood * 1000);
