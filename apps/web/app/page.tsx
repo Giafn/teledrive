@@ -1579,10 +1579,23 @@ function PreviewModal({
       api
         .getManifest(item.id)
         .then((manifest) => openMediaStream(buildMediaManifest(manifest)))
-        .then((session) => {
+        .then(async (session) => {
           if (cancelled) {
             session.close();
             return;
+          }
+          // Probe: pastikan Service Worker benar-benar melayani 206 sebelum video dimount,
+          // supaya kegagalan SW basi/handshake terlihat sebagai pesan jelas, bukan error kosong.
+          const probe = await fetch(session.url, { headers: { Range: 'bytes=0-1' } }).catch(() => null);
+          if (cancelled) {
+            session.close();
+            return;
+          }
+          if (!probe || probe.status !== 206) {
+            session.close();
+            throw new Error(
+              `Proxy streaming merespons ${probe ? probe.status : 'gagal'} — muat ulang halaman agar Service Worker terbaru aktif, lalu coba lagi.`,
+            );
           }
           closeStream = session.close;
           setStream(session);

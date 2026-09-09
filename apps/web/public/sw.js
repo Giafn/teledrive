@@ -28,7 +28,11 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('message', (event) => {
   const data = event.data || {};
   if (data.type === 'td-media-manifest' && data.manifest && data.manifest.objectId) {
-    sessions.set(data.manifest.objectId, data.manifest);
+    // Catat pemilik sesi: permintaan part harus dikirim ke tab yang membuka stream.
+    sessions.set(data.manifest.objectId, {
+      manifest: data.manifest,
+      clientId: event.source && event.source.id ? event.source.id : null,
+    });
     return;
   }
   if (data.type === 'td-media-close' && data.objectId) {
@@ -87,10 +91,14 @@ function cachePut(key, bytes) {
   }
 }
 
-function pickClient() {
-  return self.clients
-    .matchAll({ type: 'window', includeUncontrolled: true })
-    .then((clients) => clients[0] || null);
+function pickClient(preferredClientId) {
+  return self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+    if (preferredClientId) {
+      const owner = clients.find((client) => client.id === preferredClientId);
+      if (owner) return owner;
+    }
+    return clients[0] || null;
+  });
 }
 
 function requestManifestFromClients(objectId) {
@@ -139,11 +147,13 @@ async function handleStream(request) {
     const objectId = decodeURIComponent(url.pathname.slice('/media/stream/'.length));
     if (!objectId) return new Response('missing object id', { status: 404 });
 
-    let manifest = sessions.get(objectId);
-    if (!manifest) {
-      manifest = await requestManifestFromClients(objectId);
-      if (manifest) sessions.set(manifest.objectId, manifest);
+    let session = sessions.get(objectId);
+    if (!session) {
+      const manifest = await requestManifestFromClients(objectId);
+      if (manifest) session = { manifest, clientId: null };
+      if (session) sessions.set(objectId, session);
     }
+    const manifest = session && session.manifest;
     if (!manifest || !Array.isArray(manifest.parts) || manifest.parts.length === 0) {
       return new Response('media session unavailable', { status: 404 });
     }
@@ -165,7 +175,7 @@ async function handleStream(request) {
     // Batasi ukuran respons per request supaya browser meminta kelanjutan dengan range terbatas.
     range.end = Math.min(range.end, range.start + MAX_RESPONSE_BYTES - 1);
 
-    const client = await pickClient();
+    const client = await pickClient(session.clientId);
     if (!client) return new Response('no active page client', { status: 502 });
 
     const slices = [];

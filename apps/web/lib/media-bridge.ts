@@ -179,6 +179,7 @@ export async function handlePartRequest(port: PortLike, objectId: string, partNo
   const manifest = manifestCache.get(objectId);
   const part = manifest?.parts.find((candidate) => candidate.partNo === partNo);
   if (!manifest || !part) {
+    console.error('[teledrive:media]', JSON.stringify({ operation: 'part_request', objectId, partNo, code: 'MANIFEST_MISSING' }));
     port.postMessage({ ok: false, code: 'MANIFEST_MISSING' });
     return;
   }
@@ -198,6 +199,7 @@ export async function handlePartRequest(port: PortLike, objectId: string, partNo
     void prefetchNext(manifest, part.partNo + 1);
   } catch (error) {
     const code = error instanceof Error ? error.message : 'PART_DOWNLOAD_FAILED';
+    console.error('[teledrive:media]', JSON.stringify({ operation: 'part_request', objectId, partNo, code }));
     port.postMessage({ ok: false, code });
   } finally {
     releaseSlot();
