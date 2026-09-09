@@ -1613,7 +1613,6 @@ function PreviewModal({
   onDownload: (item: DownloadItem) => void;
   download?: DownloadAction;
 }) {
-  const [progress, setProgress] = useState<DownloadProgress>();
   const [preview, setPreview] = useState<{ url: string; mime: string; revoke: () => void }>();
   const [stream, setStream] = useState<MediaStream>();
   const [error, setError] = useState('');
@@ -1662,7 +1661,7 @@ function PreviewModal({
     }
     if (supported) {
       const abort = new AbortController();
-      const controller = createDownloadController({ signal: abort.signal, onProgress: setProgress });
+      const controller = createDownloadController({ signal: abort.signal });
       controller
         .loadPreview(item.id, abort.signal)
         .then((result) => {
@@ -1745,11 +1744,7 @@ function PreviewModal({
             <div className={styles.previewLoading} aria-live="polite">
               <span className={styles.spinner} />
               <b>{useStream ? 'Menyiapkan streaming…' : 'Menyiapkan pratinjau…'}</b>
-              <small>
-                {useStream
-                  ? 'Video diputar langsung dari Telegram, seek bebas.'
-                  : `${percent}% · ${progress?.completedParts ?? 0}/${progress?.totalParts ?? 0} bagian`}
-              </small>
+              <small>{useStream ? 'Video diputar langsung dari Telegram, seek bebas.' : 'Menyiapkan file…'}</small>
               <button className={styles.previewCancel} onClick={onClose}>
                 Batalkan
               </button>

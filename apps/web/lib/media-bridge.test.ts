@@ -2,12 +2,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { telegramGateway } from './telegram-gateway';
-import {
-  handlePartRequest,
-  primeManifestCache,
-  setSleepFunction,
-  buildMediaManifest,
-} from './media-bridge';
+import { handlePartRequest, primeManifestCache, setSleepFunction, buildMediaManifest } from './media-bridge';
 import type { MediaManifest } from './media-range';
 
 vi.mock('./telegram-gateway', () => ({ telegramGateway: { downloadPart: vi.fn() } }));
@@ -113,15 +108,13 @@ describe('handlePartRequest', () => {
   it('retries transient failures and honors FLOOD_WAIT seconds', async () => {
     const bytes = Uint8Array.from([5, 6]);
     primeManifestCache(makeManifest([makePart(0, bytes)]));
-    mockedDownload
-      .mockRejectedValueOnce(new Error('FLOOD_WAIT_2 (wait 2 seconds)'))
-      .mockResolvedValueOnce({
-        messageId: 1,
-        data: bytes,
-        fileName: 'video.mp4',
-        mime: 'video/mp4',
-        size: bytes.byteLength,
-      });
+    mockedDownload.mockRejectedValueOnce(new Error('FLOOD_WAIT_2 (wait 2 seconds)')).mockResolvedValueOnce({
+      messageId: 1,
+      data: bytes,
+      fileName: 'video.mp4',
+      mime: 'video/mp4',
+      size: bytes.byteLength,
+    });
     const sleeps: number[] = [];
     setSleepFunction((ms) => {
       sleeps.push(ms);
@@ -136,7 +129,7 @@ describe('handlePartRequest', () => {
     expect(port.replies[0].message).toMatchObject({ ok: true });
   });
 
-  it('limits part downloads to two concurrent requests', async () => {
+  it('allows four concurrent part downloads', async () => {
     const partData = [0, 1, 2].map((partNo) => Uint8Array.from([partNo, 1, 2, 3]));
     const parts = partData.map((data, partNo) => makePart(partNo, data));
     primeManifestCache(makeManifest(parts));
@@ -151,10 +144,9 @@ describe('handlePartRequest', () => {
 
     const runs = ports.map((port, index) => handlePartRequest(port, 'object-1', index));
     await Promise.resolve();
-    expect(mockedDownload).toHaveBeenCalledTimes(2);
+    expect(mockedDownload).toHaveBeenCalledTimes(3);
 
     gates[0].resolve();
-    await vi.waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(3));
     gates[1].resolve();
     gates[2].resolve();
     await Promise.all(runs);
@@ -189,9 +181,39 @@ describe('buildMediaManifest', () => {
         thumbnail: null,
       },
       parts: [
-        { id: 'p2', objectId: 'object-1', partNo: 2, size: 10, sha256: 'c'.repeat(64), messageId: '13', botFileId: null, idempotencyKey: 'k2', createdAt: '' },
-        { id: 'p0', objectId: 'object-1', partNo: 0, size: 20, sha256: 'a'.repeat(64), messageId: '11', botFileId: null, idempotencyKey: 'k0', createdAt: '' },
-        { id: 'p1', objectId: 'object-1', partNo: 1, size: 10, sha256: 'b'.repeat(64), messageId: '12', botFileId: null, idempotencyKey: 'k1', createdAt: '' },
+        {
+          id: 'p2',
+          objectId: 'object-1',
+          partNo: 2,
+          size: 10,
+          sha256: 'c'.repeat(64),
+          messageId: '13',
+          botFileId: null,
+          idempotencyKey: 'k2',
+          createdAt: '',
+        },
+        {
+          id: 'p0',
+          objectId: 'object-1',
+          partNo: 0,
+          size: 20,
+          sha256: 'a'.repeat(64),
+          messageId: '11',
+          botFileId: null,
+          idempotencyKey: 'k0',
+          createdAt: '',
+        },
+        {
+          id: 'p1',
+          objectId: 'object-1',
+          partNo: 1,
+          size: 10,
+          sha256: 'b'.repeat(64),
+          messageId: '12',
+          botFileId: null,
+          idempotencyKey: 'k1',
+          createdAt: '',
+        },
       ],
     });
     expect(manifest.parts.map((part) => part.partNo)).toEqual([0, 1, 2]);
