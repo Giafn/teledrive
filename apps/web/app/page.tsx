@@ -1691,33 +1691,35 @@ function PreviewModal({
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className={styles.previewHeader}>
-          <div>
-            <span className={styles.eyebrow}>PRATINJAU FILE</span>
-            <h2 id="preview-title" title={item.name}>
+          <div className={styles.previewTitle}>
+            <b id="preview-title" title={item.name}>
               {item.name}
-            </h2>
+            </b>
+            <small>
+              {formatSize(item.size)} · {item.mime}
+            </small>
           </div>
-          <button className={styles.dialogClose} onClick={onClose} aria-label="Tutup pratinjau">
+          <button className={styles.previewClose} onClick={onClose} aria-label="Tutup pratinjau">
             <Icon name="close" />
           </button>
         </header>
         <div className={styles.previewBody}>
           {!supported ? (
             <div className={styles.previewNotice}>
-              <span className={styles.emptyArt}>
+              <span className={styles.previewNoticeIcon}>
                 <Icon name="download" size={25} />
               </span>
-              <h3>{tooLarge ? 'File terlalu besar untuk pratinjau' : 'Pratinjau belum tersedia'}</h3>
+              <h3>{tooLarge ? 'File terlalu besar untuk dipratinjau' : 'File ini tidak dapat dipratinjau'}</h3>
               <p>
                 {tooLarge
-                  ? 'Pratinjau dibatasi hingga 200 MiB agar perangkat tetap responsif.'
-                  : 'Tipe file ini tidak memiliki tampilan browser yang aman.'}
+                  ? 'Ukuran file melewati batas preview browser. Unduh file untuk membukanya.'
+                  : 'Format file ini tidak didukung untuk preview di browser. Unduh file untuk membukanya.'}
               </p>
               <DownloadButton item={item} action={download} onDownload={onDownload} />
             </div>
           ) : error ? (
             <div className={styles.previewNotice}>
-              <span className={styles.emptyArt}>
+              <span className={styles.previewNoticeIcon}>
                 <Icon name="info" size={25} />
               </span>
               <h3>Pratinjau gagal</h3>
@@ -1748,7 +1750,7 @@ function PreviewModal({
                   ? 'Video diputar langsung dari Telegram, seek bebas.'
                   : `${percent}% · ${progress?.completedParts ?? 0}/${progress?.totalParts ?? 0} bagian`}
               </small>
-              <button className={styles.textButton} onClick={onClose}>
+              <button className={styles.previewCancel} onClick={onClose}>
                 Batalkan
               </button>
             </div>
@@ -1772,9 +1774,6 @@ function PreviewModal({
           )}
         </div>
         <footer className={styles.previewFooter}>
-          <span>
-            {formatSize(item.size)} · {item.mime}
-          </span>
           <DownloadButton item={item} action={download} onDownload={onDownload} />
         </footer>
       </section>

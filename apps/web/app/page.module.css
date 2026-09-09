@@ -1428,65 +1428,92 @@
   position: fixed;
   inset: 0;
   z-index: 6;
-  background: rgb(24 43 37 / 55%);
+  background: rgb(0 0 0 / 50%);
   display: grid;
   place-items: center;
-  padding: 22px;
 }
 .previewModal {
-  width: min(100%, 900px);
-  height: min(90vh, 720px);
+  width: 100%;
+  height: 100%;
   display: flex;
   flex-direction: column;
-  background: var(--surface);
-  border-radius: var(--radius-l);
+  background: #111;
+  color: #fff;
   overflow: hidden;
-  box-shadow: var(--shadow-pop);
 }
 .previewHeader {
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 1;
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  padding: 18px 22px;
-  border-bottom: 1px solid var(--border);
+  gap: 18px;
+  padding: 20px 24px;
+  background: linear-gradient(rgb(0 0 0 / 62%), transparent);
+  pointer-events: none;
 }
-.previewHeader h2 {
-  max-width: 680px;
-  margin: 0;
-  font-size: 15px;
-  white-space: nowrap;
+.previewTitle {
+  min-width: 0;
+  max-width: min(70vw, 680px);
+  text-shadow: 0 1px 3px rgb(0 0 0 / 70%);
+}
+.previewTitle b,
+.previewTitle small {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.previewHeader .eyebrow {
-  margin-bottom: 6px;
+.previewTitle b {
+  font-size: 15px;
+  font-weight: 600;
+}
+.previewTitle small {
+  margin-top: 5px;
+  color: rgb(255 255 255 / 72%);
+  font-size: 11px;
+}
+.previewClose {
+  border: 0;
+  background: rgb(0 0 0 / 38%);
+  color: #fff;
+  width: 40px;
+  height: 40px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  pointer-events: auto;
+  flex: 0 0 auto;
+}
+.previewClose:hover,
+.previewClose:focus-visible {
+  background: rgb(255 255 255 / 18%);
 }
 .previewBody {
   flex: 1;
   min-height: 0;
-  background: var(--bg);
+  background: #111;
   display: grid;
   place-items: center;
   position: relative;
-  overflow: auto;
-  padding: 18px;
+  overflow: hidden;
+  padding: 68px 24px;
 }
-.previewImage {
+.previewImage,
+.previewVideo {
+  display: block;
+  width: auto;
+  height: auto;
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
 }
 .previewFrame {
-  width: 100%;
+  width: min(100%, 1100px);
   height: 100%;
   border: 0;
-  background: var(--surface);
-}
-.previewVideo {
-  display: block;
-  width: 100%;
-  max-width: 100%;
-  max-height: 100%;
+  background: #fff;
 }
 .previewLoading,
 .previewNotice {
@@ -1494,30 +1521,50 @@
   align-items: center;
   flex-direction: column;
   gap: 10px;
+  max-width: 420px;
   text-align: center;
-  color: var(--text-2);
+  color: rgb(255 255 255 / 80%);
   padding: 25px;
 }
 .previewLoading b,
 .previewNotice h3 {
-  color: var(--ink);
-  font-size: 13px;
+  color: #fff;
+  font-size: 15px;
   margin: 0;
 }
 .previewLoading small,
 .previewNotice p {
-  font-size: 11.5px;
+  font-size: 12px;
+  line-height: 1.5;
   margin: 0;
-  color: var(--text-3);
+  color: rgb(255 255 255 / 68%);
 }
-.previewNotice .emptyArt {
-  margin: 0;
+.previewNoticeIcon {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 20%);
+  border-radius: 50%;
+  color: #fff;
+}
+.previewCancel {
+  border: 0;
+  background: transparent;
+  color: rgb(255 255 255 / 78%);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px;
+}
+.previewCancel:hover {
+  color: #fff;
+  text-decoration: underline;
 }
 .spinner {
   width: 23px;
   height: 23px;
-  border: 2px solid var(--border-strong);
-  border-top-color: var(--accent);
+  border: 2px solid rgb(255 255 255 / 28%);
+  border-top-color: #fff;
   border-radius: 50%;
   animation: spin 1s linear infinite;
 }
@@ -1527,19 +1574,17 @@
   }
 }
 .previewFooter {
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 1;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 12px 22px;
-  border-top: 1px solid var(--border);
-  color: var(--text-3);
-  font-size: 11px;
+  justify-content: flex-end;
+  padding: 18px 24px;
+  background: linear-gradient(transparent, rgb(0 0 0 / 62%));
+  pointer-events: none;
 }
-.previewFooter > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.previewFooter .downloadAction {
+  pointer-events: auto;
 }
 .downloadAction {
   display: flex;
@@ -1549,17 +1594,17 @@
   min-width: 62px;
 }
 .downloadButton {
-  border: 1px solid var(--border-strong);
-  background: var(--surface);
-  color: var(--accent-strong);
+  border: 1px solid rgb(255 255 255 / 35%);
+  background: rgb(0 0 0 / 42%);
+  color: #fff;
   border-radius: 8px;
-  padding: 7px 10px;
+  padding: 8px 12px;
   font-size: 11px;
   font-weight: 600;
   white-space: nowrap;
 }
 .downloadButton:hover:not(:disabled) {
-  background: var(--accent-soft);
+  background: rgb(255 255 255 / 18%);
 }
 .downloadButton:disabled {
   opacity: 0.65;
@@ -1567,15 +1612,10 @@
 }
 .downloadError {
   max-width: 150px;
-  color: var(--danger);
+  color: #ffb4a6;
   font-size: 10px;
   line-height: 1.35;
   text-align: right;
-}
-.previewFooter .downloadError {
-  position: absolute;
-  bottom: 54px;
-  right: 22px;
 }
 
 /* ===== Mobile nav ===== */
@@ -1720,20 +1760,17 @@
   .downloadButton {
     font-size: 10px;
   }
-  .previewBackdrop {
-    padding: 10px;
-  }
-  .previewModal {
-    height: min(92vh, 720px);
-  }
   .previewHeader {
-    padding: 15px;
+    padding: 16px;
+  }
+  .previewBody {
+    padding: 62px 12px;
   }
   .previewFooter {
-    padding: 11px 15px;
+    padding: 16px;
   }
-  .previewFooter > span {
-    max-width: 55%;
+  .previewTitle {
+    max-width: calc(100vw - 82px);
   }
   .moveDialog {
     width: 100%;
