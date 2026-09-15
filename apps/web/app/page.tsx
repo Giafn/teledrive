@@ -27,7 +27,7 @@ import {
   type MediaThumbnailResult,
 } from '../lib/media-thumbnail';
 import { buildMediaManifest, openMediaStream, type MediaStream } from '../lib/media-bridge';
-import { clearPreviews, getPreview, setPreview as cachePreview } from '../lib/preview-cache';
+import { clearPreviews, getPreview, releasePreview, setPreview as cachePreview } from '../lib/preview-cache';
 import { enqueueUpload } from '../lib/upload-queue';
 import styles from './page.module.css';
 
@@ -1757,9 +1757,11 @@ function PreviewModal({
           .catch(() => undefined);
       }
       // Tahap 2 / cache: full preview (atau instant dari LRU).
+      // Entri cache di-pin selama modal terbuka agar tidak di-revoke/evict.
       const cached = isImage ? getPreview(item.id) : undefined;
+      let usingCache = false;
       const full = cached
-        ? Promise.resolve({ url: cached.url, mime: cached.mime, revoke: () => undefined })
+        ? ((usingCache = true), Promise.resolve({ url: cached.url, mime: cached.mime, revoke: () => undefined }))
         : controller.loadPreview(item.id, abort.signal);
       full
         .then((result) => finish(result, 'full'))
@@ -1769,20 +1771,21 @@ function PreviewModal({
       return () => {
         abort.abort();
         thumbRevoke?.();
-        urlRef.current?.revoke();
+        if (usingCache) releasePreview(item.id);
+        else urlRef.current?.revoke();
         window.removeEventListener('keydown', onKey);
       };
     }
     return () => window.removeEventListener('keydown', onKey);
   }, [item.id, supported, useStream, isImage, item.thumbnail]);
   return (
-    <div className={styles.previewBackdrop} role="presentation" onMouseDown={onClose}>
+    <div className={styles.previewBackdrop} role="presentation" onClick={onClose}>
       <section
         className={styles.previewModal}
         role="dialog"
         aria-modal="true"
         aria-labelledby="preview-title"
-        onMouseDown={(event) => event.stopPropagation()}
+        onClick={(event) => event.stopPropagation()}
       >
         <header className={styles.previewHeader}>
           <div className={styles.previewTitle}>
