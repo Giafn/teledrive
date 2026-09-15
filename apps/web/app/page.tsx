@@ -321,7 +321,6 @@ export default function Page() {
   const [drawer, setDrawer] = useState(false);
   const [folderDialog, setFolderDialog] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-  const settings = useRef({ concurrency: 3 });
   const folderRefreshTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
     if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
@@ -593,7 +592,6 @@ export default function Page() {
       const controller = createUploadController({
         file,
         folderId: targetFolderId,
-        concurrency: settings.current.concurrency,
         idempotencyKey: () => idempotencyKey,
         onProgress: (progress) => {
           // Throttle render: maks ~4 update/detik per item.
@@ -634,7 +632,6 @@ export default function Page() {
     const controller = createUploadController({
       file: item.file,
       folderId: folder?.folder.id ?? workspace?.rootFolder.id,
-      concurrency: settings.current.concurrency,
       idempotencyKey: () => item.idempotencyKey,
       onProgress: (progress) =>
         setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, controller, progress, error: undefined } : x))),
@@ -784,7 +781,7 @@ export default function Page() {
           />
         )}
         {view === 'settings' ? (
-          <Settings settings={settings} onLogout={logout} />
+          <Settings onLogout={logout} />
         ) : view !== 'drive' ? (
           <SpecialView
             title={view === 'recent' ? 'Terbaru' : 'Sampah'}
@@ -2374,13 +2371,7 @@ function UploadDrawer({
   );
 }
 
-function Settings({
-  settings,
-  onLogout,
-}: {
-  settings: React.MutableRefObject<{ concurrency: number }>;
-  onLogout: () => Promise<void>;
-}) {
+function Settings({ onLogout }: { onLogout: () => Promise<void> }) {
   async function exportData() {
     const data = await api.exportWorkspace();
     const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
@@ -2395,21 +2386,6 @@ function Settings({
       <div className={styles.eyebrow}>PREFERENSI</div>
       <h1>Pengaturan</h1>
       <p className={styles.subtle}>Upload dan data lokal perangkat ini.</p>
-      <section className={styles.settingsCard}>
-        <h2>Upload</h2>
-        <div className={styles.settingLine}>
-          <span>
-            <b>Concurrency</b>
-            <small>Bagian bersamaan untuk upload berikutnya</small>
-          </span>
-          <select defaultValue="3" onChange={(e) => (settings.current.concurrency = Number(e.target.value))}>
-            <option value="1">1 bagian</option>
-            <option value="2">2 bagian</option>
-            <option value="3">3 bagian</option>
-            <option value="4">4 bagian</option>
-          </select>
-        </div>
-      </section>
       <section className={styles.settingsCard}>
         <h2>Data</h2>
         <p className={styles.disclaimer}>

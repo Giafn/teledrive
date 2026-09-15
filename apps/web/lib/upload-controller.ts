@@ -9,7 +9,7 @@ export const MIN_CHUNK_SIZE = 8 * 1024 * 1024;
 // yang meminimalkan jumlah part — paling sedikit round-trip Telegram dan risiko FLOOD_WAIT.
 export const DEFAULT_CHUNK_SIZE = 19 * 1024 * 1024;
 export const MAX_CHUNK_SIZE = 19 * 1024 * 1024;
-export const DEFAULT_CONCURRENCY = 3;
+export const DEFAULT_CONCURRENCY = 2;
 
 export class UploadCancelledError extends Error {
   constructor() {
