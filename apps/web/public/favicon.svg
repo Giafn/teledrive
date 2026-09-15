@@ -1,8 +1,85 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">
-  <rect width="192" height="192" rx="43" fill="#147a54"/>
-  <g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" transform="translate(45 45) scale(4.25)">
-    <path d="M12 3 20 7.5v9L12 21 4 16.5v-9z"/>
-    <path d="m4 7.5 8 4.5 8-4.5"/>
-    <path d="M12 12v9"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="80 70 370 350" width="100%" height="100%">
+
+  <defs>
+
+    <!-- Bayangan Halus -->
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow
+        dx="2"
+        dy="6"
+        stdDeviation="6"
+        flood-color="#064e3b"
+        flood-opacity="0.18"
+      />
+    </filter>
+
+    <!-- Gradasi Pesawat Kertas Kiri -->
+    <linearGradient id="wingLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#35b984"/>
+      <stop offset="100%" stop-color="#147a54"/>
+    </linearGradient>
+
+    <!-- Gradasi Pesawat Kertas Kanan -->
+    <linearGradient id="wingRight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#147a54"/>
+      <stop offset="100%" stop-color="#0b5c3f"/>
+    </linearGradient>
+
+  </defs>
+
+  <!-- Background transparan -->
+
+  <!-- AWAN -->
+  <g filter="url(#shadow)" fill="#5fcfa5">
+
+    <circle
+      cx="160"
+      cy="310"
+      r="70"
+    />
+
+    <circle
+      cx="256"
+      cy="220"
+      r="90"
+    />
+
+    <circle
+      cx="352"
+      cy="290"
+      r="90"
+    />
+
+    <rect
+      x="160"
+      y="280"
+      width="192"
+      height="100"
+    />
+
   </g>
+
+  <!-- PESAWAT KERTAS -->
+  <g filter="url(#shadow)">
+
+    <!-- Sayap Kiri -->
+    <polygon
+      points="130,250 420,110 280,290"
+      fill="url(#wingLeft)"
+    />
+
+    <!-- Sayap Kanan -->
+    <polygon
+      points="420,110 330,410 280,290"
+      fill="url(#wingRight)"
+    />
+
+    <!-- Lipatan Bawah -->
+    <polygon
+      points="280,290 280,340 298,330"
+      fill="#0b5138"
+    />
+
+  </g>
+
 </svg>
