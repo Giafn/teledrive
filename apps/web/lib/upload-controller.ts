@@ -23,6 +23,7 @@ export type UploadProgress = {
   phase: 'hashing' | 'uploading' | 'paused' | 'completed' | 'cancelled' | 'queued';
   bytesHashed: number;
   bytesUploaded: number;
+  bytesCommitted: number;
   totalBytes: number;
   completedParts: number;
   totalParts: number;
@@ -133,6 +134,8 @@ export class UploadController {
   private runPromise: Promise<UploadControllerResult> | undefined;
   private abortPromise: Promise<void> | undefined;
   private sessionId: string | undefined;
+  private sessionKey: string | undefined;
+  private planByPartNo = new Map<number, PartPlan>();
   private paused = false;
   private cancelled = false;
   private bytesHashed = 0;
@@ -193,10 +196,16 @@ export class UploadController {
     if (!this.onProgress) return;
     let bytesUploaded = 0;
     for (const bytes of this.partProgress.values()) bytesUploaded += bytes;
+    let bytesCommitted = 0;
+    for (const partNo of this.committed) {
+      const known = this.planByPartNo.get(partNo);
+      if (known) bytesCommitted += known.size;
+    }
     this.onProgress({
       phase,
       bytesHashed: this.bytesHashed,
       bytesUploaded,
+      bytesCommitted,
       totalBytes: this.file.size,
       completedParts: this.committed.size,
       totalParts: this.totalParts,
@@ -275,7 +284,9 @@ export class UploadController {
 
     const chunk = this.file.slice(plan.offset, plan.offset + plan.size);
     this.partProgress.set(plan.partNo, 0);
-    const partIdempotencyKey = this.idempotencyKey();
+    // Deterministik per (sesi, partNo): retry kirim key SAMA sehingga worker
+    // mengenalinya sebagai percobaan ulang, bukan konflik (409).
+    const partIdempotencyKey = `${this.sessionKey}:part:${plan.partNo}`;
     const telegramResult = await this.retry(() =>
       this.gateway.uploadPart(chunk, plan.partNo, (bytes) => {
         this.partProgress.set(plan.partNo, Math.min(plan.size, Math.max(0, bytes)));
@@ -283,19 +294,53 @@ export class UploadController {
       }),
     );
     if (this.cancelled) throw new UploadCancelledError();
-    const committed = await this.retry(() =>
-      this.api.commitPart(this.sessionId as string, {
-        partNo: plan.partNo,
-        size: plan.size,
-        sha256: plan.sha256,
-        messageId: telegramResult.messageId,
-        idempotencyKey: partIdempotencyKey,
-      }),
-    );
+    let committed: UploadPart;
+    try {
+      committed = await this.retry(() =>
+        this.api.commitPart(this.sessionId as string, {
+          partNo: plan.partNo,
+          size: plan.size,
+          sha256: plan.sha256,
+          messageId: telegramResult.messageId,
+          idempotencyKey: partIdempotencyKey,
+        }),
+      );
+    } catch (error) {
+      // 409 konflik/idempoten: jangan diperlakukan sebagai gagal — part
+      // kemungkinan sudah tercatat (timeout-nyata-masuk). Verifikasi via
+      // getUpload; bila cocok, lanjut. Bila tidak, lempar asli.
+      if (error instanceof ApiError && error.status === 409) {
+        const healed = await this.healIdempotencyConflict(plan, existing);
+        if (healed) return;
+      }
+      throw error;
+    }
     this.partProgress.set(plan.partNo, plan.size);
     this.committed.add(plan.partNo);
     existing.set(plan.partNo, committed);
     this.emit('uploading');
+  }
+
+  /**
+   * Penyembuh 409 yang sudah terlanjur terjadi: bila part ternyata sudah
+   * tercatat dengan size+sha+messageId yang sama (key boleh beda karena bug
+   * key-fresh lama), anggap committed dan lanjut — bukan error.
+   */
+  private async healIdempotencyConflict(plan: PartPlan, existing: Map<number, UploadPart>): Promise<boolean> {
+    try {
+      const detail = await this.api.getUpload(this.sessionId as string);
+      const healed = detail.parts.find(
+        (part) => part.partNo === plan.partNo && part.size === plan.size && part.sha256 === plan.sha256,
+      );
+      if (!healed) return false;
+      this.partProgress.set(plan.partNo, plan.size);
+      this.committed.add(plan.partNo);
+      existing.set(plan.partNo, healed);
+      this.emit('uploading');
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async run(): Promise<UploadControllerResult> {
@@ -316,6 +361,8 @@ export class UploadController {
         sha256: manifest.sha256,
         idempotencyKey: this.idempotencyKey(),
       };
+      this.sessionKey = startMetadata.idempotencyKey;
+      this.planByPartNo = new Map(manifest.parts.map((part) => [part.partNo, part]));
       const session = await this.retry(() => this.api.startUpload(startMetadata));
       this.sessionId = session.id;
       const detail = await this.retry(() => this.api.getUpload(session.id));

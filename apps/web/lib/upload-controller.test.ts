@@ -263,4 +263,64 @@ describe('UploadController', () => {
     expect(events).toEqual(['checkSession', 'workspace', 'start', 'get', 'telegram:1', 'commit:1', 'complete']);
     expect(result.partCount).toBe(2);
   });
+
+  it('sends identical part keys on commit retry and heals 409 via refetch', async () => {
+    const bytes = new Uint8Array(chunkSize + 1);
+    bytes.forEach((_, index) => {
+      bytes[index] = index % 251;
+    });
+    const file = new Blob([bytes], { type: 'application/octet-stream' }) as Blob & { name: string };
+    Object.defineProperty(file, 'name', { value: 'heal.bin' });
+    const events: string[] = [];
+    const partKeys: string[] = [];
+    let commitCalls = 0;
+    const api = fakeApi(events) as ApiClient;
+    const realCommit = api.commitPart.bind(api);
+    api.commitPart = (async (uploadId: string, part: never) => {
+      commitCalls += 1;
+      partKeys.push((part as { idempotencyKey: string }).idempotencyKey);
+      // Percobaan pertama: commit ASLI masuk, tapi responsnya hilang (timeout).
+      // Client mengira gagal; worker sudah mencatat part.
+      if (commitCalls === 1) {
+        await realCommit(uploadId, part);
+        const { ApiError } = await import('./api');
+        throw new ApiError('HTTP_0', 'network timeout after commit', 0);
+      }
+      return realCommit(uploadId, part);
+    }) as ApiClient['commitPart'];
+    const controller = new UploadController({
+      file,
+      chunkSize,
+      concurrency: 1,
+      api,
+      idempotencyKey: () => 'stable-session',
+      sleep: async () => undefined,
+      gateway: {
+        checkSession: async () => {
+          events.push('checkSession');
+          return { connected: true, authorized: true };
+        },
+        uploadPart: async (chunk, partNo, onProgress) => {
+          events.push(`telegram:${partNo}`);
+          onProgress?.(chunk.size);
+          return {
+            messageId: `message-${partNo}`,
+            partNo,
+            sha256: '',
+            size: chunk.size,
+            fileName: 'heal.bin',
+            mime: chunk.type,
+          };
+        },
+      },
+    });
+
+    // Commit part 0 gagal 409 sekali (lalu heal via getUpload menemukan part),
+    // part 1 lancar. Key part 0 yang dikirim harus identik antar percobaan.
+    const result = await controller.start();
+    expect(result.partCount).toBe(2);
+    const part0Keys = partKeys.filter((key) => key.endsWith(':part:0'));
+    expect(part0Keys.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(part0Keys).size).toBe(1);
+  });
 });

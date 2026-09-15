@@ -151,14 +151,10 @@ const iconPaths: Record<string, React.ReactNode> = {
       <path d="M12 11v5m0-8v.01" />
     </>
   ),
-  brand: (
-    <>
-      <path d="M12 3 20 7.5v9L12 21 4 16.5v-9z" />
-      <path d="m4 7.5 8 4.5 8-4.5" />
-      <path d="M12 12v9" />
-    </>
-  ),
 };
+function BrandMark({ size = 17 }: { size?: number }) {
+  return <img src="/favicon.svg" alt="" aria-hidden="true" width={size} height={size} />;
+}
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
   return (
     <svg
@@ -713,7 +709,7 @@ export default function Page() {
       <aside className={styles.sidebar}>
         <div className={styles.brand}>
           <span className={styles.logo}>
-            <Icon name="brand" size={17} />
+            <BrandMark size={17} />
           </span>
           ruang<span className={styles.dot}>.</span>
         </div>
@@ -754,7 +750,7 @@ export default function Page() {
         <header className={styles.header}>
           <button className={styles.mobileBrand}>
             <span className={styles.logo}>
-              <Icon name="brand" size={15} />
+              <BrandMark size={15} />
             </span>
             ruang<span className={styles.dot}>.</span>
           </button>
@@ -774,9 +770,6 @@ export default function Page() {
             <kbd>⌘ K</kbd>
           </label>
           <div className={styles.headerActions}>
-            <span className={styles.connected}>
-              <span className={styles.onlineDot} /> API aktif
-            </span>
             <button className={styles.avatar} aria-label="Buka profil">
               {user.displayName.slice(0, 2).toUpperCase()}
             </button>
@@ -1038,7 +1031,7 @@ function SessionRestore({ error, onRetry }: { error?: string; onRetry?: () => vo
       <main className={styles.authPage} aria-busy="true">
         <div className={styles.splash}>
           <span className={styles.splashLogo}>
-            <Icon name="brand" size={26} />
+            <BrandMark size={26} />
           </span>
           <p className={styles.splashText}>Menyiapkan ruang kerja kamu…</p>
           <span className={styles.splashBar} aria-hidden="true">
@@ -1052,7 +1045,7 @@ function SessionRestore({ error, onRetry }: { error?: string; onRetry?: () => vo
       <div className={styles.authCard} role="alert">
         <div className={styles.brand}>
           <span className={styles.logo}>
-            <Icon name="brand" size={17} />
+            <BrandMark size={17} />
           </span>
           ruang<span className={styles.dot}>.</span>
         </div>
@@ -1267,7 +1260,7 @@ function AuthScreen({
       <div className={styles.authCard}>
         <div className={styles.brand}>
           <span className={styles.logo}>
-            <Icon name="brand" size={17} />
+            <BrandMark size={17} />
           </span>
           ruang<span className={styles.dot}>.</span>
         </div>
@@ -2307,9 +2300,13 @@ function UploadDrawer({
       <div className={styles.uploadList}>
         {uploads.map((item) => {
           const progress = item.progress;
-          const percent = progress?.totalBytes ? Math.round((progress.bytesUploaded / progress.totalBytes) * 100) : 0;
+          // Persen jujur: hanya byte yang SUDAH TERCATAT di server (commit),
+          // bukan byte yang baru naik ke Telegram tapi belum tercatat.
+          const committed = progress?.bytesCommitted ?? 0;
+          const percent = progress?.totalBytes ? Math.round((committed / progress.totalBytes) * 100) : 0;
           const paused = progress?.phase === 'paused';
           const queued = progress?.phase === 'queued';
+          const hashing = progress?.phase === 'hashing';
           const done = progress?.phase === 'completed';
           return (
             <div className={styles.uploadItem} key={item.id}>
@@ -2327,8 +2324,8 @@ function UploadDrawer({
                         ? 'Selesai'
                         : queued
                           ? `Menunggu antrean${progress?.queuePosition ? ` (${progress.queuePosition})` : ''}`
-                          : progress?.phase === 'hashing'
-                            ? 'Menghitung hash'
+                          : hashing
+                            ? 'Menyiapkan'
                             : paused
                               ? 'Dijeda'
                               : 'Mengunggah'}
@@ -2341,7 +2338,7 @@ function UploadDrawer({
                   {queued
                     ? 'Akan mulai otomatis saat giliran tiba'
                     : progress
-                      ? `${percent}% · ${progress.completedParts}/${progress.totalParts} bagian`
+                      ? `${percent}%`
                       : 'Menunggu mulai'}
                 </small>
                 {item.error && <small className={styles.uploadError}>{telegramError(item.error)}</small>}
