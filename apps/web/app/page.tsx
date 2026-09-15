@@ -1675,13 +1675,6 @@ function FileRow({
     </article>
   );
 }
-function debugPreview(operation: string, detail: Record<string, unknown>): void {
-  try {
-    console.error('[teledrive:preview]', JSON.stringify({ operation, ...detail }));
-  } catch {
-    console.error('[teledrive:preview]', operation);
-  }
-}
 function PreviewModal({
   item,
   onClose,
@@ -1727,27 +1720,15 @@ function PreviewModal({
           }
           if (!probe || probe.status !== 206) {
             session.close();
-            debugPreview('stream_probe_failed', {
-              objectId: item.id,
-              status: probe ? probe.status : 'fetch_failed',
-              swController: navigator.serviceWorker?.controller?.scriptURL ?? 'none',
-            });
             throw new Error(
               `Proxy streaming merespons ${probe ? probe.status : 'gagal'} — muat ulang halaman agar Service Worker terbaru aktif, lalu coba lagi.`,
             );
           }
-          debugPreview('stream_probe_ok', {
-            objectId: item.id,
-            swController: navigator.serviceWorker?.controller?.scriptURL ?? 'none',
-          });
           closeStream = session.close;
           setStream(session);
         })
         .catch((reason) => {
-          if (!cancelled) {
-            debugPreview('stream_setup_failed', { objectId: item.id, reason: message(reason) });
-            setError(downloadError(reason));
-          }
+          if (!cancelled) setError(downloadError(reason));
         });
       return () => {
         cancelled = true;
@@ -1768,14 +1749,7 @@ function PreviewModal({
             setPreview({ url: ownUrl, mime, revoke: () => undefined });
           })
           .catch((reason) => {
-            if (reason?.code !== 'DOWNLOAD_ABORTED') {
-              debugPreview('preview_fallback_failed', {
-                objectId: item.id,
-                code: reason?.code ?? 'unknown',
-                reason: message(reason),
-              });
-              setError(downloadError(reason));
-            }
+            if (reason?.code !== 'DOWNLOAD_ABORTED') setError(downloadError(reason));
           });
         return () => {
           abort.abort();
@@ -1786,6 +1760,7 @@ function PreviewModal({
       const abort = new AbortController();
       const controller = createDownloadController({ signal: abort.signal });
       let thumbRevoke: (() => void) | undefined;
+      let fullArrived = false;
       let ownUrl: string | undefined;
       const makeOwnUrl = (bytes: Uint8Array, mime: string): string => {
         if (ownUrl) URL.revokeObjectURL(ownUrl);
@@ -1793,8 +1768,15 @@ function PreviewModal({
         return ownUrl;
       };
       const finish = (result: { url: string; mime: string; revoke: () => void }, stage: 'thumb' | 'full') => {
-        if (stage === 'thumb') thumbRevoke = result.revoke;
-        else {
+        if (stage === 'thumb') {
+          // Thumb yang datang setelah full tampil harus dibuang — jangan downgrade.
+          if (fullArrived) {
+            result.revoke();
+            return;
+          }
+          thumbRevoke = result.revoke;
+        } else {
+          fullArrived = true;
           thumbRevoke?.();
           thumbRevoke = undefined;
           urlRef.current = result;
@@ -1807,19 +1789,15 @@ function PreviewModal({
         controller
           .loadThumbnail(item.thumbnail, abort.signal)
           .then((result) => finish(result, 'thumb'))
-          .catch((reason) => {
-            debugPreview('thumb_failed', { objectId: item.id, reason: message(reason) });
-          });
+          .catch(() => undefined);
       }
       // Tahap 2: bytes dari cache LRU (instant, tanpa MTProto) atau unduh penuh.
       // URL selalu milik modal ini — dibuat dari bytes, direvoke saat tutup.
       const cachedBytes = isImage ? getPreviewBytes(item.id) : undefined;
       if (cachedBytes) {
-        debugPreview('preview_cache_hit', { objectId: item.id, bytes: cachedBytes.bytes.byteLength });
         const url = makeOwnUrl(cachedBytes.bytes, cachedBytes.mime);
         finish({ url, mime: cachedBytes.mime, revoke: () => undefined }, 'full');
       } else {
-        if (isImage) debugPreview('preview_cache_miss', { objectId: item.id });
         controller
           .loadPreviewBytes(item.id, abort.signal)
           .then(({ bytes, mime }) => {
@@ -1827,14 +1805,7 @@ function PreviewModal({
             finish({ url: makeOwnUrl(bytes, mime), mime, revoke: () => undefined }, 'full');
           })
           .catch((reason) => {
-            if (reason?.code !== 'DOWNLOAD_ABORTED') {
-              debugPreview('preview_load_failed', {
-                objectId: item.id,
-                code: reason?.code ?? 'unknown',
-                reason: message(reason),
-              });
-              setError(downloadError(reason));
-            }
+            if (reason?.code !== 'DOWNLOAD_ABORTED') setError(downloadError(reason));
           });
       }
       return () => {
@@ -1905,16 +1876,7 @@ function PreviewModal({
               playsInline
               preload="metadata"
               onClick={(event) => event.stopPropagation()}
-              onError={(event) => {
-                const video = event.currentTarget;
-                debugPreview('stream_video_error', {
-                  objectId: item.id,
-                  code: video.error?.code ?? 'none',
-                  src: stream.url.slice(0, 60),
-                  swController: navigator.serviceWorker?.controller?.scriptURL ?? 'none',
-                });
-                setStreamFailed(true);
-              }}
+              onError={() => setStreamFailed(true)}
             />
           ) : useStream && streamFailed && preview ? (
             <video
@@ -1953,14 +1915,7 @@ function PreviewModal({
               decoding="async"
               fetchPriority="high"
               onClick={(event) => event.stopPropagation()}
-              onError={() => {
-                debugPreview('img_element_error', {
-                  objectId: item.id,
-                  stage: previewStage,
-                  srcPrefix: preview.url.slice(0, 20),
-                });
-                setError('Pratinjau tidak dapat ditampilkan oleh browser.');
-              }}
+              onError={() => setError('Pratinjau tidak dapat ditampilkan oleh browser.')}
             />
           ) : item.mime === 'application/pdf' ? (
             <iframe
