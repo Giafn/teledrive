@@ -1509,6 +1509,10 @@
   max-height: calc(100vh - 136px);
   object-fit: contain;
 }
+.previewImageBlur {
+  filter: blur(8px);
+  transform: scale(1.02);
+}
 .previewFrame {
   width: min(100%, 1100px);
   height: 100%;

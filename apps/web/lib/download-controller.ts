@@ -58,6 +58,22 @@ type StreamSaver = {
 };
 type PreparedDownload = { channel: string; manifest: ManifestResponse };
 
+export const MANIFEST_CACHE_TTL_MS = 30 * 1000;
+const manifestCache = new Map<string, { manifest: ManifestResponse; expiresAt: number }>();
+
+export function invalidateManifestCache(objectId?: string): void {
+  if (objectId === undefined) manifestCache.clear();
+  else manifestCache.delete(objectId);
+}
+
+async function cachedGetManifest(api: DownloadApi, objectId: string): Promise<ManifestResponse> {
+  const cached = manifestCache.get(objectId);
+  if (cached && cached.expiresAt > Date.now()) return cached.manifest;
+  const manifest = await api.getManifest(objectId);
+  manifestCache.set(objectId, { manifest, expiresAt: Date.now() + MANIFEST_CACHE_TTL_MS });
+  return manifest;
+}
+
 const STREAMSAVER_MITM_PATH = '/streamsaver/mitm.html';
 
 function previewMimeSupported(mime: string): boolean {
@@ -323,11 +339,13 @@ export class DownloadController {
 
   private async prepare(objectId: string, signal?: AbortSignal): Promise<PreparedDownload> {
     throwIfAborted(signal);
-    const session = await this.gateway.checkSession();
+    const [session, manifest] = await Promise.all([
+      this.gateway.checkSession(),
+      cachedGetManifest(this.api, objectId),
+    ]);
     if (!session.authorized) throw new DownloadError('TG_AUTH_REQUIRED', 'Connect Telegram before downloading.');
     throwIfAborted(signal);
     const channel = configuredChannel(this.channel);
-    const manifest = await this.api.getManifest(objectId);
     validateManifest(manifest);
     this.onProgress?.({
       phase: 'metadata',

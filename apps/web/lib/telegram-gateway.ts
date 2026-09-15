@@ -74,6 +74,22 @@ export type TelegramWorkerMethods = {
   downloadPart: (params: TelegramWorkerDownloadPart) => Promise<TelegramDownloadResult>;
 };
 
+export const SESSION_CACHE_TTL_MS = 60 * 1000;
+
+let cachedSession: { state: TelegramSessionState; expiresAt: number } | undefined;
+
+export function invalidateSessionCache(): void {
+  cachedSession = undefined;
+}
+
+function cachedCheckSession(call: () => Promise<TelegramSessionState>): Promise<TelegramSessionState> {
+  if (cachedSession && cachedSession.expiresAt > Date.now()) return Promise.resolve(cachedSession.state);
+  return call().then((state) => {
+    cachedSession = { state, expiresAt: Date.now() + SESSION_CACHE_TTL_MS };
+    return state;
+  });
+}
+
 export type TelegramDownloadRange = { byteOffset?: number; byteLimit?: number };
 
 export interface TelegramGateway {
@@ -322,7 +338,11 @@ export function createTelegramGateway(options: TelegramGatewayOptions = {}): Tel
 
   const resendCode = (_params?: TelegramResendCodeParams) =>
     withTelegramReport('resendCode', () => invoke('resendCode'));
-  const logOut = () => withTelegramReport('logOut', () => invoke('logOut'));
+  const logOut = () =>
+    withTelegramReport('logOut', async () => {
+      invalidateSessionCache();
+      return invoke('logOut');
+    });
 
   return {
     sendCode,
@@ -330,7 +350,7 @@ export function createTelegramGateway(options: TelegramGatewayOptions = {}): Tel
     checkPassword,
     resendCode,
     checkConnection: () => withTelegramReport('checkConnection', () => invoke('checkConnection')),
-    checkSession: () => withTelegramReport('checkSession', () => invoke('checkSession')),
+    checkSession: () => withTelegramReport('checkSession', () => cachedCheckSession(() => invoke('checkSession'))),
     logOut,
     logout: logOut,
     uploadPart: (file, partNo, onProgress) =>

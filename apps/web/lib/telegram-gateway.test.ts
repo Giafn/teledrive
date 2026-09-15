@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   createTelegramGateway,
+  invalidateSessionCache,
   normalizeTelegramError,
   prepareTelegramUpload,
   reportTelegramError,

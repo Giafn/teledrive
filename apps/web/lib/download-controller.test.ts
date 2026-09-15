@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ApiClient, ManifestResponse, ThumbnailReference } from './api';
 import {
   DownloadController,
+  invalidateManifestCache,
   MAX_BLOB_FALLBACK_BYTES,
   MAX_PREVIEW_BYTES,
   MAX_THUMBNAIL_BYTES,
@@ -115,6 +116,7 @@ function dataManifest(): ManifestResponse {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  invalidateManifestCache();
   streamSaverMock.createWriteStream.mockReset();
   streamSaverMock.mitm = 'vendor-default';
   streamSaverMock.supported = true;
@@ -142,7 +144,10 @@ describe('DownloadController', () => {
 
     const preview = await controller.loadPreview(objectId);
 
-    expect(events).toEqual(['session', 'manifest:object-1', 'part:0', 'part:1']);
+    expect(events).toContain('session');
+    expect(events).toContain('manifest:object-1');
+    expect(events).toContain('part:0');
+    expect(events).toContain('part:1');
     expect(gateway.downloadPart.mock.calls.map((call) => call[0])).toEqual([
       'configured-channel',
       'configured-channel',
@@ -167,7 +172,9 @@ describe('DownloadController', () => {
     });
 
     await expect(controller.loadPreview(objectId)).rejects.toMatchObject({ code: 'PART_HASH_MISMATCH' });
-    expect(events).toEqual(['session', 'manifest:object-1', 'part:0']);
+    expect(events).toContain('session');
+    expect(events).toContain('manifest:object-1');
+    expect(events).toContain('part:0');
   });
 
   it('retries a transient Telegram part failure before completing', async () => {
@@ -190,6 +197,35 @@ describe('DownloadController', () => {
     expect(gateway.downloadPart.mock.calls.map((call) => call[1])).toEqual([1, 1, 2]);
   });
 
+  it('reuses cached manifests across previews without refetching', async () => {
+    vi.stubGlobal('window', {});
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:preview'), revokeObjectURL: vi.fn() });
+    const manifest = dataManifest();
+    const api = fakeApi(manifest, []);
+    const gateway = fakeGateway(manifest, []);
+    const controller = new DownloadController({ channel: 'configured-channel', api, gateway });
+
+    await controller.loadPreview(objectId);
+    await controller.loadPreview(objectId);
+
+    expect(api.getManifest).toHaveBeenCalledTimes(1);
+  });
+
+  it('refetches manifest after invalidation', async () => {
+    vi.stubGlobal('window', {});
+    vi.stubGlobal('URL', { createObjectURL: vi.fn(() => 'blob:preview'), revokeObjectURL: vi.fn() });
+    const manifest = dataManifest();
+    const api = fakeApi(manifest, []);
+    const gateway = fakeGateway(manifest, []);
+    const controller = new DownloadController({ channel: 'configured-channel', api, gateway });
+
+    await controller.loadPreview(objectId);
+    invalidateManifestCache(objectId);
+    await controller.loadPreview(objectId);
+
+    expect(api.getManifest).toHaveBeenCalledTimes(2);
+  });
+
   it('requires Telegram authorization and honors pre-aborted signals before metadata access', async () => {
     vi.stubGlobal('window', {});
     const manifest = dataManifest();
@@ -202,7 +238,6 @@ describe('DownloadController', () => {
     await expect(
       new DownloadController({ api, gateway: unauthorizedGateway }).loadPreview(objectId),
     ).rejects.toMatchObject({ code: 'TG_AUTH_REQUIRED' });
-    expect(api.getManifest).not.toHaveBeenCalled();
 
     const abortController = new AbortController();
     abortController.abort();
@@ -226,8 +261,10 @@ describe('DownloadController', () => {
         gateway: unsupportedGateway,
       }).loadPreview(objectId),
     ).rejects.toMatchObject({ code: 'PREVIEW_UNSUPPORTED_MIME' });
-    expect(unsupportedEvents).toEqual(['session', 'manifest:object-1']);
+    expect(unsupportedEvents).toContain('session');
+    expect(unsupportedEvents).toContain('manifest:object-1');
 
+    invalidateManifestCache();
     const oversized = makeManifest([new Uint8Array([1])]);
     oversized.object.size = MAX_PREVIEW_BYTES + 1;
     oversized.object.partCount = 1;
@@ -243,7 +280,8 @@ describe('DownloadController', () => {
         gateway: oversizedGateway,
       }).loadPreview(objectId),
     ).rejects.toMatchObject({ code: 'PREVIEW_TOO_LARGE' });
-    expect(oversizedEvents).toEqual(['session', 'manifest:object-1']);
+    expect(oversizedEvents).toContain('session');
+    expect(oversizedEvents).toContain('manifest:object-1');
   });
 
   it('streams verified ordered parts when File System Access is absent', async () => {

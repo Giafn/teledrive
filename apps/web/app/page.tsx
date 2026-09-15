@@ -7,6 +7,7 @@ import {
   type FolderChildrenResponse,
   type FolderItem,
   type ObjectListItem,
+  type ThumbnailReference,
   type WorkspaceResponse,
 } from '../lib/api';
 import { createUploadController, type UploadController, type UploadProgress } from '../lib/upload-controller';
@@ -26,11 +27,19 @@ import {
   type MediaThumbnailResult,
 } from '../lib/media-thumbnail';
 import { buildMediaManifest, openMediaStream, type MediaStream } from '../lib/media-bridge';
+import { clearPreviews, getPreview, setPreview as cachePreview } from '../lib/preview-cache';
 import styles from './page.module.css';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
 type Upload = { id: string; file: File; controller: UploadController; progress?: UploadProgress; error?: string };
-type DownloadItem = { id: string; name: string; mime: string; size: number | null; partCount?: number | null };
+type DownloadItem = {
+  id: string;
+  name: string;
+  mime: string;
+  size: number | null;
+  partCount?: number | null;
+  thumbnail?: ThumbnailReference | null;
+};
 type DownloadAction = {
   controller: ReturnType<typeof createDownloadController>;
   progress?: DownloadProgress;
@@ -385,6 +394,21 @@ export default function Page() {
   useEffect(() => {
     void restoreSession();
   }, []);
+  // Warmup koneksi MTProto saat idle agar klik preview pertama tidak bayar handshake.
+  useEffect(() => {
+    if (!user) return;
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (cb: () => void) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    const warmup = () => void telegramGateway.checkSession().catch(() => undefined);
+    if (typeof idleWindow.requestIdleCallback === 'function') {
+      const timer = idleWindow.requestIdleCallback(warmup);
+      return () => idleWindow.cancelIdleCallback?.(timer);
+    }
+    const fallback = window.setTimeout(warmup, 2000);
+    return () => window.clearTimeout(fallback);
+  }, [user]);
   async function purgeTrash() {
     if (!window.confirm('Hapus permanen semua isi Sampah? Tindakan ini tidak dapat dibatalkan.')) return;
     setLoadError('');
@@ -598,6 +622,7 @@ export default function Page() {
   async function logout() {
     await telegramGateway.logout().catch(() => undefined);
     await api.logout().catch(() => undefined);
+    clearPreviews();
     setUser(null);
     setWorkspace(null);
     setFolder(null);
@@ -819,6 +844,7 @@ export default function Page() {
                             mime: item.mime ?? 'application/octet-stream',
                             size: item.size,
                             partCount: item.partCount,
+                            thumbnail: item.thumbnail,
                           })
                     }
                     onDownload={startDownload}
@@ -842,6 +868,7 @@ export default function Page() {
                               mime: item.mime ?? 'application/octet-stream',
                               size: item.size,
                               partCount: item.partCount,
+                              thumbnail: item.thumbnail,
                             })
                       }
                       onMutate={mutate}
@@ -1614,10 +1641,12 @@ function PreviewModal({
   download?: DownloadAction;
 }) {
   const [preview, setPreview] = useState<{ url: string; mime: string; revoke: () => void }>();
+  const [previewStage, setPreviewStage] = useState<'thumb' | 'full'>('full');
   const [stream, setStream] = useState<MediaStream>();
   const [error, setError] = useState('');
   const urlRef = useRef<{ revoke: () => void }>();
   const isVideo = item.mime.startsWith('video/');
+  const isImage = item.mime.startsWith('image/');
   const useStream = isVideo;
   const tooLarge = !useStream && (item.size ?? 0) > 200 * 1024 * 1024;
   const supported = isPreviewMimeSupported(item.mime) && !tooLarge;
@@ -1662,23 +1691,44 @@ function PreviewModal({
     if (supported) {
       const abort = new AbortController();
       const controller = createDownloadController({ signal: abort.signal });
-      controller
-        .loadPreview(item.id, abort.signal)
-        .then((result) => {
+      let thumbRevoke: (() => void) | undefined;
+      const finish = (result: { url: string; mime: string; revoke: () => void }, stage: 'thumb' | 'full') => {
+        if (stage === 'thumb') thumbRevoke = result.revoke;
+        else {
+          thumbRevoke?.();
+          thumbRevoke = undefined;
+          if (isImage) cachePreview(item.id, { url: result.url, mime: result.mime, size: item.size ?? 0, revoke: () => undefined });
           urlRef.current = result;
-          setPreview(result);
-        })
+        }
+        setPreviewStage(stage);
+        setPreview(result);
+      };
+      // Tahap 1: sidecar kecil tanpa manifest (khusus image) — tampil <1s.
+      if (isImage && item.thumbnail) {
+        controller
+          .loadThumbnail(item.thumbnail, abort.signal)
+          .then((result) => finish(result, 'thumb'))
+          .catch(() => undefined);
+      }
+      // Tahap 2 / cache: full preview (atau instant dari LRU).
+      const cached = isImage ? getPreview(item.id) : undefined;
+      const full = cached
+        ? Promise.resolve({ url: cached.url, mime: cached.mime, revoke: () => undefined })
+        : controller.loadPreview(item.id, abort.signal);
+      full
+        .then((result) => finish(result, 'full'))
         .catch((reason) => {
           if (reason?.code !== 'DOWNLOAD_ABORTED') setError(downloadError(reason));
         });
       return () => {
         abort.abort();
+        thumbRevoke?.();
         urlRef.current?.revoke();
         window.removeEventListener('keydown', onKey);
       };
     }
     return () => window.removeEventListener('keydown', onKey);
-  }, [item.id, supported, useStream]);
+  }, [item.id, supported, useStream, isImage, item.thumbnail]);
   return (
     <div className={styles.previewBackdrop} role="presentation" onMouseDown={onClose}>
       <section
@@ -1750,9 +1800,11 @@ function PreviewModal({
             </div>
           ) : item.mime.startsWith('image/') ? (
             <img
-              className={styles.previewImage}
+              className={previewStage === 'thumb' ? `${styles.previewImage} ${styles.previewImageBlur}` : styles.previewImage}
               src={preview.url}
               alt={item.name}
+              decoding="async"
+              fetchPriority="high"
               onError={() => setError('Pratinjau tidak dapat ditampilkan oleh browser.')}
             />
           ) : item.mime === 'application/pdf' ? (
