@@ -28,10 +28,19 @@ import {
 } from '../lib/media-thumbnail';
 import { buildMediaManifest, openMediaStream, type MediaStream } from '../lib/media-bridge';
 import { clearPreviews, getPreview, setPreview as cachePreview } from '../lib/preview-cache';
+import { enqueueUpload } from '../lib/upload-queue';
 import styles from './page.module.css';
 
 type View = 'drive' | 'recent' | 'trash' | 'settings';
-type Upload = { id: string; file: File; controller: UploadController; progress?: UploadProgress; error?: string };
+type Upload = {
+  id: string;
+  file: File;
+  controller: UploadController;
+  progress?: UploadProgress;
+  error?: string;
+  idempotencyKey: string;
+  thumbnailPromise?: Promise<MediaThumbnailResult>;
+};
 type DownloadItem = {
   id: string;
   name: string;
@@ -193,6 +202,14 @@ function telegramError(error: unknown) {
     return `Channel Telegram belum dikonfigurasi atau tidak dapat diakses — periksa username dan izin admin${suffix}.`;
   if (lower.includes('network') || lower.includes('connection') || lower.includes('timeout'))
     return `Koneksi Telegram bermasalah — periksa jaringan lalu coba lagi${suffix}.`;
+  if (/flood_wait/i.test(text))
+    return 'Telegram membatasi sementara — antrean otomatis lanjut sendiri, tidak perlu diklik.';
+  if (text.includes('PART_SIZE_MISMATCH'))
+    return 'File berubah saat diupload — hapus entri ini lalu upload ulang file.';
+  if (text.includes('UPLOAD_CLOSED'))
+    return 'Sesi upload kedaluwarsa — mulai ulang upload file ini.';
+  if (text.includes('PART_IDEMPOTENCY_CONFLICT'))
+    return 'Bagian file bentrok — hapus entri ini lalu upload ulang file.';
   return 'Permintaan Telegram gagal — coba lagi.';
 }
 function downloadError(error: unknown) {
@@ -309,6 +326,7 @@ export default function Page() {
   const [folderDialog, setFolderDialog] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const settings = useRef({ concurrency: 3 });
+  const folderRefreshTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
     if ('serviceWorker' in navigator) void navigator.serviceWorker.register('/sw.js');
   }, []);
@@ -570,44 +588,81 @@ export default function Page() {
 
   function uploadFiles(files: FileList | File[]) {
     if (!workspace) return;
+    const targetFolderId = folder?.folder.id ?? workspace.rootFolder.id;
+    const lastProgressAt = new Map<string, number>();
     Array.from(files).forEach((file) => {
       const id = crypto.randomUUID();
+      const idempotencyKey = crypto.randomUUID();
       const thumbnailPromise = createMediaThumbnail(file);
       const controller = createUploadController({
         file,
-        folderId: folder?.folder.id ?? workspace.rootFolder.id,
+        folderId: targetFolderId,
         concurrency: settings.current.concurrency,
-        onProgress: (progress) =>
-          setUploads((items) => items.map((item) => (item.id === id ? { ...item, progress } : item))),
+        idempotencyKey: () => idempotencyKey,
+        onProgress: (progress) => {
+          // Throttle render: maks ~4 update/detik per item.
+          const now = Date.now();
+          if (progress.phase === 'uploading' && now - (lastProgressAt.get(id) ?? 0) < 250) return;
+          lastProgressAt.set(id, now);
+          setUploads((items) => items.map((item) => (item.id === id ? { ...item, progress } : item)));
+        },
       });
-      const item = { id, file, controller };
+      const runUpload = () =>
+        controller
+          .start()
+          .then(async (result) => {
+            await commitObjectThumbnail(result.objectId, thumbnailPromise);
+            scheduleFolderRefresh(targetFolderId);
+          })
+          .catch((error) => {
+            if (error?.name !== 'UploadCancelledError')
+              setUploads((items) => items.map((x) => (x.id === id ? { ...x, error: message(error) } : x)));
+          });
+      const item = { id, file, controller, idempotencyKey, thumbnailPromise };
       setUploads((items) => [item, ...items]);
       setDrawer(true);
-      controller
-        .start()
-        .then(async (result) => {
-          await commitObjectThumbnail(result.objectId, thumbnailPromise);
-          await loadFolder(folder?.folder.id ?? workspace.rootFolder.id);
-        })
-        .catch((error) => {
-          if (error?.name !== 'UploadCancelledError')
-            setUploads((items) => items.map((x) => (x.id === id ? { ...x, error: message(error) } : x)));
-        });
+      enqueueUpload({
+        id,
+        run: runUpload,
+        onQueued: (position) => controller.emitQueued(position),
+      });
     });
+  }
+  function scheduleFolderRefresh(targetFolderId: string) {
+    folderRefreshTimer.current ??= window.setTimeout(() => {
+      folderRefreshTimer.current = undefined;
+      void loadFolder(targetFolderId);
+    }, 2000);
   }
   async function retryUpload(item: Upload) {
     const controller = createUploadController({
       file: item.file,
       folderId: folder?.folder.id ?? workspace?.rootFolder.id,
       concurrency: settings.current.concurrency,
+      idempotencyKey: () => item.idempotencyKey,
       onProgress: (progress) =>
         setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, controller, progress, error: undefined } : x))),
     });
-    setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, controller, error: undefined } : x)));
-    controller
-      .start()
-      .then(() => loadFolder(folder?.folder.id ?? workspace!.rootFolder.id))
-      .catch((error) => setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, error: message(error) } : x))));
+    setUploads((xs) =>
+      xs.map((x) =>
+        x.id === item.id ? { ...x, controller, error: undefined, thumbnailPromise: x.thumbnailPromise } : x,
+      ),
+    );
+    enqueueUpload({
+      id: item.id,
+      run: () =>
+        controller
+          .start()
+          .then(() => scheduleFolderRefresh(folder?.folder.id ?? workspace!.rootFolder.id))
+          .catch((error) =>
+            setUploads((xs) => xs.map((x) => (x.id === item.id ? { ...x, error: message(error) } : x))),
+          ),
+      onQueued: (position) => controller.emitQueued(position),
+    });
+  }
+  function retryAllFailed() {
+    const failed = uploads.filter((item) => item.error);
+    failed.forEach((item) => retryUpload(item));
   }
   async function createFolder(name: string) {
     if (!name.trim() || !workspace) return;
@@ -917,6 +972,7 @@ export default function Page() {
             setUploads((items) => items.filter((item) => item.progress?.phase !== 'completed' && !item.error));
           }}
           onRetry={retryUpload}
+          onRetryAll={retryAllFailed}
         />
       )}{' '}
       {folderDialog && <FolderDialog onClose={() => setFolderDialog(false)} onCreate={createFolder} />}{' '}
@@ -2219,27 +2275,41 @@ function UploadDrawer({
   uploads,
   onClose,
   onRetry,
+  onRetryAll,
 }: {
   uploads: Upload[];
   onClose: () => void;
   onRetry: (item: Upload) => void;
+  onRetryAll: () => void;
 }) {
+  const failed = uploads.filter((item) => item.error);
+  const done = uploads.filter((item) => item.progress?.phase === 'completed');
   return (
     <aside className={styles.drawer} aria-label="Antrean upload">
       <div className={styles.drawerHead}>
         <div>
           <b>Antrean upload</b>
-          <small>{uploads.length} file · status nyata</small>
+          <small>
+            {uploads.length} file · {done.length} selesai{failed.length > 0 ? ` · ${failed.length} gagal` : ''}
+          </small>
         </div>
         <button onClick={onClose} aria-label="Tutup antrean">
           <Icon name="close" />
         </button>
       </div>
+      {failed.length > 0 && (
+        <div className={styles.drawerRetryAll}>
+          <button className={styles.secondaryButton} onClick={onRetryAll}>
+            Coba lagi semua yang gagal ({failed.length})
+          </button>
+        </div>
+      )}
       <div className={styles.uploadList}>
         {uploads.map((item) => {
           const progress = item.progress;
           const percent = progress?.totalBytes ? Math.round((progress.bytesUploaded / progress.totalBytes) * 100) : 0;
           const paused = progress?.phase === 'paused';
+          const queued = progress?.phase === 'queued';
           const done = progress?.phase === 'completed';
           return (
             <div className={styles.uploadItem} key={item.id}>
@@ -2255,20 +2325,24 @@ function UploadDrawer({
                       ? 'Gagal'
                       : done
                         ? 'Selesai'
-                        : progress?.phase === 'hashing'
-                          ? 'Menghitung hash'
-                          : paused
-                            ? 'Dijeda'
-                            : 'Mengunggah'}
+                        : queued
+                          ? `Menunggu antrean${progress?.queuePosition ? ` (${progress.queuePosition})` : ''}`
+                          : progress?.phase === 'hashing'
+                            ? 'Menghitung hash'
+                            : paused
+                              ? 'Dijeda'
+                              : 'Mengunggah'}
                   </span>
                 </div>
                 <div className={styles.miniProgress}>
                   <i style={{ width: `${percent}%` }} />
                 </div>
                 <small>
-                  {progress
-                    ? `${percent}% · ${progress.completedParts}/${progress.totalParts} bagian`
-                    : 'Menunggu mulai'}
+                  {queued
+                    ? 'Akan mulai otomatis saat giliran tiba'
+                    : progress
+                      ? `${percent}% · ${progress.completedParts}/${progress.totalParts} bagian`
+                      : 'Menunggu mulai'}
                 </small>
                 {item.error && <small className={styles.uploadError}>{telegramError(item.error)}</small>}
               </div>

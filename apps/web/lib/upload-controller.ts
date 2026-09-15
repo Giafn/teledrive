@@ -2,6 +2,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { ApiError, api, type ApiClient, type UploadPart, type UploadStartInput } from './api';
 import { telegramGateway, type TelegramGateway, type TelegramUploadResult } from './telegram-gateway';
+import { notifyFloodWait } from './upload-queue';
 
 export const MIN_CHUNK_SIZE = 8 * 1024 * 1024;
 // Chunk size ditetapkan sistem (bukan pengaturan pengguna): 19 MiB adalah batas backend
@@ -19,12 +20,13 @@ export class UploadCancelledError extends Error {
 }
 
 export type UploadProgress = {
-  phase: 'hashing' | 'uploading' | 'paused' | 'completed' | 'cancelled';
+  phase: 'hashing' | 'uploading' | 'paused' | 'completed' | 'cancelled' | 'queued';
   bytesHashed: number;
   bytesUploaded: number;
   totalBytes: number;
   completedParts: number;
   totalParts: number;
+  queuePosition?: number;
 };
 
 export type UploadControllerResult = {
@@ -187,7 +189,7 @@ export class UploadController {
     }
   }
 
-  private emit(phase: UploadProgress['phase']): void {
+  private emit(phase: UploadProgress['phase'], queuePosition?: number): void {
     if (!this.onProgress) return;
     let bytesUploaded = 0;
     for (const bytes of this.partProgress.values()) bytesUploaded += bytes;
@@ -198,7 +200,12 @@ export class UploadController {
       totalBytes: this.file.size,
       completedParts: this.committed.size,
       totalParts: this.totalParts,
+      queuePosition,
     });
+  }
+
+  emitQueued(queuePosition: number): void {
+    this.emit('queued', queuePosition);
   }
 
   private async waitUntilRunnable(): Promise<void> {
@@ -238,7 +245,9 @@ export class UploadController {
         if (flood === null) throw error;
         if (flood === undefined && !isTransient(error)) throw error;
         if (attempt >= this.maxRetries) throw error;
-        const wait = flood === undefined ? this.retryDelayMs * 2 ** attempt : flood * 1000;
+        if (flood !== undefined) notifyFloodWait(flood);
+        const base = flood === undefined ? this.retryDelayMs * 2 ** attempt : flood * 1000;
+        const wait = base + Math.floor(Math.random() * 1000);
         await this.sleep(wait, this.abortController.signal);
         attempt += 1;
       }

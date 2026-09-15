@@ -1,8 +1,9 @@
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import type { ApiClient, UploadPart, UploadResponse, UploadSession } from './api';
 import { UploadController } from './upload-controller';
+import { invalidateSessionCache } from './telegram-gateway';
 
 const chunkSize = 8 * 1024 * 1024;
 
@@ -119,6 +120,7 @@ function fakeApi(events: string[], parts: UploadPart[] = []): ApiClient {
 }
 
 describe('UploadController', () => {
+  beforeEach(() => invalidateSessionCache());
   it('hashes sliced chunks without reading the full File and completes after every commit', async () => {
     const bytes = new Uint8Array(chunkSize + 1);
     bytes.forEach((_, index) => {
@@ -209,5 +211,56 @@ describe('UploadController', () => {
 
     await expect(controller.start()).rejects.toMatchObject({ code: 'TG_AUTH_REQUIRED' });
     expect(events).toEqual(['checkSession']);
+  });
+
+  it('skips already-committed parts when resuming with a stable idempotency key', async () => {
+    const bytes = new Uint8Array(chunkSize + 1);
+    bytes.forEach((_, index) => {
+      bytes[index] = index % 251;
+    });
+    const file = new Blob([bytes], { type: 'application/octet-stream' }) as Blob & { name: string };
+    Object.defineProperty(file, 'name', { value: 'resume.bin' });
+    const committedPart0: UploadPart = {
+      id: 'part-0',
+      objectId: 'object-1',
+      partNo: 0,
+      size: chunkSize,
+      sha256: bytesToHex(sha256(bytes.slice(0, chunkSize))),
+      messageId: 'message-0',
+      botFileId: null,
+      idempotencyKey: 'stable-session',
+      createdAt: '2099-01-01T00:00:00.000Z',
+    };
+    const events: string[] = [];
+    const controller = new UploadController({
+      file,
+      chunkSize,
+      concurrency: 1,
+      api: fakeApi(events, [committedPart0]) as ApiClient,
+      idempotencyKey: () => 'stable-session',
+      sleep: async () => undefined,
+      gateway: {
+        checkSession: async () => {
+          events.push('checkSession');
+          return { connected: true, authorized: true };
+        },
+        uploadPart: async (chunk, partNo, onProgress) => {
+          events.push(`telegram:${partNo}`);
+          onProgress?.(chunk.size);
+          return {
+            messageId: `message-${partNo}`,
+            partNo,
+            sha256: '',
+            size: chunk.size,
+            fileName: 'resume.bin',
+            mime: chunk.type,
+          };
+        },
+      },
+    });
+
+    const result = await controller.start();
+    expect(events).toEqual(['checkSession', 'workspace', 'start', 'get', 'telegram:1', 'commit:1', 'complete']);
+    expect(result.partCount).toBe(2);
   });
 });
