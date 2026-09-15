@@ -1,65 +1,44 @@
-import type { PreviewResult } from './download-controller';
+export type CachedPreviewBytes = { bytes: Uint8Array; mime: string; size: number; storedAt: number };
 
 const MAX_ENTRIES = 10;
-const MAX_BYTES = 50 * 1024 * 1024;
+const MAX_BYTES = 5 * 1024 * 1024;
+export const PREVIEW_BYTES_TTL_MS = 60 * 1000;
 
-type Entry = { result: PreviewResult; size: number; pinned: number };
-
-const entries = new Map<string, Entry>();
+const entries = new Map<string, CachedPreviewBytes>();
 let totalBytes = 0;
 
-function destroy(entry: Entry): void {
-  try {
-    entry.result.revoke();
-  } catch {
-    // Revoke best-effort; entri tetap dikeluarkan dari cache.
-  }
-}
-
-function evictOldest(): void {
-  for (const [key, entry] of entries) {
-    if (entry.pinned === 0) {
-      totalBytes -= entry.size;
-      destroy(entry);
-      entries.delete(key);
-      return;
-    }
-  }
-}
-
-export function getPreview(objectId: string): PreviewResult | undefined {
+export function getPreviewBytes(objectId: string): CachedPreviewBytes | undefined {
   const entry = entries.get(objectId);
   if (!entry) return undefined;
+  if (Date.now() - entry.storedAt > PREVIEW_BYTES_TTL_MS) {
+    totalBytes -= entry.size;
+    entries.delete(objectId);
+    return undefined;
+  }
   entries.delete(objectId);
   entries.set(objectId, entry);
-  entry.pinned += 1;
-  return entry.result;
+  return entry;
 }
 
-export function releasePreview(objectId: string): void {
-  const entry = entries.get(objectId);
-  if (!entry || entry.pinned === 0) return;
-  entry.pinned -= 1;
-}
-
-export function setPreview(objectId: string, result: PreviewResult): void {
+export function setPreviewBytes(objectId: string, bytes: Uint8Array, mime: string): void {
+  if (bytes.byteLength > MAX_BYTES) return;
   const existing = entries.get(objectId);
   if (existing) {
     totalBytes -= existing.size;
     entries.delete(objectId);
-    if (existing.pinned > 0) destroy(existing);
   }
-  entries.set(objectId, { result, size: result.size, pinned: 0 });
-  totalBytes += result.size;
+  entries.set(objectId, { bytes, mime, size: bytes.byteLength, storedAt: Date.now() });
+  totalBytes += bytes.byteLength;
   while ((entries.size > MAX_ENTRIES || totalBytes > MAX_BYTES) && entries.size > 0) {
-    const before = entries.size;
-    evictOldest();
-    if (entries.size === before) break;
+    const oldest = entries.keys().next().value;
+    if (oldest === undefined) break;
+    const entry = entries.get(oldest);
+    if (entry) totalBytes -= entry.size;
+    entries.delete(oldest);
   }
 }
 
 export function clearPreviews(): void {
-  for (const entry of entries.values()) destroy(entry);
   entries.clear();
   totalBytes = 0;
 }

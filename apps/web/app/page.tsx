@@ -27,7 +27,7 @@ import {
   type MediaThumbnailResult,
 } from '../lib/media-thumbnail';
 import { buildMediaManifest, openMediaStream, type MediaStream } from '../lib/media-bridge';
-import { clearPreviews, getPreview, releasePreview, setPreview as cachePreview } from '../lib/preview-cache';
+import { clearPreviews, getPreviewBytes, setPreviewBytes } from '../lib/preview-cache';
 import { enqueueUpload } from '../lib/upload-queue';
 import styles from './page.module.css';
 
@@ -1675,6 +1675,13 @@ function FileRow({
     </article>
   );
 }
+function debugPreview(operation: string, detail: Record<string, unknown>): void {
+  try {
+    console.error('[teledrive:preview]', JSON.stringify({ operation, ...detail }));
+  } catch {
+    console.error('[teledrive:preview]', operation);
+  }
+}
 function PreviewModal({
   item,
   onClose,
@@ -1689,6 +1696,7 @@ function PreviewModal({
   const [preview, setPreview] = useState<{ url: string; mime: string; revoke: () => void }>();
   const [previewStage, setPreviewStage] = useState<'thumb' | 'full'>('full');
   const [stream, setStream] = useState<MediaStream>();
+  const [streamFailed, setStreamFailed] = useState(false);
   const [error, setError] = useState('');
   const urlRef = useRef<{ revoke: () => void }>();
   const isVideo = item.mime.startsWith('video/');
@@ -1719,15 +1727,27 @@ function PreviewModal({
           }
           if (!probe || probe.status !== 206) {
             session.close();
+            debugPreview('stream_probe_failed', {
+              objectId: item.id,
+              status: probe ? probe.status : 'fetch_failed',
+              swController: navigator.serviceWorker?.controller?.scriptURL ?? 'none',
+            });
             throw new Error(
               `Proxy streaming merespons ${probe ? probe.status : 'gagal'} — muat ulang halaman agar Service Worker terbaru aktif, lalu coba lagi.`,
             );
           }
+          debugPreview('stream_probe_ok', {
+            objectId: item.id,
+            swController: navigator.serviceWorker?.controller?.scriptURL ?? 'none',
+          });
           closeStream = session.close;
           setStream(session);
         })
         .catch((reason) => {
-          if (!cancelled) setError(downloadError(reason));
+          if (!cancelled) {
+            debugPreview('stream_setup_failed', { objectId: item.id, reason: message(reason) });
+            setError(downloadError(reason));
+          }
         });
       return () => {
         cancelled = true;
@@ -1735,15 +1755,48 @@ function PreviewModal({
       };
     }
     if (supported) {
+      // Video yang gagal streaming: fallback unduh-penuh lalu putar lokal.
+      if (useStream && streamFailed) {
+        const abort = new AbortController();
+        const controller = createDownloadController({ signal: abort.signal });
+        let ownUrl: string | undefined;
+        controller
+          .loadPreviewBytes(item.id, abort.signal)
+          .then(({ bytes, mime }) => {
+            ownUrl = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mime }));
+            urlRef.current = { revoke: () => undefined };
+            setPreview({ url: ownUrl, mime, revoke: () => undefined });
+          })
+          .catch((reason) => {
+            if (reason?.code !== 'DOWNLOAD_ABORTED') {
+              debugPreview('preview_fallback_failed', {
+                objectId: item.id,
+                code: reason?.code ?? 'unknown',
+                reason: message(reason),
+              });
+              setError(downloadError(reason));
+            }
+          });
+        return () => {
+          abort.abort();
+          if (ownUrl) URL.revokeObjectURL(ownUrl);
+          window.removeEventListener('keydown', onKey);
+        };
+      }
       const abort = new AbortController();
       const controller = createDownloadController({ signal: abort.signal });
       let thumbRevoke: (() => void) | undefined;
+      let ownUrl: string | undefined;
+      const makeOwnUrl = (bytes: Uint8Array, mime: string): string => {
+        if (ownUrl) URL.revokeObjectURL(ownUrl);
+        ownUrl = URL.createObjectURL(new Blob([bytes as BlobPart], { type: mime }));
+        return ownUrl;
+      };
       const finish = (result: { url: string; mime: string; revoke: () => void }, stage: 'thumb' | 'full') => {
         if (stage === 'thumb') thumbRevoke = result.revoke;
         else {
           thumbRevoke?.();
           thumbRevoke = undefined;
-          if (isImage) cachePreview(item.id, { url: result.url, mime: result.mime, size: item.size ?? 0, revoke: () => undefined });
           urlRef.current = result;
         }
         setPreviewStage(stage);
@@ -1754,30 +1807,45 @@ function PreviewModal({
         controller
           .loadThumbnail(item.thumbnail, abort.signal)
           .then((result) => finish(result, 'thumb'))
-          .catch(() => undefined);
+          .catch((reason) => {
+            debugPreview('thumb_failed', { objectId: item.id, reason: message(reason) });
+          });
       }
-      // Tahap 2 / cache: full preview (atau instant dari LRU).
-      // Entri cache di-pin selama modal terbuka agar tidak di-revoke/evict.
-      const cached = isImage ? getPreview(item.id) : undefined;
-      let usingCache = false;
-      const full = cached
-        ? ((usingCache = true), Promise.resolve({ url: cached.url, mime: cached.mime, revoke: () => undefined }))
-        : controller.loadPreview(item.id, abort.signal);
-      full
-        .then((result) => finish(result, 'full'))
-        .catch((reason) => {
-          if (reason?.code !== 'DOWNLOAD_ABORTED') setError(downloadError(reason));
-        });
+      // Tahap 2: bytes dari cache LRU (instant, tanpa MTProto) atau unduh penuh.
+      // URL selalu milik modal ini — dibuat dari bytes, direvoke saat tutup.
+      const cachedBytes = isImage ? getPreviewBytes(item.id) : undefined;
+      if (cachedBytes) {
+        debugPreview('preview_cache_hit', { objectId: item.id, bytes: cachedBytes.bytes.byteLength });
+        const url = makeOwnUrl(cachedBytes.bytes, cachedBytes.mime);
+        finish({ url, mime: cachedBytes.mime, revoke: () => undefined }, 'full');
+      } else {
+        if (isImage) debugPreview('preview_cache_miss', { objectId: item.id });
+        controller
+          .loadPreviewBytes(item.id, abort.signal)
+          .then(({ bytes, mime }) => {
+            if (isImage) setPreviewBytes(item.id, bytes, mime);
+            finish({ url: makeOwnUrl(bytes, mime), mime, revoke: () => undefined }, 'full');
+          })
+          .catch((reason) => {
+            if (reason?.code !== 'DOWNLOAD_ABORTED') {
+              debugPreview('preview_load_failed', {
+                objectId: item.id,
+                code: reason?.code ?? 'unknown',
+                reason: message(reason),
+              });
+              setError(downloadError(reason));
+            }
+          });
+      }
       return () => {
         abort.abort();
         thumbRevoke?.();
-        if (usingCache) releasePreview(item.id);
-        else urlRef.current?.revoke();
+        if (ownUrl) URL.revokeObjectURL(ownUrl);
         window.removeEventListener('keydown', onKey);
       };
     }
     return () => window.removeEventListener('keydown', onKey);
-  }, [item.id, supported, useStream, isImage, item.thumbnail]);
+  }, [item.id, supported, useStream, streamFailed, isImage, item.thumbnail]);
   return (
     <div className={styles.previewBackdrop} role="presentation" onClick={onClose}>
       <section
@@ -1800,7 +1868,7 @@ function PreviewModal({
             <Icon name="close" />
           </button>
         </header>
-        <div className={styles.previewBody}>
+        <div className={styles.previewBody} onClick={onClose}>
           {!supported ? (
             <div className={styles.previewNotice}>
               <span className={styles.previewNoticeIcon}>
@@ -1828,7 +1896,7 @@ function PreviewModal({
                 <DownloadButton item={item} action={download} onDownload={onDownload} />
               </div>
             </div>
-          ) : useStream && stream ? (
+          ) : useStream && stream && !streamFailed ? (
             <video
               className={styles.previewVideo}
               src={stream.url}
@@ -1836,8 +1904,38 @@ function PreviewModal({
               autoPlay
               playsInline
               preload="metadata"
-              onError={() => setError('Streaming gagal — periksa koneksi Telegram lalu coba lagi, atau unduh video.')}
+              onClick={(event) => event.stopPropagation()}
+              onError={(event) => {
+                const video = event.currentTarget;
+                debugPreview('stream_video_error', {
+                  objectId: item.id,
+                  code: video.error?.code ?? 'none',
+                  src: stream.url.slice(0, 60),
+                  swController: navigator.serviceWorker?.controller?.scriptURL ?? 'none',
+                });
+                setStreamFailed(true);
+              }}
             />
+          ) : useStream && streamFailed && preview ? (
+            <video
+              className={styles.previewVideo}
+              src={preview.url}
+              controls
+              autoPlay
+              playsInline
+              preload="auto"
+              onClick={(event) => event.stopPropagation()}
+              onError={() => setError('Video tidak dapat diputar oleh browser.')}
+            />
+          ) : useStream && streamFailed ? (
+            <div className={styles.previewLoading} aria-live="polite">
+              <span className={styles.spinner} />
+              <b>Streaming tidak didukung browser ini…</b>
+              <small>Mengunduh video untuk diputar lokal.</small>
+              <button className={styles.previewCancel} onClick={onClose}>
+                Batalkan
+              </button>
+            </div>
           ) : !preview ? (
             <div className={styles.previewLoading} aria-live="polite">
               <span className={styles.spinner} />
@@ -1854,16 +1952,30 @@ function PreviewModal({
               alt={item.name}
               decoding="async"
               fetchPriority="high"
-              onError={() => setError('Pratinjau tidak dapat ditampilkan oleh browser.')}
+              onClick={(event) => event.stopPropagation()}
+              onError={() => {
+                debugPreview('img_element_error', {
+                  objectId: item.id,
+                  stage: previewStage,
+                  srcPrefix: preview.url.slice(0, 20),
+                });
+                setError('Pratinjau tidak dapat ditampilkan oleh browser.');
+              }}
             />
           ) : item.mime === 'application/pdf' ? (
-            <iframe className={styles.previewFrame} src={preview.url} title={`Pratinjau ${item.name}`} />
+            <iframe
+              className={styles.previewFrame}
+              src={preview.url}
+              title={`Pratinjau ${item.name}`}
+              onClick={(event) => event.stopPropagation()}
+            />
           ) : (
             <video
               className={styles.previewVideo}
               src={preview.url}
               controls
               preload="metadata"
+              onClick={(event) => event.stopPropagation()}
               onError={() => setError('Video tidak dapat diputar oleh browser.')}
             />
           )}

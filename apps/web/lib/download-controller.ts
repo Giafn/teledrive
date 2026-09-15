@@ -20,6 +20,7 @@ export type DownloadProgress = {
 };
 
 export type PreviewResult = { url: string; mime: string; size: number; revoke: () => void };
+export type PreviewBytes = { bytes: Uint8Array; mime: string; size: number };
 export type SaveResult = { method: 'file-system-access' | 'streamsaver' | 'blob'; name: string; size: number };
 
 export class DownloadError extends Error {
@@ -251,6 +252,28 @@ export class DownloadController {
       throw new DownloadError('PREVIEW_UNAVAILABLE', 'Object URL preview is unavailable.');
     const url = URL.createObjectURL(blob);
     return { url, mime: object.mime, size: object.size, revoke: () => URL.revokeObjectURL(url) };
+  }
+
+  async loadPreviewBytes(objectId: string, signal = this.signal): Promise<PreviewBytes> {
+    requireBrowser();
+    const prepared = await this.prepare(objectId, signal);
+    const { object } = prepared.manifest;
+    if (!previewMimeSupported(object.mime)) {
+      throw new DownloadError('PREVIEW_UNSUPPORTED_MIME', 'This file type is download-only.');
+    }
+    if (object.size > MAX_PREVIEW_BYTES) {
+      throw new DownloadError('PREVIEW_TOO_LARGE', 'Preview exceeds the safe 200 MiB limit.');
+    }
+    const chunks = await this.downloadParts(prepared, signal, MAX_PREVIEW_BYTES, true);
+    let total = 0;
+    for (const chunk of chunks) total += chunk.byteLength;
+    const bytes = new Uint8Array(total);
+    let position = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, position);
+      position += chunk.byteLength;
+    }
+    return { bytes, mime: object.mime, size: object.size };
   }
 
   async loadThumbnail(reference: ThumbnailReference, signal = this.signal): Promise<PreviewResult> {
