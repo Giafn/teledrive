@@ -55,7 +55,12 @@ export type TelegramWorkerUploadPart = {
   fileMime: string;
 };
 
-export type TelegramWorkerDownloadPart = { channel: string; messageId: number };
+export type TelegramWorkerDownloadPart = {
+  channel: string;
+  messageId: number;
+  byteOffset?: number;
+  byteLimit?: number;
+};
 
 export type TelegramWorkerMethods = {
   sendCode: (phone: string) => Promise<TelegramAuthState>;
@@ -68,6 +73,8 @@ export type TelegramWorkerMethods = {
   uploadPart: (params: TelegramWorkerUploadPart) => Promise<Omit<TelegramUploadResult, 'sha256'>>;
   downloadPart: (params: TelegramWorkerDownloadPart) => Promise<TelegramDownloadResult>;
 };
+
+export type TelegramDownloadRange = { byteOffset?: number; byteLimit?: number };
 
 export interface TelegramGateway {
   sendCode(params: TelegramSendCodeParams | string): Promise<TelegramAuthState>;
@@ -83,6 +90,7 @@ export interface TelegramGateway {
     channel: string,
     messageId: number,
     onProgress?: (bytes: number, total: number) => void,
+    range?: TelegramDownloadRange,
   ): Promise<TelegramDownloadResult>;
 }
 
@@ -336,10 +344,10 @@ export function createTelegramGateway(options: TelegramGatewayOptions = {}): Tel
         onProgress?.(file.size);
         return { ...result, sha256: prepared.sha256 };
       }),
-    downloadPart: (channel, messageId, onProgress) =>
+    downloadPart: (channel, messageId, onProgress, range) =>
       withTelegramReport('download', async () => {
         requireBrowserTelegramConfig();
-        const result = await invoke('downloadPart', { channel, messageId });
+        const result = await invoke('downloadPart', { channel, messageId, ...range });
         onProgress?.(result.size, result.size);
         return result;
       }),

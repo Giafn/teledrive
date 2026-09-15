@@ -4,9 +4,11 @@ import type { ManifestResponse } from './api';
 import { telegramGateway } from './telegram-gateway';
 import type { MediaManifest, MediaManifestPart } from './media-range';
 
-const MAX_INFLIGHT_PARTS = 2;
+const MAX_INFLIGHT_PARTS = 4;
 const MAX_RETRIES = 4;
 const RETRY_BASE_DELAY_MS = 250;
+/** Ukuran maksimum satu sub-request range MTProto. */
+export const RANGE_CHUNK_BYTES = 1024 * 1024;
 
 /** Video di atas ambang ini (atau multi-part) diputar via Service Worker streaming. */
 export const VIDEO_PROXY_MIN_BYTES = 32 * 1024 * 1024;
@@ -120,6 +122,11 @@ function registerPageMessageHandler(): void {
       void handlePartRequest(port, String(data.objectId), Number(data.partNo));
       return;
     }
+    if (data.type === 'td-media-range' && port) {
+      const payload = event.data as { objectId?: unknown; byteStart?: unknown; byteEnd?: unknown };
+      void handleRangeRequest(port, String(payload.objectId), Number(payload.byteStart), Number(payload.byteEnd));
+      return;
+    }
     if (data.type === 'td-media-manifest-request' && port) {
       const manifest = manifestCache.get(String(data.objectId));
       port.postMessage(manifest ? { ok: true, manifest } : { ok: false });
@@ -137,20 +144,44 @@ export async function openMediaStream(manifest: MediaManifest): Promise<MediaStr
   };
 }
 
-async function fetchPartBytes(manifest: MediaManifest, part: MediaManifestPart): Promise<Uint8Array> {
-  const key = `${manifest.objectId}:${part.partNo}`;
+async function fetchPartBytes(manifest: MediaManifest, part: MediaManifestPart): Promise<Uint8Array>;
+async function fetchPartBytes(
+  manifest: MediaManifest,
+  part: MediaManifestPart,
+  range?: { byteOffset: number; byteLimit: number },
+): Promise<Uint8Array>;
+async function fetchPartBytes(
+  manifest: MediaManifest,
+  part: MediaManifestPart,
+  range?: { byteOffset: number; byteLimit: number },
+): Promise<Uint8Array> {
+  const key =
+    range === undefined
+      ? `${manifest.objectId}:${part.partNo}`
+      : `${manifest.objectId}:${part.partNo}:${range.byteOffset}:${range.byteLimit}`;
   const existing = inflight.get(key);
   if (existing) return existing;
   const promise = (async () => {
     let lastError: unknown;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
       try {
-        const result = await telegramGateway.downloadPart(configuredChannel(), Number(part.messageId));
-        if (!(result.data instanceof Uint8Array) || result.data.byteLength !== part.size) {
-          throw new Error('PART_SIZE_MISMATCH');
+        const result = await telegramGateway.downloadPart(
+          configuredChannel(),
+          Number(part.messageId),
+          undefined,
+          range === undefined ? undefined : { byteOffset: range.byteOffset, byteLimit: range.byteLimit },
+        );
+        if (range === undefined) {
+          if (!(result.data instanceof Uint8Array) || result.data.byteLength !== part.size) {
+            throw new Error('PART_SIZE_MISMATCH');
+          }
+          if (bytesToHex(sha256(result.data)).toLowerCase() !== part.sha256.toLowerCase()) {
+            throw new Error('PART_HASH_MISMATCH');
+          }
+          return result.data;
         }
-        if (bytesToHex(sha256(result.data)).toLowerCase() !== part.sha256.toLowerCase()) {
-          throw new Error('PART_HASH_MISMATCH');
+        if (!(result.data instanceof Uint8Array) || result.data.byteLength !== range.byteLimit) {
+          throw new Error('PART_SIZE_MISMATCH');
         }
         return result.data;
       } catch (error) {
@@ -168,6 +199,28 @@ async function fetchPartBytes(manifest: MediaManifest, part: MediaManifestPart):
   })().finally(() => inflight.delete(key));
   inflight.set(key, promise);
   return promise;
+}
+
+/**
+ * Petakan irisan [start, end] (offset file global) dari satu part Telegram
+ * menjadi daftar sub-range MTProto maksimal RANGE_CHUNK_BYTES.
+ */
+export function rangeChunksForPart(
+  partStart: number,
+  partSize: number,
+  start: number,
+  end: number,
+): Array<{ byteOffset: number; byteLimit: number }> {
+  const from = Math.max(start, partStart) - partStart;
+  const to = Math.min(end, partStart + partSize - 1) - partStart;
+  const chunks: Array<{ byteOffset: number; byteLimit: number }> = [];
+  let cursor = from;
+  while (cursor <= to) {
+    const size = Math.min(RANGE_CHUNK_BYTES, to - cursor + 1);
+    chunks.push({ byteOffset: cursor, byteLimit: size });
+    cursor += size;
+  }
+  return chunks;
 }
 
 /** Test-only: isi cache manifest tanpa melewati Service Worker. */
@@ -207,6 +260,66 @@ export async function handlePartRequest(port: PortLike, objectId: string, partNo
     port.postMessage({ ok: false, code });
   } finally {
     releaseSlot();
+  }
+}
+
+export async function handleRangeRequest(
+  port: PortLike,
+  objectId: string,
+  byteStart: number,
+  byteEnd: number,
+): Promise<void> {
+  const manifest = manifestCache.get(objectId);
+  if (
+    !manifest ||
+    !Number.isSafeInteger(byteStart) ||
+    !Number.isSafeInteger(byteEnd) ||
+    byteStart < 0 ||
+    byteEnd < byteStart ||
+    byteEnd >= manifest.size
+  ) {
+    console.error(
+      '[teledrive:media]',
+      JSON.stringify({ operation: 'range_request', objectId, code: 'RANGE_INVALID' }),
+    );
+    port.postMessage({ ok: false, code: 'RANGE_INVALID' });
+    return;
+  }
+  try {
+    const jobs: Array<{ part: MediaManifestPart; chunk: { byteOffset: number; byteLimit: number } }> = [];
+    let offset = 0;
+    for (const part of manifest.parts) {
+      const partStart = offset;
+      offset += part.size;
+      if (partStart + part.size - 1 < byteStart) continue;
+      if (partStart > byteEnd) break;
+      for (const chunk of rangeChunksForPart(partStart, part.size, byteStart, byteEnd)) {
+        jobs.push({ part, chunk });
+      }
+    }
+    const pieces = await Promise.all(
+      jobs.map(async ({ part, chunk }) => {
+        await acquireSlot();
+        try {
+          return await fetchPartBytes(manifest, part, chunk);
+        } finally {
+          releaseSlot();
+        }
+      }),
+    );
+    const total = byteEnd - byteStart + 1;
+    const body = new Uint8Array(total);
+    let position = 0;
+    for (const piece of pieces) {
+      body.set(piece, position);
+      position += piece.byteLength;
+    }
+    const buffer = toArrayBuffer(body);
+    port.postMessage({ ok: true, bytes: buffer }, [buffer]);
+  } catch (error) {
+    const code = error instanceof Error ? error.message : 'PART_DOWNLOAD_FAILED';
+    console.error('[teledrive:media]', JSON.stringify({ operation: 'range_request', objectId, code }));
+    port.postMessage({ ok: false, code });
   }
 }
 

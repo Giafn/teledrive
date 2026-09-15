@@ -2,6 +2,7 @@ import { BaseTelegramClient, SentCode, TelegramWorker } from '@mtcute/web';
 import {
   checkPassword as checkPasswordRequest,
   downloadAsBuffer,
+  downloadChunk,
   getMe,
   getMessages,
   logOut as logOutRequest,
@@ -97,6 +98,8 @@ function requireUploadPart(params: TelegramWorkerUploadPart) {
   }
 }
 
+const MAX_RANGE_CHUNK_BYTES = 1024 * 1024;
+
 async function downloadPart(client: BaseTelegramClient, params: TelegramWorkerDownloadPart) {
   if (!params.channel.trim()) throw new TelegramConfigurationError('Download channel is required.');
   if (!Number.isInteger(params.messageId) || params.messageId <= 0) {
@@ -112,9 +115,36 @@ async function downloadPart(client: BaseTelegramClient, params: TelegramWorkerDo
     throw new TelegramConfigurationError('Telegram message does not contain a downloadable document.');
   }
 
-  const data = await downloadAsBuffer(client, media);
   const fileName = 'fileName' in media && typeof media.fileName === 'string' ? media.fileName : null;
   const mime = 'mimeType' in media && typeof media.mimeType === 'string' ? media.mimeType : null;
+
+  const byteOffset = params.byteOffset ?? 0;
+  const byteLimit = params.byteLimit;
+  if (byteOffset === 0 && byteLimit === undefined) {
+    const data = await downloadAsBuffer(client, media);
+    return { messageId: message.id, data, fileName, mime, size: data.byteLength };
+  }
+  if (!Number.isSafeInteger(byteOffset) || byteOffset < 0) {
+    throw new TelegramConfigurationError('Download byte offset must be a non-negative integer.');
+  }
+  if (byteLimit !== undefined && (!Number.isSafeInteger(byteLimit) || byteLimit <= 0)) {
+    throw new TelegramConfigurationError('Download byte limit must be a positive integer.');
+  }
+  const limit = byteLimit ?? (await downloadAsBuffer(client, media).then((full) => full.byteLength - byteOffset));
+  if (limit <= 0) return { messageId: message.id, data: new Uint8Array(0), fileName, mime, size: 0 };
+  const chunks: Uint8Array[] = [];
+  let done = 0;
+  while (done < limit) {
+    const size = Math.min(MAX_RANGE_CHUNK_BYTES, limit - done);
+    chunks.push(await downloadChunk(client, { location: media, offset: byteOffset + done, limit: size }));
+    done += size;
+  }
+  const data = new Uint8Array(limit);
+  let position = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, position);
+    position += chunk.byteLength;
+  }
   return { messageId: message.id, data, fileName, mime, size: data.byteLength };
 }
 

@@ -139,6 +139,22 @@ function requestPartFromClient(client, objectId, partNo) {
   });
 }
 
+function requestRangeFromClient(client, objectId, byteStart, byteEnd) {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    const timer = setTimeout(() => {
+      channel.port1.onmessage = null;
+      resolve(null);
+    }, PART_REQUEST_TIMEOUT_MS);
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timer);
+      channel.port1.onmessage = null;
+      resolve(event.data);
+    };
+    client.postMessage({ type: 'td-media-range', objectId, byteStart, byteEnd }, [channel.port2]);
+  });
+}
+
 async function handleStream(request) {
   try {
     const url = new URL(request.url);
@@ -175,6 +191,31 @@ async function handleStream(request) {
 
     const client = await pickClient(session.clientId);
     if (!client) return new Response('no active page client', { status: 502 });
+
+    // Jalur cepat: minta tepat irisan byte ke tab (tab mengunduh parsial via
+    // MTProto offset/limit). Fallback ke jalur part-full bila tab masih versi lama.
+    const expectedBytes = range.end - range.start + 1;
+    const rangeReply = await requestRangeFromClient(client, objectId, range.start, range.end);
+    if (rangeReply && rangeReply.ok && rangeReply.bytes instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(rangeReply.bytes);
+      if (bytes.byteLength === expectedBytes) {
+        return new Response(bytes, {
+          status: 206,
+          headers: {
+            'Content-Type': manifest.mime || 'application/octet-stream',
+            'Content-Length': String(bytes.byteLength),
+            'Content-Range': `bytes ${range.start}-${range.start + bytes.byteLength - 1}/${manifest.size}`,
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+    }
+    if (rangeReply && rangeReply.ok) {
+      const code = 'range size mismatch';
+      console.error('[teledrive:media-sw]', code);
+      return new Response(code, { status: 502 });
+    }
 
     const slices = [];
     let offset = 0;

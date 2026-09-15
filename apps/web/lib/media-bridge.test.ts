@@ -2,7 +2,14 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { telegramGateway } from './telegram-gateway';
-import { handlePartRequest, primeManifestCache, setSleepFunction, buildMediaManifest } from './media-bridge';
+import {
+  handlePartRequest,
+  handleRangeRequest,
+  primeManifestCache,
+  rangeChunksForPart,
+  setSleepFunction,
+  buildMediaManifest,
+} from './media-bridge';
 import type { MediaManifest } from './media-range';
 
 vi.mock('./telegram-gateway', () => ({ telegramGateway: { downloadPart: vi.fn() } }));
@@ -62,7 +69,7 @@ describe('handlePartRequest', () => {
 
     await handlePartRequest(port, 'object-1', 0);
 
-    expect(mockedDownload).toHaveBeenCalledWith(expect.any(String), 1);
+    expect(mockedDownload).toHaveBeenCalledWith(expect.any(String), 1, undefined, undefined);
     const reply = port.replies[0].message as { ok: boolean; bytes: ArrayBuffer };
     expect(reply.ok).toBe(true);
     expect(new Uint8Array(reply.bytes)).toEqual(bytes);
@@ -129,31 +136,28 @@ describe('handlePartRequest', () => {
     expect(port.replies[0].message).toMatchObject({ ok: true });
   });
 
-  it('limits part downloads to two concurrent requests', async () => {
-    const partData = [0, 1, 2].map((partNo) => Uint8Array.from([partNo, 1, 2, 3]));
+  it('limits part downloads to four concurrent requests', async () => {
+    const partData = [0, 1, 2, 3, 4].map((partNo) => Uint8Array.from([partNo, 1, 2, 3]));
     const parts = partData.map((data, partNo) => makePart(partNo, data));
     primeManifestCache(makeManifest(parts));
-    const gates = [deferred(), deferred(), deferred()];
+    const gates = partData.map(() => deferred());
     mockedDownload.mockImplementation(async (_channel: string, messageId: number) => {
-      const gate = gates[mockedDownload.mock.calls.length - 1] ?? gates[2];
+      const gate = gates[mockedDownload.mock.calls.length - 1] ?? gates[gates.length - 1];
       await gate.promise;
       const data = partData[messageId - 1];
       return { messageId, data, fileName: 'video.mp4', mime: 'video/mp4', size: data.byteLength };
     });
-    const ports = [fakePort(), fakePort(), fakePort()];
+    const ports = partData.map(() => fakePort());
 
     const runs = ports.map((port, index) => handlePartRequest(port, 'object-1', index));
     await Promise.resolve();
-    expect(mockedDownload).toHaveBeenCalledTimes(2);
+    expect(mockedDownload).toHaveBeenCalledTimes(4);
 
     gates[0].resolve();
-    await vi.waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(3));
-    gates[1].resolve();
-    gates[2].resolve();
+    await vi.waitFor(() => expect(mockedDownload).toHaveBeenCalledTimes(5));
+    for (const gate of gates) gate.resolve();
     await Promise.all(runs);
-    expect(ports[0].replies[0].message).toMatchObject({ ok: true });
-    expect(ports[1].replies[0].message).toMatchObject({ ok: true });
-    expect(ports[2].replies[0].message).toMatchObject({ ok: true });
+    for (const port of ports) expect(port.replies[0].message).toMatchObject({ ok: true });
   });
 
   it('answers MANIFEST_MISSING for unknown objects', async () => {
@@ -161,6 +165,66 @@ describe('handlePartRequest', () => {
     await handlePartRequest(port, 'unknown', 0);
     expect(mockedDownload).not.toHaveBeenCalled();
     expect(port.replies[0].message).toMatchObject({ ok: false, code: 'MANIFEST_MISSING' });
+  });
+});
+
+describe('handleRangeRequest', () => {
+  const partBytes = Uint8Array.from([10, 20, 30, 40, 50, 60, 70, 80]);
+
+  it('downloads only the requested byte slice', async () => {
+    primeManifestCache(makeManifest([makePart(0, partBytes)]));
+    mockedDownload.mockImplementation(async (_channel: string, _messageId: number, _onProgress?: unknown, range?: { byteOffset: number; byteLimit: number }) => {
+      const slice = partBytes.slice(range?.byteOffset ?? 0, (range?.byteOffset ?? 0) + (range?.byteLimit ?? partBytes.length));
+      return { messageId: 1, data: slice, fileName: 'video.mp4', mime: 'video/mp4', size: slice.byteLength };
+    });
+    const port = fakePort();
+
+    await handleRangeRequest(port, 'object-1', 2, 5);
+
+    expect(mockedDownload).toHaveBeenCalledWith('test-channel', 1, undefined, { byteOffset: 2, byteLimit: 4 });
+    const reply = port.replies[0].message as { ok: boolean; bytes: ArrayBuffer };
+    expect(reply.ok).toBe(true);
+    expect(Array.from(new Uint8Array(reply.bytes))).toEqual([30, 40, 50, 60]);
+  });
+
+  it('splits ranges spanning parts into per-part sub-requests', async () => {
+    const first = Uint8Array.from([1, 2, 3, 4]);
+    const second = Uint8Array.from([5, 6, 7, 8]);
+    primeManifestCache(makeManifest([makePart(0, first), makePart(1, second)]));
+    mockedDownload.mockImplementation(async (_channel: string, messageId: number, _onProgress?: unknown, range?: { byteOffset: number; byteLimit: number }) => {
+      const source = messageId === 1 ? first : second;
+      const slice = source.slice(range?.byteOffset ?? 0, (range?.byteOffset ?? 0) + (range?.byteLimit ?? source.length));
+      return { messageId, data: slice, fileName: 'video.mp4', mime: 'video/mp4', size: slice.byteLength };
+    });
+    const port = fakePort();
+
+    await handleRangeRequest(port, 'object-1', 2, 5);
+
+    expect(mockedDownload).toHaveBeenCalledWith('test-channel', 1, undefined, { byteOffset: 2, byteLimit: 2 });
+    expect(mockedDownload).toHaveBeenCalledWith('test-channel', 2, undefined, { byteOffset: 0, byteLimit: 2 });
+    const reply = port.replies[0].message as { ok: boolean; bytes: ArrayBuffer };
+    expect(reply.ok).toBe(true);
+    expect(Array.from(new Uint8Array(reply.bytes))).toEqual([3, 4, 5, 6]);
+  });
+
+  it('rejects out-of-bounds ranges without downloading', async () => {
+    primeManifestCache(makeManifest([makePart(0, partBytes)]));
+    const port = fakePort();
+
+    await handleRangeRequest(port, 'object-1', 0, 8);
+
+    expect(mockedDownload).not.toHaveBeenCalled();
+    expect(port.replies[0].message).toMatchObject({ ok: false, code: 'RANGE_INVALID' });
+  });
+});
+
+describe('rangeChunksForPart', () => {
+  it('returns a single chunk for small slices', () => {
+    expect(rangeChunksForPart(0, 100, 2, 5)).toEqual([{ byteOffset: 2, byteLimit: 4 }]);
+  });
+
+  it('clamps to the intersection with the part', () => {
+    expect(rangeChunksForPart(10, 10, 0, 100)).toEqual([{ byteOffset: 0, byteLimit: 10 }]);
   });
 });
 
