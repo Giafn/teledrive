@@ -127,10 +127,16 @@ async function downloadPart(client: BaseTelegramClient, params: TelegramWorkerDo
   if (!Number.isSafeInteger(byteOffset) || byteOffset < 0) {
     throw new TelegramConfigurationError('Download byte offset must be a non-negative integer.');
   }
-  if (byteLimit !== undefined && (!Number.isSafeInteger(byteLimit) || byteLimit <= 0)) {
-    throw new TelegramConfigurationError('Download byte limit must be a positive integer.');
+  let limit: number;
+  if (byteLimit === undefined) {
+    const full = await downloadAsBuffer(client, media);
+    limit = full.byteLength - byteOffset;
+  } else {
+    if (!Number.isSafeInteger(byteLimit) || byteLimit <= 0) {
+      throw new TelegramConfigurationError('Download byte limit must be a positive integer.');
+    }
+    limit = byteLimit;
   }
-  const limit = byteLimit ?? (await downloadAsBuffer(client, media).then((full) => full.byteLength - byteOffset));
   if (limit <= 0) return { messageId: message.id, data: new Uint8Array(0), fileName, mime, size: 0 };
   const chunks: Uint8Array[] = [];
   let done = 0;
